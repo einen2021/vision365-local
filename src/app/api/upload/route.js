@@ -1,9 +1,13 @@
 import { NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
+import { tryProxyToDesktopServer } from "@/lib/desktopServerProxy";
 
-/** File upload API — replaces Firebase Storage */
+/** File upload API — prefers local Hono server, falls back to public/ for npm run dev */
 export async function POST(request) {
+  const proxied = await tryProxyToDesktopServer(request, "/api/upload", null, 120000);
+  if (proxied) return proxied;
+
   try {
     const formData = await request.formData();
     const file = formData.get("file");
@@ -34,6 +38,9 @@ export async function POST(request) {
 }
 
 export async function DELETE(request) {
+  const proxied = await tryProxyToDesktopServer(request, "/api/upload", null, 30000);
+  if (proxied) return proxied;
+
   try {
     const { path: filePath } = await request.json();
     if (!filePath) {

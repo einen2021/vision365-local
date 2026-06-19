@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { setDesktopApiPort } from "@/lib/platform";
-import { resetApiBaseUrl, waitForDesktopApi, DESKTOP_API_PORT } from "@/lib/apiClient";
+import { resetApiBaseUrl, waitForDesktopApi, DESKTOP_API_PORT, primeAssetUrlResolver } from "@/lib/apiClient";
 
 /**
  * Blocks the UI until the local database server is running.
@@ -20,6 +20,7 @@ export function DesktopProvider({ children }) {
     const isTauri =
       "__TAURI_INTERNALS__" in window || "__TAURI__" in window;
     if (!isTauri) {
+      primeAssetUrlResolver();
       setStatus("ready");
       return;
     }

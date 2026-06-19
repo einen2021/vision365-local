@@ -117,18 +117,36 @@ export async function apiPost<T = unknown>(
   return res.json() as Promise<T>;
 }
 
-/** Resolve image/upload URLs for desktop local file serving */
+/** Resolve image/upload URLs for local file serving (desktop app + desktop:dev). */
+export async function primeAssetUrlResolver(): Promise<void> {
+  if (!isDesktop()) await resolveWebApiBaseUrl();
+}
+
+function getResolvableApiBase(): string {
+  if (isDesktop()) return getApiBaseUrl();
+  return webDesktopApiBase ?? "";
+}
+
 export function resolveAssetUrl(url: string): string {
   if (!url) return url;
+  if (url.startsWith("blob:") || url.startsWith("data:")) return url;
   if (url.startsWith("http://") || url.startsWith("https://")) return url;
 
-  if (isDesktop()) {
-    const base = getApiBaseUrl();
-    if (!base) return url;
-    if (url.startsWith("/local/")) return `${base}${url}`;
-    if (url.startsWith("/uploads/")) return `${base}/local/${url.slice(1)}`;
-    if (url.startsWith("/floor-plans/")) return `${base}/local/${url.slice(1)}`;
+  const base = getResolvableApiBase();
+  let path = url;
+
+  // Legacy Firebase-style paths saved when upload fell back to mock storage
+  if (path.startsWith("/floor-plans/")) {
+    path = base
+      ? `/local/uploads/${path.slice(1)}`
+      : path;
+  } else if (path.startsWith("/uploads/")) {
+    path = `/local/${path.slice(1)}`;
   }
 
-  return url;
+  if (path.startsWith("/local/")) {
+    return base ? encodeURI(`${base}${path}`) : encodeURI(path);
+  }
+
+  return encodeURI(path);
 }

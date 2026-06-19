@@ -43,6 +43,7 @@ import { Input } from '@/components/ui/input';
 import { rowsForLiveAlarmLikeDisplay, rowsForLiveTroubleDisplay } from '@/lib/liveAlarmFeedWrite';
 import { PageHelpBanner } from "@/components/page-help-banner"
 import { getMarkerImageSrc, handleImageError } from "@/lib/assetIcons"
+import { useResolvedAssetUrl } from "@/hooks/useResolvedAssetUrl"
 import {
   getAssetMarkerTooltip,
   getFireBorderColor,
@@ -126,6 +127,7 @@ function CommunityOverviewContent() {
   const [floorMaps, setFloorMaps] = useState([]);
   const [selectedFloorMapName, setSelectedFloorMapName] = useState(null);
   const [currentFloorMap, setCurrentFloorMap] = useState(null);
+  const floorMapImageUrl = useResolvedAssetUrl(currentFloorMap?.imageUrl);
   const [imageLoaded, setImageLoaded] = useState(false);
   const [actualImageDimensions, setActualImageDimensions] = useState({
     width: 0,
@@ -1331,7 +1333,7 @@ function CommunityOverviewContent() {
                             >
                               <img
                                 ref={imageRef}
-                                src={currentFloorMap.imageUrl}
+                                src={floorMapImageUrl}
                                 alt={selectedFloorMapName || 'Floor Map'}
                                 className="block w-full h-auto object-contain"
                                 style={{

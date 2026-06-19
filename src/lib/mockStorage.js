@@ -28,7 +28,7 @@ export async function uploadBytes(storageRef, file) {
 
 export async function getDownloadURL(storageRef) {
   if (storageRef._downloadUrl) return storageRef._downloadUrl;
-  return `/${storageRef.fullPath}`;
+  throw new Error("Upload did not complete. Call uploadBytes before getDownloadURL.");
 }
 
 export async function deleteObject(storageRef) {

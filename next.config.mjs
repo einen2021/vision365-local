@@ -9,6 +9,7 @@ const firebaseAliases = {
 };
 
 const isDesktopBuild = process.env.DESKTOP_BUILD === "1";
+const desktopApiPort = process.env.VISION365_PORT || "47821";
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -18,7 +19,16 @@ const nextConfig = {
         images: { unoptimized: true },
         trailingSlash: true,
       }
-    : {}),
+    : {
+        async rewrites() {
+          return [
+            {
+              source: "/local/:path*",
+              destination: `http://127.0.0.1:${desktopApiPort}/local/:path*`,
+            },
+          ];
+        },
+      }),
   turbopack: {
     resolveAlias: firebaseAliases,
   },

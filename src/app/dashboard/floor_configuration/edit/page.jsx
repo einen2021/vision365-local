@@ -94,6 +94,22 @@ import FirestoreService from "@/services/firestoreService"
 import { PageHelpBanner } from "@/components/page-help-banner"
 import { FaqHelpButton } from "@/components/faq-help-button"
 import { CATEGORY_ICONS, getIconForCategory, handleImageError } from "@/lib/assetIcons"
+import { useResolvedAssetUrl } from "@/hooks/useResolvedAssetUrl"
+
+function FloorPlanThumbnail({ imageUrl, alt, className = "w-20 h-20 object-cover rounded mb-2 border" }) {
+  const src = useResolvedAssetUrl(imageUrl)
+  if (!imageUrl) return null
+  return (
+    <img
+      src={src}
+      alt={alt}
+      className={className}
+      onError={(e) => {
+        e.target.style.display = "none"
+      }}
+    />
+  )
+}
 
 // Create a client-only ModeToggle
 const ClientModeToggle = dynamic(
@@ -145,6 +161,9 @@ export default function ManageFloorPlansPage() {
   // Image editing states
   const [selectedImage, setSelectedImage] = useState(null)
   const [imagePreview, setImagePreview] = useState(null)
+  const resolvedImagePreview = useResolvedAssetUrl(
+    imagePreview && !String(imagePreview).startsWith("blob:") ? imagePreview : "",
+  )
   const [isImageDialogOpen, setIsImageDialogOpen] = useState(false)
 
   // Asset management states
@@ -1905,8 +1924,8 @@ export default function ManageFloorPlansPage() {
                     <Card key={floorPlan.name} className="overflow-hidden">
                       <div className="aspect-video relative bg-muted">
                         {floorPlan.imageUrl ? (
-                          <img
-                            src={floorPlan.imageUrl || "/placeholder.svg"}
+                          <FloorPlanThumbnail
+                            imageUrl={floorPlan.imageUrl}
                             alt={floorPlan.name}
                             className="w-full h-full object-cover"
                           />
@@ -2665,7 +2684,11 @@ export default function ManageFloorPlansPage() {
                         >
                           <img
                             ref={imageRef}
-                            src={imagePreview || "/placeholder.svg"}
+                            src={
+                              imagePreview?.startsWith("blob:")
+                                ? imagePreview
+                                : resolvedImagePreview || "/placeholder.svg"
+                            }
                             alt="Floor plan"
                             className={`block w-full h-auto max-w-full ${isEditMode ? (isMobile ? "cursor-pointer" : "cursor-crosshair") : "cursor-default"}`}
                             onLoad={handleImageLoad}
