@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability",
+  "identifier": "default",
+  "description": "Default capabilities for Vision365 desktop app",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "shell:allow-spawn",
+    "shell:allow-execute",
+    "notification:default",
+    "dialog:default",
+    "fs:default",
+    "fs:allow-app-read",
+    "fs:allow-app-write",
+    "fs:allow-app-read-recursive",
+    "fs:allow-app-write-recursive"
+  ]
+}

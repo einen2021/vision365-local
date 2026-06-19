@@ -1,0 +1,17 @@
+{
+  "UserDB": {
+    "admin": {
+      "email": "admin@vision365.com",
+      "password": "admin123",
+      "role": "admin",
+      "designation": "Administrator",
+      "communities": [],
+      "buildings": {}
+    }
+  },
+  "communities": {},
+  "AssetsList": {},
+  "BrandRegistry": {},
+  "Staffs": {},
+  "jobs": {}
+}
