@@ -1985,8 +1985,18 @@ export default function AssetsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: "cshow *", timeoutMs: CSHOW_COLLECT_TIMEOUT_MS }),
       })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || "Panel command failed")
+      const contentType = res.headers.get("content-type") || ""
+      const data = contentType.includes("application/json")
+        ? await res.json()
+        : { error: await res.text() }
+      if (!res.ok) {
+        throw new Error(
+          data.error ||
+            (res.status === 503
+              ? "Local API server is not running. Start it with: npm run desktop:dev"
+              : "Panel command failed"),
+        )
+      }
 
       const devices = parseSimplexFile(data.response || "")
       if (devices.length === 0) {

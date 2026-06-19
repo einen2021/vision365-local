@@ -8,9 +8,28 @@ import { isDesktop, getDesktopApiPort, setDesktopApiPort } from "./platform";
 export const DESKTOP_API_PORT = 47821;
 
 let cachedBaseUrl: string | null = null;
+/** undefined = not checked yet; "" = checked, unavailable */
+let webDesktopApiBase: string | undefined;
 
 export function resetApiBaseUrl(): void {
   cachedBaseUrl = null;
+  webDesktopApiBase = undefined;
+}
+
+/** In browser dev, use the local Hono server when desktop:dev is running. */
+async function resolveWebApiBaseUrl(): Promise<string> {
+  if (webDesktopApiBase !== undefined) return webDesktopApiBase;
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${DESKTOP_API_PORT}/health`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    webDesktopApiBase = res.ok ? `http://127.0.0.1:${DESKTOP_API_PORT}` : "";
+  } catch {
+    webDesktopApiBase = "";
+  }
+
+  return webDesktopApiBase;
 }
 
 export function getApiBaseUrl(): string {
@@ -74,8 +93,12 @@ export async function apiFetch(
 ): Promise<Response> {
   if (isDesktop()) {
     await waitForDesktopApi();
+    return fetch(apiUrl(path), options);
   }
-  return fetch(apiUrl(path), options);
+
+  const base = await resolveWebApiBaseUrl();
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  return fetch(`${base}${normalized}`, options);
 }
 
 export async function apiPost<T = unknown>(

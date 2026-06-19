@@ -8,8 +8,8 @@ const DESKTOP_API_PORT = Number(process.env.VISION365_PORT || 47821);
  * Forward a Next.js API request to the local Hono desktop server.
  * Used when the app runs in the browser (next dev) instead of inside Tauri.
  */
-export async function proxyToDesktopServer(apiPath, request) {
-  const proxied = await tryProxyToDesktopServer(request, apiPath);
+export async function proxyToDesktopServer(apiPath, request, timeoutMs = 5000) {
+  const proxied = await tryProxyToDesktopServer(request, apiPath, null, timeoutMs);
   if (proxied) return proxied;
 
   return NextResponse.json(
@@ -24,14 +24,19 @@ export async function proxyToDesktopServer(apiPath, request) {
  * Try forwarding to desktop-server. Returns null when the server is unavailable
  * so routes can fall back to the embedded Next.js MongoDB (npm run dev only).
  */
-export async function tryProxyToDesktopServer(request, apiPath, bodyText = null) {
+export async function tryProxyToDesktopServer(
+  request,
+  apiPath,
+  bodyText = null,
+  timeoutMs = 5000,
+) {
   const url = `http://${DESKTOP_API_HOST}:${DESKTOP_API_PORT}${apiPath}`;
 
   try {
     const init = {
       method: request.method,
       headers: {},
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(timeoutMs),
     };
 
     if (request.method !== "GET" && request.method !== "HEAD") {
