@@ -33,18 +33,18 @@ export function createBuildingsRoutes() {
 
   app.get("/buildings/unassigned", async (c) => {
     const db = await readDb();
-    return c.json({ buildings: listUnassignedBuildings(db) });
+    return c.json({ status: true, buildings: listUnassignedBuildings(db) });
   });
 
   app.post("/buildings/with-community-status", async (c) => {
     const db = await readDb();
-    return c.json({ buildings: listAllBuildingsWithStatus(db) });
+    return c.json({ status: true, buildings: listAllBuildingsWithStatus(db) });
   });
 
   app.get("/community/:communityId/buildings", async (c) => {
     const communityId = c.req.param("communityId");
     const db = await readDb();
-    return c.json({ buildings: getCommunityBuildingsList(db, communityId) });
+    return c.json({ status: true, buildings: getCommunityBuildingsList(db, communityId) });
   });
 
   app.post("/community/:communityId/assign-buildings", async (c) => {
