@@ -1,0 +1,55 @@
+import { collection, doc, getDoc, getDocs, updateDoc } from "firebase/firestore"
+import { db } from "@/config/firebase"
+import { getAssetsListIdFromMapping } from "@/lib/floorMapAssets"
+import { normalizeSimplexStatus } from "@/lib/assetFireStatus"
+import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress"
+
+/** Find the global AssetsList document for a floor-map / building asset. */
+export async function resolveAssetsListDocId(asset, deviceAddress = "") {
+  const candidates = [
+    getAssetsListIdFromMapping(asset),
+    asset?.assetsListId,
+    asset?.id,
+    asset?.buildingAssetId,
+  ].filter(Boolean)
+
+  for (const id of candidates) {
+    const snap = await getDoc(doc(db, "AssetsList", String(id)))
+    if (snap.exists()) return snap.id
+  }
+
+  const targetAddress = resolveAssetDeviceAddress({ ...asset, deviceAddress })
+  if (!targetAddress) return null
+
+  const snapshot = await getDocs(collection(db, "AssetsList"))
+  for (const docSnap of snapshot.docs) {
+    const data = docSnap.data()
+    if (resolveAssetDeviceAddress(data) === targetAddress) return docSnap.id
+  }
+
+  return null
+}
+
+/** Set simplexStatus.F or .T to 0 on the AssetsList record. */
+export async function resetSimplexFlag(asset, deviceAddress, flag) {
+  if (flag !== "F" && flag !== "T") {
+    throw new Error("Invalid simplex flag")
+  }
+
+  const assetsListId = await resolveAssetsListDocId(asset, deviceAddress)
+  if (!assetsListId) {
+    throw new Error("AssetsList record not found for this asset")
+  }
+
+  const assetRef = doc(db, "AssetsList", assetsListId)
+  const snap = await getDoc(assetRef)
+  const current = normalizeSimplexStatus(snap.data()?.simplexStatus)
+  const next = { ...current, [flag]: 0 }
+
+  await updateDoc(assetRef, {
+    simplexStatus: next,
+    updatedAt: new Date().toISOString(),
+  })
+
+  return next
+}

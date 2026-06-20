@@ -32,17 +32,9 @@ import {
   getFloorMapName,
   hasFloorPosition,
 } from "@/lib/floorMapAssets"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { Input } from "@/components/ui/input"
 import { PageHelpBanner } from "@/components/page-help-banner"
 import { FaqHelpButton } from "@/components/faq-help-button"
+import { AssetControlModal } from "@/components/asset-control-modal"
 import { getIconForCategory, handleImageError } from "@/lib/assetIcons"
 import { useResolvedAssetUrl } from "@/hooks/useResolvedAssetUrl"
 import {
@@ -131,11 +123,7 @@ export default function ViewFloorPlanPage() {
   // State for asset control modal
   const [selectedAsset, setSelectedAsset] = useState(null)
   const [isAssetModalOpen, setIsAssetModalOpen] = useState(false)
-  const [isUpdatingAsset, setIsUpdatingAsset] = useState(false)
   const userRole = effectiveRole || ""
-  const [deviceLocation, setDeviceLocation] = useState("")
-  const [deviceAddress, setDeviceAddress] = useState("")
-  const [installed, setInstalled] = useState(false)
 
   // New state for tracking actual image dimensions and position
   const [actualImageDimensions, setActualImageDimensions] = useState({
@@ -1047,10 +1035,9 @@ export default function ViewFloorPlanPage() {
   }
 
   // Handle asset click to open modal
-  const handleAssetClick = async (mapping) => {
+  const handleAssetClick = (mapping) => {
     if (!selectedBuilding || !selectedFloorPlan) return
 
-    // Check if building status is "construction"
     if (buildingStatus !== "construction") {
       toast({
         title: "Feature Unavailable",
@@ -1060,293 +1047,12 @@ export default function ViewFloorPlanPage() {
       return
     }
 
-    try {
-      // Fetch the asset document from new asset collection structure
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const assetDocRef = doc(
-        db,
-        buildingNameWithSuffix,
-        "asset",
-        mapping.categoryKey, // Use actual categoryKey (fire-life-safety, electrical, etc.)
-        mapping.id // id is the buildingAssetId
-      )
-      
-      const assetDoc = await getDoc(assetDocRef)
-      
-      let assetData = {}
-      
-      if (assetDoc.exists()) {
-        assetData = assetDoc.data()
-      } else {
-        // Document doesn't exist, use defaults
-        assetData = {}
-      }
-
-      const installedStatus = assetData.installed !== undefined ? assetData.installed : false
-      
-      setSelectedAsset({
-        ...mapping,
-        buildingAssetId: mapping.id, // Store buildingAssetId for updates
-        assetCategory: mapping.categoryKey, // Store categoryKey for path building in update functions
-        activityStatus: assetData.activityStatus !== undefined ? assetData.activityStatus : mapping.active,
-        enabled: assetData.enabled !== undefined ? assetData.enabled : true,
-        deviceLocation: assetData.deviceLocation || "",
-        deviceAddress: assetData.deviceAddress || "",
-        installed: installedStatus,
-      })
-      setDeviceLocation(assetData.deviceLocation || "")
-      setDeviceAddress(assetData.deviceAddress || "")
-      setInstalled(installedStatus)
-      setIsAssetModalOpen(true)
-    } catch (error) {
-      console.error("Error fetching asset data:", error)
-      toast({
-        title: "Error",
-        description: "Failed to load asset details",
-        variant: "destructive",
-      })
-    }
-  }
-
-  // Update installed status
-  const handleUpdateInstalled = async (installedValue) => {
-    if (!selectedAsset || !selectedBuilding || !selectedFloorPlan || userRole !== "admin") {
-      toast({
-        title: "Unauthorized",
-        description: "Only admins can update installation status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (buildingStatus !== "construction") {
-      toast({
-        title: "Feature Unavailable",
-        description: "Asset controls are only available for buildings with 'Construction' status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    setIsUpdatingAsset(true)
-    try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const assetDocRef = doc(
-        db,
-        buildingNameWithSuffix,
-        "asset",
-        selectedAsset.assetCategory, // category key (fire-life-safety, electrical, etc.)
-        selectedAsset.buildingAssetId // buildingAssetId as document ID
-      )
-
-      await updateDoc(assetDocRef, {
-        installed: installedValue,
-      })
-
-      setSelectedAsset({ ...selectedAsset, installed: installedValue })
-      setInstalled(installedValue)
-      toast({
-        title: "Success",
-        description: `Asset ${installedValue ? "marked as installed" : "marked as not installed"} successfully`,
-      })
-    } catch (error) {
-      console.error("Error updating installed status:", error)
-      toast({
-        title: "Error",
-        description: "Failed to update installation status",
-        variant: "destructive",
-      })
-    } finally {
-      setIsUpdatingAsset(false)
-    }
-  }
-
-  // Update asset activity status (on/off)
-  const handleUpdateActivityStatus = async (status) => {
-    if (!selectedAsset || !selectedBuilding || !selectedFloorPlan || userRole !== "admin") {
-      toast({
-        title: "Unauthorized",
-        description: "Only admins can update asset status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (buildingStatus !== "construction") {
-      toast({
-        title: "Feature Unavailable",
-        description: "Asset controls are only available for buildings with 'Construction' status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (!selectedAsset.installed) {
-      toast({
-        title: "Action Restricted",
-        description: "Asset must be installed before you can change its activity status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    setIsUpdatingAsset(true)
-    try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const assetDocRef = doc(
-        db,
-        buildingNameWithSuffix,
-        "asset",
-        selectedAsset.assetCategory, // category key (fire-life-safety, electrical, etc.)
-        selectedAsset.buildingAssetId // buildingAssetId as document ID
-      )
-
-      await updateDoc(assetDocRef, {
-        activityStatus: status,
-      })
-
-      setSelectedAsset({ ...selectedAsset, activityStatus: status })
-      toast({
-        title: "Success",
-        description: `Asset ${status === 0 ? "turned off" : "turned on"} successfully`,
-      })
-    } catch (error) {
-      console.error("Error updating activity status:", error)
-      toast({
-        title: "Error",
-        description: "Failed to update asset status",
-        variant: "destructive",
-      })
-    } finally {
-      setIsUpdatingAsset(false)
-    }
-  }
-
-  // Update asset enabled status
-  const handleUpdateEnabled = async (enabled) => {
-    if (!selectedAsset || !selectedBuilding || !selectedFloorPlan || userRole !== "admin") {
-      toast({
-        title: "Unauthorized",
-        description: "Only admins can update asset status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (buildingStatus !== "construction") {
-      toast({
-        title: "Feature Unavailable",
-        description: "Asset controls are only available for buildings with 'Construction' status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (!selectedAsset.installed) {
-      toast({
-        title: "Action Restricted",
-        description: "Asset must be installed before you can enable/disable it",
-        variant: "destructive",
-      })
-      return
-    }
-
-    setIsUpdatingAsset(true)
-    try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const assetDocRef = doc(
-        db,
-        buildingNameWithSuffix,
-        "asset",
-        selectedAsset.assetCategory, // category key (fire-life-safety, electrical, etc.)
-        selectedAsset.buildingAssetId // buildingAssetId as document ID
-      )
-
-      await updateDoc(assetDocRef, {
-        enabled: enabled,
-      })
-
-      setSelectedAsset({ ...selectedAsset, enabled })
-      toast({
-        title: "Success",
-        description: `Asset ${enabled ? "enabled" : "disabled"} successfully`,
-      })
-    } catch (error) {
-      console.error("Error updating enabled status:", error)
-      toast({
-        title: "Error",
-        description: "Failed to update asset status",
-        variant: "destructive",
-      })
-    } finally {
-      setIsUpdatingAsset(false)
-    }
-  }
-
-  // Update device location and address
-  const handleUpdateLocation = async () => {
-    if (!selectedAsset || !selectedBuilding || !selectedFloorPlan || userRole !== "admin") {
-      toast({
-        title: "Unauthorized",
-        description: "Only admins can update device location",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (buildingStatus !== "construction") {
-      toast({
-        title: "Feature Unavailable",
-        description: "Asset controls are only available for buildings with 'Construction' status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (!selectedAsset.installed) {
-      toast({
-        title: "Action Restricted",
-        description: "Asset must be installed before you can update its location",
-        variant: "destructive",
-      })
-      return
-    }
-
-    setIsUpdatingAsset(true)
-    try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const assetDocRef = doc(
-        db,
-        buildingNameWithSuffix,
-        "asset",
-        selectedAsset.assetCategory, // category key (fire-life-safety, electrical, etc.)
-        selectedAsset.buildingAssetId // buildingAssetId as document ID
-      )
-
-      await updateDoc(assetDocRef, {
-        deviceLocation: deviceLocation.trim(),
-        deviceAddress: deviceAddress.trim(),
-      })
-
-      setSelectedAsset({
-        ...selectedAsset,
-        deviceLocation: deviceLocation.trim(),
-        deviceAddress: deviceAddress.trim(),
-      })
-      toast({
-        title: "Success",
-        description: "Device location and address updated successfully",
-      })
-    } catch (error) {
-      console.error("Error updating device location:", error)
-      toast({
-        title: "Error",
-        description: "Failed to update device location",
-        variant: "destructive",
-      })
-    } finally {
-      setIsUpdatingAsset(false)
-    }
+    setSelectedAsset({
+      ...mapping,
+      buildingAssetId: mapping.id,
+      assetCategory: mapping.categoryKey,
+    })
+    setIsAssetModalOpen(true)
   }
 
   if (!mounted) {
@@ -1793,193 +1499,14 @@ export default function ViewFloorPlanPage() {
         </div>
       </SidebarInset>
 
-      {/* Asset Control Modal */}
-      <Dialog open={isAssetModalOpen} onOpenChange={setIsAssetModalOpen}>
-        <DialogContent className="sm:max-w-[500px]">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Edit className="h-5 w-5" />
-              Asset Control - {selectedAsset?.assetName}
-            </DialogTitle>
-            <DialogDescription>
-              {selectedAsset?.category} at position ({selectedAsset?.naturalX}, {selectedAsset?.naturalY})
-            </DialogDescription>
-          </DialogHeader>
-
-          {userRole === "admin" && buildingStatus === "construction" ? (
-            <div className="space-y-6 py-4">
-              {/* Installation Status */}
-              <div className="space-y-2">
-                <Label className="text-base font-semibold flex items-center gap-2">
-                  <CheckCircle className="h-4 w-4" />
-                  Installation Status
-                </Label>
-                <div className="flex items-center gap-3 p-3 border rounded-lg">
-                  <input
-                    type="checkbox"
-                    id="installed"
-                    checked={installed}
-                    onChange={(e) => handleUpdateInstalled(e.target.checked)}
-                    disabled={isUpdatingAsset}
-                    className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                  />
-                  <Label htmlFor="installed" className="text-sm font-medium cursor-pointer flex-1">
-                    Asset is installed
-                  </Label>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  Current Status: {installed ? "Installed" : "Not Installed"}
-                </p>
-                {!installed && (
-                  <Alert className="mt-2">
-                    <AlertDescription className="text-xs">
-                      Other controls are disabled until the asset is marked as installed.
-                    </AlertDescription>
-                  </Alert>
-                )}
-              </div>
-
-              {/* Activity Status (On/Off) */}
-              <div className="space-y-2">
-                <Label className="text-base font-semibold">Activity Status</Label>
-                <div className="flex gap-2">
-                  <Button
-                    onClick={() => handleUpdateActivityStatus(1)}
-                    disabled={isUpdatingAsset || selectedAsset?.activityStatus === 1 || !installed}
-                    className={`flex-1 ${
-                      selectedAsset?.activityStatus === 1
-                        ? "bg-green-600 hover:bg-green-700"
-                        : "bg-gray-200 hover:bg-gray-300"
-                    } ${!installed ? "opacity-50 cursor-not-allowed" : ""}`}
-                  >
-                    <Power className="mr-2 h-4 w-4" />
-                    On
-                  </Button>
-                  <Button
-                    onClick={() => handleUpdateActivityStatus(0)}
-                    disabled={isUpdatingAsset || selectedAsset?.activityStatus === 0 || !installed}
-                    className={`flex-1 ${
-                      selectedAsset?.activityStatus === 0
-                        ? "bg-red-600 hover:bg-red-700"
-                        : "bg-gray-200 hover:bg-gray-300"
-                    } ${!installed ? "opacity-50 cursor-not-allowed" : ""}`}
-                  >
-                    <PowerOff className="mr-2 h-4 w-4" />
-                    Off
-                  </Button>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  Current Status: {selectedAsset?.activityStatus === 1 ? "On" : "Off"}
-                </p>
-              </div>
-
-              {/* Enable/Disable */}
-              <div className="space-y-2">
-                <Label className="text-base font-semibold">Enable/Disable Asset</Label>
-                <div className="flex gap-2">
-                  <Button
-                    onClick={() => handleUpdateEnabled(true)}
-                    disabled={isUpdatingAsset || selectedAsset?.enabled === true || !installed}
-                    className={`flex-1 ${
-                      selectedAsset?.enabled === true
-                        ? "bg-green-600 hover:bg-green-700"
-                        : "bg-gray-200 hover:bg-gray-300"
-                    } ${!installed ? "opacity-50 cursor-not-allowed" : ""}`}
-                  >
-                    <CheckCircle className="mr-2 h-4 w-4" />
-                    Enable
-                  </Button>
-                  <Button
-                    onClick={() => handleUpdateEnabled(false)}
-                    disabled={isUpdatingAsset || selectedAsset?.enabled === false || !installed}
-                    className={`flex-1 ${
-                      selectedAsset?.enabled === false
-                        ? "bg-red-600 hover:bg-red-700"
-                        : "bg-gray-200 hover:bg-gray-300"
-                    } ${!installed ? "opacity-50 cursor-not-allowed" : ""}`}
-                  >
-                    <XCircle className="mr-2 h-4 w-4" />
-                    Disable
-                  </Button>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  Current State: {selectedAsset?.enabled ? "Enabled" : "Disabled"}
-                </p>
-              </div>
-
-              {/* Device Location and Address */}
-              <div className="space-y-4">
-                <div className="space-y-2">
-                  <Label htmlFor="deviceLocation" className="text-base font-semibold flex items-center gap-2">
-                    <MapPin className="h-4 w-4" />
-                    Device Location
-                  </Label>
-                  <Input
-                    id="deviceLocation"
-                    value={deviceLocation}
-                    onChange={(e) => setDeviceLocation(e.target.value)}
-                    placeholder="Enter device location"
-                    disabled={isUpdatingAsset || !installed}
-                    className={!installed ? "opacity-50 cursor-not-allowed" : ""}
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label htmlFor="deviceAddress" className="text-base font-semibold flex items-center gap-2">
-                    <MapPin className="h-4 w-4" />
-                    Device Address
-                  </Label>
-                  <Input
-                    id="deviceAddress"
-                    value={deviceAddress}
-                    onChange={(e) => setDeviceAddress(e.target.value)}
-                    placeholder="Enter device address"
-                    disabled={isUpdatingAsset || !installed}
-                    className={!installed ? "opacity-50 cursor-not-allowed" : ""}
-                  />
-                </div>
-
-                <Button
-                  onClick={handleUpdateLocation}
-                  disabled={isUpdatingAsset || !installed}
-                  className={`w-full ${!installed ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  {isUpdatingAsset ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Updating...
-                    </>
-                  ) : (
-                    <>
-                      <MapPin className="mr-2 h-4 w-4" />
-                      Update Location & Address
-                    </>
-                  )}
-                </Button>
-              </div>
-            </div>
-          ) : (
-            <div className="py-4">
-              <Alert>
-                <AlertTitle>
-                  {userRole !== "admin" ? "Access Restricted" : "Feature Unavailable"}
-                </AlertTitle>
-                <AlertDescription>
-                  {userRole !== "admin" 
-                    ? "Only administrators can control assets. Please contact an admin for assistance."
-                    : "Asset controls are only available for buildings with 'Construction' status. Current building status: " + (buildingStatus || "Unknown")}
-                </AlertDescription>
-              </Alert>
-            </div>
-          )}
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setIsAssetModalOpen(false)}>
-              Close
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <AssetControlModal
+        isOpen={isAssetModalOpen}
+        onClose={() => setIsAssetModalOpen(false)}
+        asset={selectedAsset}
+        selectedBuilding={selectedBuilding}
+        buildingStatus={buildingStatus}
+        userRole={userRole}
+      />
     </SidebarProvider>
   )
 }

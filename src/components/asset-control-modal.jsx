@@ -16,7 +16,14 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Loader2, Edit, MapPin, Power, PowerOff, CheckCircle, XCircle } from "lucide-react"
+import { Loader2, Edit, MapPin, Power, PowerOff, CheckCircle, XCircle, Flame, AlertTriangle } from "lucide-react"
+import {
+  getFireStatusDisplay,
+  normalizeSimplexStatus,
+  simplexStatusToActive,
+} from "@/lib/assetFireStatus"
+import { resolveAssetsListDocId, resetSimplexFlag } from "@/lib/assetsListSimplexStatus"
+import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
 
 /**
  * Helper function to map display category names to Firestore collection keys
@@ -75,6 +82,7 @@ export function AssetControlModal({
   const [deviceAddress, setDeviceAddress] = useState("")
   const [installed, setInstalled] = useState(false)
   const [selectedAsset, setSelectedAsset] = useState(null)
+  const [simplexStatus, setSimplexStatus] = useState({ F: 0, T: 0 })
 
   // Load asset data when modal opens or asset changes
   useEffect(() => {
@@ -90,8 +98,26 @@ export function AssetControlModal({
       setDeviceAddress("")
       setInstalled(false)
       setSelectedAsset(null)
+      setSimplexStatus({ F: 0, T: 0 })
     }
   }, [isOpen])
+
+  const loadSimplexStatus = async (assetRecord, location, address) => {
+    const assetsListId = await resolveAssetsListDocId(assetRecord, address)
+    if (assetsListId) {
+      const listSnap = await getDoc(doc(db, "AssetsList", assetsListId))
+      if (listSnap.exists()) {
+        return normalizeSimplexStatus(listSnap.data()?.simplexStatus)
+      }
+    }
+
+    const storeStatus = useAssetFireStatusStore
+      .getState()
+      .getSimplexStatus(assetRecord.buildingAssetId || assetRecord.id, address)
+    if (storeStatus) return normalizeSimplexStatus(storeStatus)
+
+    return { F: 0, T: 0 }
+  }
 
   const loadAssetData = async () => {
     try {      // Use the building name from selectedBuilding prop
@@ -134,6 +160,13 @@ export function AssetControlModal({
       setDeviceLocation(assetData.deviceLocation || "")
       setDeviceAddress(assetData.deviceAddress || "")
       setInstalled(installedStatus)
+
+      const panelStatus = await loadSimplexStatus(
+        { ...asset, buildingAssetId: assetId },
+        assetData.deviceLocation || "",
+        assetData.deviceAddress || "",
+      )
+      setSimplexStatus(panelStatus)
     } catch (error) {
       console.error("Error loading asset data:", error)
       toast({
@@ -333,6 +366,46 @@ export function AssetControlModal({
     }
   }
 
+  const handleResetSimplexFlag = async (flag) => {
+    if (!selectedAsset || !selectedBuilding || userRole !== "admin") {
+      toast({
+        title: "Unauthorized",
+        description: "Only admins can reset panel alarm status",
+        variant: "destructive",
+      })
+      return
+    }
+
+    if (buildingStatus?.toLowerCase() !== "construction") {
+      toast({
+        title: "Feature Unavailable",
+        description: "Asset controls are only available for buildings with 'Construction' status",
+        variant: "destructive",
+      })
+      return
+    }
+
+    setIsUpdatingAsset(true)
+    try {
+      const next = await resetSimplexFlag(selectedAsset, deviceAddress, flag)
+      setSimplexStatus(next)
+      await useAssetFireStatusStore.getState().syncFromAssetsList()
+      toast({
+        title: "Success",
+        description: flag === "F" ? "Fire status (F) reset to 0" : "Trouble status (T) reset to 0",
+      })
+    } catch (error) {
+      console.error(`Error resetting simplex ${flag}:`, error)
+      toast({
+        title: "Error",
+        description: error.message || `Failed to reset ${flag === "F" ? "fire" : "trouble"} status`,
+        variant: "destructive",
+      })
+    } finally {
+      setIsUpdatingAsset(false)
+    }
+  }
+
   // Update device location and address
   const handleUpdateLocation = async () => {
     if (!selectedAsset || !selectedBuilding || userRole !== "admin") {
@@ -401,6 +474,9 @@ export function AssetControlModal({
 
   if (!asset) return null
 
+  const panelActive = simplexStatusToActive(simplexStatus.F, simplexStatus.T)
+  const panelDisplay = getFireStatusDisplay(panelActive)
+
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="sm:max-w-[500px]">
@@ -445,6 +521,47 @@ export function AssetControlModal({
                   </AlertDescription>
                 </Alert>
               )}
+            </div>
+
+            {/* Panel fire / trouble status (AssetsList simplexStatus) */}
+            <div className="space-y-2">
+              <Label className="text-base font-semibold flex items-center gap-2">
+                <Flame className="h-4 w-4" />
+                Panel Alarm Status
+              </Label>
+              <div className="rounded-lg border p-3 space-y-1">
+                <p className="text-sm">
+                  F (Fire): <span className="font-mono font-semibold">{simplexStatus.F}</span>
+                  {" · "}
+                  T (Trouble): <span className="font-mono font-semibold">{simplexStatus.T}</span>
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Marker status:{" "}
+                  <span style={{ color: panelDisplay.color }}>{panelDisplay.label}</span>
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => handleResetSimplexFlag("F")}
+                  disabled={isUpdatingAsset || Number(simplexStatus.F) === 0}
+                  className="flex-1 border-red-300 text-red-700 hover:bg-red-50 dark:hover:bg-red-950/30"
+                >
+                  <Flame className="mr-2 h-4 w-4" />
+                  Reset Fire (F→0)
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => handleResetSimplexFlag("T")}
+                  disabled={isUpdatingAsset || Number(simplexStatus.T) === 0}
+                  className="flex-1 border-amber-300 text-amber-700 hover:bg-amber-50 dark:hover:bg-amber-950/30"
+                >
+                  <AlertTriangle className="mr-2 h-4 w-4" />
+                  Reset Trouble (T→0)
+                </Button>
+              </div>
             </div>
 
             {/* Activity Status (On/Off) */}
