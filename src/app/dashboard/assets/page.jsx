@@ -22,7 +22,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Upload, FileSpreadsheet, CheckCircle2, Image as ImageIcon, X, Loader2, Package, Search, MoreHorizontal, Trash2 } from "lucide-react"
+import { Upload, FileSpreadsheet, CheckCircle2, Image as ImageIcon, X, Loader2, Package, Search, MoreHorizontal, Trash2, FileText, ClipboardPaste } from "lucide-react"
 import { Checkbox } from "@/components/ui/checkbox"
 import { useToast } from "@/hooks/use-toast"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -36,9 +36,11 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
 import {
   Select,
@@ -572,6 +574,14 @@ const SIMPLEX_COLLECT_SYSTEM = "Fire Alarm System (FAS)"
 const SIMPLEX_COLLECT_CATEGORY = "FIRE & LIFE SAFETY (FLS)"
 const CSHOW_COLLECT_TIMEOUT_MS = 60000
 
+function generateAssetId(brand, system, itemType, index) {
+  const brandPart = brand ? brand.trim().toUpperCase().replace(/\s+/g, "-") : "NOBRAND"
+  const systemPart = system ? system.trim().toUpperCase().replace(/\s+/g, "-") : "NOSYS"
+  const itemTypePart = itemType ? itemType.trim().toUpperCase().replace(/\s+/g, "-") : "NOTYPE"
+  const indexPart = String(index).padStart(4, "0")
+  return `${brandPart}_${systemPart}_${itemTypePart}_${indexPart}`
+}
+
 function simplexDeviceToAsset(device, assetId) {
   const now = new Date().toISOString()
   const itemType = device.BAN || device.PointType || device.DeviceType || "Fire Device"
@@ -629,6 +639,112 @@ function simplexDeviceToAsset(device, assetId) {
     createdAt: now,
     updatedAt: now,
     rowNumber: 0,
+  }
+}
+
+/** Save parsed Simplex M-devices to AssetsList (shared by panel collect + TXT import). */
+async function importSimplexDevicesToAssetsList(devices, onProgress) {
+  const assetsCollection = collection(db, "AssetsList")
+  const existingAssetsSnapshot = await getDocs(assetsCollection)
+  const existingAssetCount = existingAssetsSnapshot.size
+
+  const existingAssetIds = new Set()
+  const existingDeviceAddresses = new Set()
+
+  existingAssetsSnapshot.forEach((docSnap) => {
+    const row = docSnap.data()
+    if (row.assetId) existingAssetIds.add(row.assetId.toLowerCase())
+    const addr = resolveAssetDeviceAddress(row)
+    if (addr) existingDeviceAddresses.add(addr.toLowerCase())
+  })
+
+  const newAssets = []
+  let skippedCount = 0
+
+  devices.forEach((device) => {
+    const address = resolveSimplexDeviceAddress({
+      deviceAddress: device.DeviceAddress,
+      loopNumber: device.LoopNumber,
+      deviceNumber: device.DeviceNumber,
+      subAdd: device.SubAdd,
+    })
+    if (!address) {
+      skippedCount++
+      return
+    }
+    if (existingDeviceAddresses.has(address.toLowerCase())) {
+      skippedCount++
+      return
+    }
+
+    const assetId = generateAssetId(
+      SIMPLEX_COLLECT_BRAND,
+      SIMPLEX_COLLECT_SYSTEM,
+      device.BAN || device.PointType || "Device",
+      existingAssetCount + newAssets.length + 1,
+    )
+
+    if (existingAssetIds.has(assetId.toLowerCase())) {
+      skippedCount++
+      return
+    }
+
+    existingDeviceAddresses.add(address.toLowerCase())
+    existingAssetIds.add(assetId.toLowerCase())
+    newAssets.push(simplexDeviceToAsset(device, assetId))
+  })
+
+  if (newAssets.length === 0) {
+    return {
+      successCount: 0,
+      skippedCount,
+      errorCount: 0,
+      parsedCount: devices.length,
+      empty: true,
+    }
+  }
+
+  let successCount = 0
+  let errorCount = 0
+  const batchSize = 25
+
+  const saveBatchWithRetry = async (batch, maxAttempts = 4) => {
+    let lastError = null
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        await addDocsBatch(assetsCollection, batch)
+        return true
+      } catch (error) {
+        lastError = error
+        if (attempt < maxAttempts - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)))
+        }
+      }
+    }
+    console.error("Error saving simplex asset batch:", lastError)
+    return false
+  }
+
+  for (let i = 0; i < newAssets.length; i += batchSize) {
+    const batch = newAssets.slice(i, i + batchSize)
+    const saved = await saveBatchWithRetry(batch)
+    if (saved) {
+      successCount += batch.length
+    } else {
+      errorCount += batch.length
+    }
+    onProgress?.({
+      total: newAssets.length,
+      processed: Math.min(i + batchSize, newAssets.length),
+    })
+  }
+
+  return {
+    successCount,
+    skippedCount,
+    errorCount,
+    parsedCount: devices.length,
+    empty: false,
   }
 }
 
@@ -697,6 +813,11 @@ export default function AssetsPage() {
   const panelConnected = useFirePanelStore((s) => s.connected)
   const panelMonitoring = useFirePanelStore((s) => s.monitoring)
   const [isCollecting, setIsCollecting] = useState(false)
+  const [isImportingSimplexText, setIsImportingSimplexText] = useState(false)
+  const [simplexPasteOpen, setSimplexPasteOpen] = useState(false)
+  const [simplexPasteText, setSimplexPasteText] = useState("")
+  const [simplexTxtFileName, setSimplexTxtFileName] = useState("")
+  const simplexFileInputRef = useRef(null)
   const canCollectAssets = panelConnected && !panelMonitoring
 
   const parseExcelToObjects = (workbook, sheetName) => {
@@ -1734,18 +1855,6 @@ export default function AssetsPage() {
     }
   }, [selectedBuildingName])
 
-  const generateAssetId = (brand, system, itemType, index) => {
-    // Create a prefix from brand, system, and itemType
-    const brandPart = brand ? brand.trim().toUpperCase().replace(/\s+/g, "-") : "NOBRAND"
-    const systemPart = system ? system.trim().toUpperCase().replace(/\s+/g, "-") : "NOSYS"
-    const itemTypePart = itemType ? itemType.trim().toUpperCase().replace(/\s+/g, "-") : "NOTYPE"
-    
-    // Format index with leading zeros (e.g., 001, 002, etc.)
-    const indexPart = String(index).padStart(4, "0")
-    
-    return `${brandPart}_${systemPart}_${itemTypePart}_${indexPart}`
-  }
-
   const processExcelData = (jsonData, existingAssetCount = 0) => {
     if (!jsonData || jsonData.length === 0) {
       throw new Error("Excel file is empty or has no data")
@@ -1998,121 +2107,7 @@ export default function AssetsPage() {
         )
       }
 
-      const devices = parseSimplexFile(data.response || "")
-      if (devices.length === 0) {
-        toast({
-          title: "No devices found",
-          description: "No M-devices were parsed from the panel response.",
-          variant: "destructive",
-        })
-        return
-      }
-
-      const assetsCollection = collection(db, "AssetsList")
-      const existingAssetsSnapshot = await getDocs(assetsCollection)
-      const existingAssetCount = existingAssetsSnapshot.size
-
-      const existingAssetIds = new Set()
-      const existingDeviceAddresses = new Set()
-
-      existingAssetsSnapshot.forEach((docSnap) => {
-        const row = docSnap.data()
-        if (row.assetId) existingAssetIds.add(row.assetId.toLowerCase())
-        const addr = resolveAssetDeviceAddress(row)
-        if (addr) existingDeviceAddresses.add(addr.toLowerCase())
-      })
-
-      const newAssets = []
-      let skippedCount = 0
-
-      devices.forEach((device) => {
-        const address = resolveSimplexDeviceAddress({
-          deviceAddress: device.DeviceAddress,
-          loopNumber: device.LoopNumber,
-          deviceNumber: device.DeviceNumber,
-          subAdd: device.SubAdd,
-        })
-        if (!address) {
-          skippedCount++
-          return
-        }
-        if (existingDeviceAddresses.has(address.toLowerCase())) {
-          skippedCount++
-          return
-        }
-
-        const assetId = generateAssetId(
-          SIMPLEX_COLLECT_BRAND,
-          SIMPLEX_COLLECT_SYSTEM,
-          device.BAN || device.PointType || "Device",
-          existingAssetCount + newAssets.length + 1,
-        )
-
-        if (existingAssetIds.has(assetId.toLowerCase())) {
-          skippedCount++
-          return
-        }
-
-        existingDeviceAddresses.add(address.toLowerCase())
-        existingAssetIds.add(assetId.toLowerCase())
-        newAssets.push(simplexDeviceToAsset(device, assetId))
-      })
-
-      if (newAssets.length === 0) {
-        toast({
-          title: "No new assets",
-          description: `Parsed ${devices.length} devices but all were skipped (duplicates or missing address).`,
-          variant: "default",
-        })
-        return
-      }
-
-      setIsLoading(true)
-      setUploadProgress({ total: newAssets.length, processed: 0 })
-
-      let successCount = 0
-      let errorCount = 0
-      const batchSize = 25
-
-      const saveBatchWithRetry = async (batch, maxAttempts = 4) => {
-        let lastError = null
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-          try {
-            await addDocsBatch(assetsCollection, batch)
-            return true
-          } catch (error) {
-            lastError = error
-            if (attempt < maxAttempts - 1) {
-              await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)))
-            }
-          }
-        }
-        console.error("Error saving collected asset batch:", lastError)
-        return false
-      }
-
-      for (let i = 0; i < newAssets.length; i += batchSize) {
-        const batch = newAssets.slice(i, i + batchSize)
-        const saved = await saveBatchWithRetry(batch)
-        if (saved) {
-          successCount += batch.length
-        } else {
-          errorCount += batch.length
-        }
-        setUploadProgress({
-          total: newAssets.length,
-          processed: Math.min(i + batchSize, newAssets.length),
-        })
-      }
-
-      setUploadSummary({ success: successCount, skipped: skippedCount, errors: errorCount })
-      setUploadSuccess(true)
-      fetchExistingAssets()
-
-      toast({
-        title: "Collect complete",
-        description: `Added ${successCount} assets from panel${skippedCount > 0 ? `, skipped ${skippedCount}` : ""}${errorCount > 0 ? ` (${errorCount} errors)` : ""}.`,
-      })
+      await runSimplexTextImport(data.response || "", "panel")
     } catch (error) {
       console.error("Collect assets error:", error)
       toast({
@@ -2124,6 +2119,109 @@ export default function AssetsPage() {
       setIsCollecting(false)
       setIsLoading(false)
       setUploadProgress({ total: 0, processed: 0 })
+    }
+  }
+
+  const runSimplexTextImport = async (text, sourceLabel = "file") => {
+    const trimmed = String(text || "").trim()
+    if (!trimmed) {
+      toast({
+        title: "No content",
+        description: "Paste or upload panel export text (cshow * output).",
+        variant: "destructive",
+      })
+      return
+    }
+
+    setIsLoading(true)
+    setUploadSuccess(false)
+
+    const devices = parseSimplexFile(trimmed)
+    if (devices.length === 0) {
+      toast({
+        title: "No devices found",
+        description: "No M-devices were parsed. Use Simplex cshow * export text.",
+        variant: "destructive",
+      })
+      setIsLoading(false)
+      return
+    }
+
+    setUploadProgress({ total: 0, processed: 0 })
+    const result = await importSimplexDevicesToAssetsList(devices, setUploadProgress)
+
+    if (result.empty) {
+      toast({
+        title: "No new assets",
+        description: `Parsed ${result.parsedCount} devices but all were skipped (duplicates or missing address).`,
+      })
+      setIsLoading(false)
+      setUploadProgress({ total: 0, processed: 0 })
+      return
+    }
+
+    setUploadSummary({
+      success: result.successCount,
+      skipped: result.skippedCount,
+      errors: result.errorCount,
+    })
+    setUploadSuccess(true)
+    fetchExistingAssets()
+
+    const sourceName =
+      sourceLabel === "panel"
+        ? "panel"
+        : sourceLabel === "paste"
+          ? "pasted text"
+          : simplexTxtFileName || "TXT file"
+
+    toast({
+      title: "Import complete",
+      description: `Added ${result.successCount} assets from ${sourceName}${result.skippedCount > 0 ? `, skipped ${result.skippedCount}` : ""}${result.errorCount > 0 ? ` (${result.errorCount} errors)` : ""}.`,
+    })
+
+    setIsLoading(false)
+    setUploadProgress({ total: 0, processed: 0 })
+  }
+
+  const handleImportSimplexTxtFile = async (event) => {
+    const selectedFile = event.target.files?.[0]
+    event.target.value = ""
+    if (!selectedFile) return
+
+    setIsImportingSimplexText(true)
+    setSimplexTxtFileName(selectedFile.name)
+
+    try {
+      const text = await selectedFile.text()
+      await runSimplexTextImport(text, "file")
+    } catch (error) {
+      console.error("Simplex TXT import error:", error)
+      toast({
+        title: "Import failed",
+        description: error.message || "Could not read the text file.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsImportingSimplexText(false)
+    }
+  }
+
+  const handleImportSimplexPaste = async () => {
+    setIsImportingSimplexText(true)
+    try {
+      await runSimplexTextImport(simplexPasteText, "paste")
+      setSimplexPasteOpen(false)
+      setSimplexPasteText("")
+    } catch (error) {
+      console.error("Simplex paste import error:", error)
+      toast({
+        title: "Import failed",
+        description: error.message || "Could not import pasted text.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsImportingSimplexText(false)
     }
   }
 
@@ -2279,7 +2377,7 @@ export default function AssetsPage() {
                     type="button"
                     variant="outline"
                     onClick={handleCollectAssets}
-                    disabled={isLoading || isCollecting || !canCollectAssets}
+                    disabled={isLoading || isCollecting || isImportingSimplexText || !canCollectAssets}
                     className="h-9 text-xs flex items-center gap-2"
                   >
                     {isCollecting ? (
@@ -2289,14 +2387,89 @@ export default function AssetsPage() {
                     )}
                     {isCollecting ? "Collecting..." : "Collect Assets"}
                   </Button>
-                  <p className="text-[10px] text-muted-foreground">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => simplexFileInputRef.current?.click()}
+                    disabled={isLoading || isCollecting || isImportingSimplexText}
+                    className="h-9 text-xs flex items-center gap-2"
+                  >
+                    {isImportingSimplexText ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <FileText className="h-3.5 w-3.5" />
+                    )}
+                    {isImportingSimplexText && simplexTxtFileName
+                      ? "Importing..."
+                      : "Import TXT File"}
+                  </Button>
+                  <input
+                    ref={simplexFileInputRef}
+                    type="file"
+                    accept=".txt,text/plain"
+                    className="hidden"
+                    onChange={handleImportSimplexTxtFile}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setSimplexPasteOpen(true)}
+                    disabled={isLoading || isCollecting || isImportingSimplexText}
+                    className="h-9 text-xs flex items-center gap-2"
+                  >
+                    <ClipboardPaste className="h-3.5 w-3.5" />
+                    Paste Panel Text
+                  </Button>
+                  <p className="text-[10px] text-muted-foreground min-w-[12rem] flex-1">
                     {!panelConnected
-                      ? "Connect on Network page first."
+                      ? "Collect needs Network connection. TXT / paste imports Simplex cshow * export (M-devices)."
                       : panelMonitoring
-                        ? "Stop monitoring on Network page before collecting."
-                        : "Runs cshow * on the panel and adds M-devices to AssetsList."}
+                        ? "Stop monitoring before Collect. TXT / paste work without the panel."
+                        : "Collect from panel, or import the same cshow * text from a .txt file or paste."}
                   </p>
                 </div>
+
+                <Dialog open={simplexPasteOpen} onOpenChange={setSimplexPasteOpen}>
+                  <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col">
+                    <DialogHeader>
+                      <DialogTitle>Paste Simplex panel export</DialogTitle>
+                      <DialogDescription>
+                        Paste the full output of <span className="font-mono">cshow *</span> (same format as
+                        devices.txt). M-address devices are added to AssetsList; duplicates are skipped.
+                      </DialogDescription>
+                    </DialogHeader>
+                    <Textarea
+                      value={simplexPasteText}
+                      onChange={(e) => setSimplexPasteText(e.target.value)}
+                      placeholder="Paste cshow * text here..."
+                      className="min-h-[280px] font-mono text-xs flex-1"
+                    />
+                    <DialogFooter className="gap-2 sm:gap-0">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => setSimplexPasteOpen(false)}
+                        disabled={isImportingSimplexText}
+                      >
+                        Cancel
+                      </Button>
+                      <Button
+                        type="button"
+                        onClick={handleImportSimplexPaste}
+                        disabled={isImportingSimplexText || !simplexPasteText.trim()}
+                      >
+                        {isImportingSimplexText ? (
+                          <>
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            Importing...
+                          </>
+                        ) : (
+                          "Import assets"
+                        )}
+                      </Button>
+                    </DialogFooter>
+                  </DialogContent>
+                </Dialog>
 
                 {/* Upload Form */}
                 {uploadMode === "bulk" ? (

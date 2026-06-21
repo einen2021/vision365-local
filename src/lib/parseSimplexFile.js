@@ -115,11 +115,23 @@ export function parseSimplexFile(content) {
   const results = [];
 
   for (const block of blocks) {
-    const headerMatch = block.match(/^~(?:(\d+):)?M(\d+)-(\d+)(?:-(\d+))?(?:\s|$)/);
+    let headerMatch = block.match(/^~(?:(\d+):)?M(\d+)-(\d+)(?:-(\d+))?(?:\s|$)/);
+
+    // Saved exports sometimes use ~@ or ~panel-node headers; M address is in NAM=
+    if (!headerMatch) {
+      const namMatch = block.match(/NAM=((?:\d+:)?M\d+-\d+(?:-\d+)?)/i);
+      if (namMatch) {
+        headerMatch = namMatch[1].match(/^(?:(\d+):)?M(\d+)-(\d+)(?:-(\d+))?$/i);
+      }
+    }
+
     if (!headerMatch) continue;
 
     const [, panelFromName, loopNumber, deviceNumber, subAddNumber] = headerMatch;
-    const bodyText = block.slice(headerMatch[0].length);
+    const headerAtStart = block.match(/^~(?:(\d+):)?M(\d+)-(\d+)/);
+    const bodyText = headerAtStart
+      ? block.slice(headerAtStart[0].length)
+      : block;
 
     const data = {};
     parseKeyValues(bodyText, data);
