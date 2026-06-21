@@ -9,13 +9,13 @@ const TROUBLE_LIST = "list t\n";
 const TOTAL_SUPERVISORY = "cshow a1 cval\r";
 const SUPERVISORY_LIST = "list s\n";
 
-const CONNECT_DELAY_MS = 1000;
+const CONNECT_DELAY_MS = 300;
 const COMMAND_TIMEOUT_MS = 2000;
 const LIST_COMMAND_TIMEOUT_MS = 15000;
 const BULK_COMMAND_TIMEOUT_MS = 60000;
 /** Resolve when no bytes arrive for this long (panel finished sending) */
-const IDLE_COMPLETE_MS = 400;
-const LIST_IDLE_COMPLETE_MS = 800;
+const IDLE_COMPLETE_MS = 100;
+const LIST_IDLE_COMPLETE_MS = 250;
 
 let oldFire = 0;
 let oldTrouble = 0;

@@ -389,7 +389,12 @@ export function AssetControlModal({
     try {
       const next = await resetSimplexFlag(selectedAsset, deviceAddress, flag)
       setSimplexStatus(next)
-      await useAssetFireStatusStore.getState().syncFromAssetsList()
+      useAssetFireStatusStore.getState().patchSimplexStatus(
+        selectedAsset.buildingAssetId || selectedAsset.id,
+        deviceAddress,
+        next,
+      )
+      useAssetFireStatusStore.getState().syncFromAssetsList()
       toast({
         title: "Success",
         description: flag === "F" ? "Fire status (F) reset to 0" : "Trouble status (T) reset to 0",

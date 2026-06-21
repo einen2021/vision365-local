@@ -13,6 +13,8 @@ export function AssetFireStatusProvider({ children }) {
   useEffect(() => {
     if (monitoring) {
       startPolling();
+      // Pull latest F/T as soon as monitoring starts
+      useAssetFireStatusStore.getState().syncFromAssetsList();
       return () => stopPolling();
     }
     stopPolling();

@@ -384,7 +384,7 @@ export default function ViewFloorPlanPage() {
     setConnectionType("polling")
     setIsConnected(true)
     fetchActiveStatuses()
-    pollingIntervalRef.current = setInterval(fetchActiveStatuses, 2000)
+    pollingIntervalRef.current = setInterval(fetchActiveStatuses, 500)
   }
 
   const startRealtimeListeners = () => {

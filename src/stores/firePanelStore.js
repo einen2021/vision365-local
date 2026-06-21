@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { apiFetch } from "@/lib/apiClient";
+import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
 
-export const POLL_INTERVAL_MS = 5000;
+export const POLL_INTERVAL_MS = 500;
 const MAX_LOG_LINES = 300;
 
 /** Parse API JSON safely — avoids cryptic errors when HTML error pages are returned */
@@ -91,6 +92,8 @@ export const useFirePanelStore = create((set, get) => ({
 
       if (pollRes.ok) {
         set({ panelData: pollData, lastError: "", ...updates });
+        // Refresh floor-map F/T markers right after panel poll updates AssetsList
+        void useAssetFireStatusStore.getState().syncFromAssetsList();
       } else {
         set({ lastError: pollData.error || "Poll failed", ...updates });
       }
@@ -103,14 +106,23 @@ export const useFirePanelStore = create((set, get) => ({
     const { pollTimer, connected, monitoring } = get();
     if (pollTimer || !connected || !monitoring) return;
 
-    get().runPoll();
-    const timer = setInterval(() => get().runPoll(), POLL_INTERVAL_MS);
-    set({ pollTimer: timer });
+    const scheduleNext = () => {
+      if (!get().monitoring) return;
+      const timer = setTimeout(async () => {
+        await get().runPoll();
+        if (get().monitoring) scheduleNext();
+      }, POLL_INTERVAL_MS);
+      set({ pollTimer: timer });
+    };
+
+    get().runPoll().finally(() => {
+      if (get().monitoring) scheduleNext();
+    });
   },
 
   stopPolling: () => {
     const { pollTimer } = get();
-    if (pollTimer) clearInterval(pollTimer);
+    if (pollTimer) clearTimeout(pollTimer);
     set({ pollTimer: null });
   },
 

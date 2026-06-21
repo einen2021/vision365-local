@@ -9,7 +9,7 @@ import {
 } from "@/lib/assetFireStatus";
 import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
 
-export const FIRE_STATUS_POLL_MS = 5000;
+export const FIRE_STATUS_POLL_MS = 1000;
 
 let pollTimer = null;
 
@@ -111,6 +111,22 @@ export const useAssetFireStatusStore = create((set, get) => ({
     byDeviceAddress: get().byDeviceAddress,
     byAssetId: get().byAssetId,
   }),
+
+  /** Instant UI update after manual F/T reset (before next DB poll). */
+  patchSimplexStatus: (assetId, deviceAddress, status) => {
+    const addr = normalizeDeviceAddress(deviceAddress);
+    const normalized = {
+      F: Number(status?.F ?? 0),
+      T: Number(status?.T ?? 0),
+    };
+    set((state) => {
+      const byDeviceAddress = { ...state.byDeviceAddress };
+      const byAssetId = { ...state.byAssetId };
+      if (addr) byDeviceAddress[addr] = normalized;
+      if (assetId) byAssetId[String(assetId)] = normalized;
+      return { byDeviceAddress, byAssetId, lastSync: Date.now() };
+    });
+  },
 }));
 
 /** Stable shallow selector — avoids infinite re-render loop */

@@ -271,7 +271,7 @@ export function onSnapshot(ref, onNext, onError) {
     } catch (err) {
       if (onError) onError(err);
     }
-    if (active) setTimeout(poll, 2000);
+    if (active) setTimeout(poll, 500);
   }
 
   poll();

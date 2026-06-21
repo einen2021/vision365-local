@@ -491,7 +491,7 @@ function CommunityOverviewContent() {
     };
 
     fetchGeneralAlarmMessages();
-    const interval = setInterval(fetchGeneralAlarmMessages, 10000); // Refresh every 10 seconds
+    const interval = setInterval(fetchGeneralAlarmMessages, 2000);
 
     return () => clearInterval(interval);
   }, [selectedBuilding, buildingList]);
