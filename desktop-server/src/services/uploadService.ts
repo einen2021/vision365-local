@@ -9,6 +9,10 @@ import {
   MAX_FILE_SIZE,
 } from "./storageService";
 import { generateId } from "../db/documentStore";
+import {
+  relativePathFromLocalUrl,
+  unlinkLocalAssetFile,
+} from "./localAssetPaths";
 
 export interface UploadResult {
   url: string;
@@ -50,10 +54,24 @@ export async function saveUpload(
   const safeName = sanitizeFilename(file.name);
   const timestamp = Date.now();
   const storedName = `${timestamp}_${safeName}`;
-  const categoryDir = getCategoryDir(paths, category);
 
   let relativePath: string;
-  if (storagePath) {
+
+  // Floor plans: copy into {AppData}/floor-plans/{building}/ (canonical location)
+  if (category === "floor-plans" && storagePath) {
+    const subPath = storagePath
+      .replace(/^uploads\/floor-plans\/?/, "")
+      .replace(/^floor-plans\/?/, "")
+      .replace(/^\//, "");
+    relativePath = path
+      .join("floor-plans", subPath, storedName)
+      .replace(/\\/g, "/");
+    const targetDir = subPath
+      ? safePath(paths.floorPlans, subPath)
+      : paths.floorPlans;
+    fs.mkdirSync(targetDir, { recursive: true });
+    fs.writeFileSync(path.join(targetDir, storedName), file.buffer);
+  } else if (storagePath) {
     const subPath = storagePath.replace(/^uploads\/?/, "").replace(/^\//, "");
     relativePath = path.join("uploads", subPath, storedName).replace(/\\/g, "/");
     const targetDir = safePath(paths.root, "uploads", subPath);
@@ -62,7 +80,7 @@ export async function saveUpload(
     fs.writeFileSync(fullPath, file.buffer);
   } else {
     relativePath = path.join("uploads", category, storedName).replace(/\\/g, "/");
-    const fullPath = safePath(categoryDir, storedName);
+    const fullPath = safePath(getCategoryDir(paths, category), storedName);
     fs.writeFileSync(fullPath, file.buffer);
   }
 
@@ -94,13 +112,9 @@ export async function saveUpload(
 }
 
 export async function deleteUpload(paths: AppPaths, filePath: string): Promise<void> {
-  const relative = filePath.replace(/^\/local\//, "").replace(/^\//, "");
-  const fullPath = safePath(paths.root, relative);
+  unlinkLocalAssetFile(paths.root, filePath);
 
-  if (fs.existsSync(fullPath)) {
-    fs.unlinkSync(fullPath);
-  }
-
+  const relative = relativePathFromLocalUrl(filePath);
   const files = getCollection("files");
   await files.deleteOne({ relative_path: relative });
 }

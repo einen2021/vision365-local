@@ -31,6 +31,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_data_path,
+            commands::resolve_local_asset_src,
             commands::get_api_port,
             commands::is_db_ready,
             commands::get_server_log,

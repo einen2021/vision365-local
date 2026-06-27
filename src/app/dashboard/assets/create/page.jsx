@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from "react"
 import { AppSidebar } from "@/components/app-sidebar"
+import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges"
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -1414,6 +1415,9 @@ export default function AssetCreatePage() {
                 </BreadcrumbItem>
               </BreadcrumbList>
             </Breadcrumb>
+          </div>
+          <div className="ml-auto flex items-center gap-2 px-8">
+            <FirePanelStatusBadges />
           </div>
         </header>
 

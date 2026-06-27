@@ -127,26 +127,80 @@ function getResolvableApiBase(): string {
   return webDesktopApiBase ?? "";
 }
 
+/** Normalize stored asset paths to /local/... URLs served by the desktop API. */
+export function normalizeLocalAssetUrl(url: string): string {
+  if (!url) return url;
+  if (url.startsWith("blob:") || url.startsWith("data:")) return url;
+  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+
+  const path = url.startsWith("/") ? url : `/${url}`;
+  if (path.startsWith("/local/")) return path;
+  if (path.startsWith("/floor-plans/") || path.startsWith("/uploads/")) {
+    return `/local${path}`;
+  }
+  return path;
+}
+
 export function resolveAssetUrl(url: string): string {
   if (!url) return url;
   if (url.startsWith("blob:") || url.startsWith("data:")) return url;
   if (url.startsWith("http://") || url.startsWith("https://")) return url;
 
-  const base = getResolvableApiBase();
-  let path = url;
-
-  // Legacy Firebase-style paths saved when upload fell back to mock storage
-  if (path.startsWith("/floor-plans/")) {
-    path = base
-      ? `/local/uploads/${path.slice(1)}`
-      : path;
-  } else if (path.startsWith("/uploads/")) {
-    path = `/local/${path.slice(1)}`;
-  }
+  const path = normalizeLocalAssetUrl(url);
 
   if (path.startsWith("/local/")) {
-    return base ? encodeURI(`${base}${path}`) : encodeURI(path);
+    const base =
+      getResolvableApiBase() ||
+      (typeof window !== "undefined"
+        ? `http://127.0.0.1:${DESKTOP_API_PORT}`
+        : "");
+    if (base) return encodeURI(`${base}${path}`);
+    // Web without local API — use bundled public/ copy for floor plans
+    if (path.startsWith("/local/floor-plans/")) {
+      return encodeURI(path.replace("/local", ""));
+    }
+    return encodeURI(path);
   }
 
   return encodeURI(path);
+}
+
+/** Resolve /local/ asset URLs in Tauri via convertFileSrc (avoids HTTPS→HTTP mixed content). */
+export async function resolveDesktopAssetUrl(url: string): Promise<string> {
+  const normalized = normalizeLocalAssetUrl(url);
+  if (!normalized) return normalized;
+  if (!isDesktop() || !normalized.startsWith("/local/")) {
+    return resolveAssetUrl(normalized);
+  }
+
+  let decodedUrl = normalized;
+  try {
+    decodedUrl = decodeURI(normalized);
+  } catch {
+    // keep normalized
+  }
+
+  try {
+    const { invoke, convertFileSrc } = await import("@tauri-apps/api/core");
+    const filePath = (await invoke("resolve_local_asset_src", {
+      url: decodedUrl,
+    })) as string;
+    return convertFileSrc(filePath);
+  } catch (err) {
+    console.warn("[resolveDesktopAssetUrl] convertFileSrc failed, trying HTTP fetch", err);
+  }
+
+  try {
+    await waitForDesktopApi();
+    const httpUrl = resolveAssetUrl(normalized);
+    const res = await fetch(httpUrl);
+    if (res.ok) {
+      const blob = await res.blob();
+      return URL.createObjectURL(blob);
+    }
+  } catch {
+    // ignore
+  }
+
+  return resolveAssetUrl(normalized);
 }

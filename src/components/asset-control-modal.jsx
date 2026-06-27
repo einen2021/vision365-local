@@ -484,19 +484,22 @@ export function AssetControlModal({
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent className="sm:max-w-[500px]">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[min(90vh,calc(100dvh-2rem))] flex-col gap-0 overflow-hidden p-0 sm:max-w-[500px]">
+        <DialogHeader className="shrink-0 space-y-1.5 border-b px-6 py-4 pr-12">
           <DialogTitle className="flex items-center gap-2">
-            <Edit className="h-5 w-5" />
-            Asset Control - {selectedAsset?.assetName || asset.assetName || asset.name || "Asset"}
+            <Edit className="h-5 w-5 shrink-0" />
+            <span className="truncate">
+              Asset Control - {selectedAsset?.assetName || asset.assetName || asset.name || "Asset"}
+            </span>
           </DialogTitle>
           <DialogDescription>
             {selectedAsset?.category || asset.category} at position ({asset.x}, {asset.y})
           </DialogDescription>
         </DialogHeader>
 
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
         {userRole === "admin" && buildingStatus?.toLowerCase() === "construction" ? (
-          <div className="space-y-6 py-4">
+          <div className="space-y-6">
             {/* Installation Status */}
             <div className="space-y-2">
               <Label className="text-base font-semibold flex items-center gap-2">
@@ -689,7 +692,7 @@ export function AssetControlModal({
             </div>
           </div>
         ) : (
-          <div className="py-4">
+          <div>
             <Alert>
               <AlertTitle>
                 {userRole !== "admin" ? "Access Restricted" : "Feature Unavailable"}
@@ -702,8 +705,9 @@ export function AssetControlModal({
             </Alert>
           </div>
         )}
+        </div>
 
-        <DialogFooter>
+        <DialogFooter className="shrink-0 border-t px-6 py-4">
           <Button variant="outline" onClick={onClose}>
             Close
           </Button>

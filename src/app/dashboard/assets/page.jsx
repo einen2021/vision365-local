@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useMemo } from "react"
 import { AppSidebar } from "@/components/app-sidebar"
+import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges"
 import dynamic from "next/dynamic"
 const ClientModeToggle = dynamic(
   () => import("@/components/theme-toggle").then((mod) => ({ default: mod.ModeToggle })),
@@ -54,7 +55,7 @@ import { db, storage } from "@/config/firebase"
 import { useAppData } from "@/hooks/useAppData"
 import { getBrandOptionsFromRegistry, loadBrandRegistry } from "@/utils/brandRegistryService"
 import secureLocalStorage from "react-secure-storage"
-import { collection, addDoc, addDocsBatch, deleteDocsBatch, getDocs, query, where, orderBy, limit, doc, updateDoc, deleteDoc } from "firebase/firestore"
+import { collection, addDoc, addDocsBatch, setDocsBatch, deleteDocsBatch, getDocs, query, where, orderBy, limit, doc, updateDoc, deleteDoc } from "firebase/firestore"
 import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage"
 import { PageHelpBanner } from "@/components/page-help-banner"
 import { FaqHelpButton } from "@/components/faq-help-button"
@@ -650,12 +651,12 @@ async function importSimplexDevicesToAssetsList(devices, onProgress) {
   const existingAssetsSnapshot = await getDocs(assetsCollection)
   const existingAssetCount = existingAssetsSnapshot.size
 
-  const existingAssetIds = new Set()
+  const existingDocIds = new Set()
   const existingDeviceAddresses = new Set()
 
   existingAssetsSnapshot.forEach((docSnap) => {
     const row = docSnap.data()
-    if (row.assetId) existingAssetIds.add(row.assetId.toLowerCase())
+    existingDocIds.add(docSnap.id.toLowerCase())
     const addr = resolveAssetDeviceAddress(row)
     if (addr) existingDeviceAddresses.add(addr.toLowerCase())
   })
@@ -676,10 +677,15 @@ async function importSimplexDevicesToAssetsList(devices, onProgress) {
       skippedCount++
       return
     }
-    // if (existingDeviceAddresses.has(address.toLowerCase())) {
-    //   skippedCount++
-    //   return
-    // }
+
+    const normalizedAddress = address.toLowerCase()
+    if (
+      existingDocIds.has(normalizedAddress) ||
+      existingDeviceAddresses.has(normalizedAddress)
+    ) {
+      skippedCount++
+      return
+    }
 
     const assetId = generateAssetId(
       SIMPLEX_COLLECT_BRAND,
@@ -688,14 +694,12 @@ async function importSimplexDevicesToAssetsList(devices, onProgress) {
       existingAssetCount + newAssets.length + 1,
     )
 
-    if (existingAssetIds.has(assetId.toLowerCase())) {
-      skippedCount++
-      return
-    }
-
-    existingDeviceAddresses.add(address.toLowerCase())
-    existingAssetIds.add(assetId.toLowerCase())
-    newAssets.push(simplexDeviceToAsset(device, assetId))
+    existingDeviceAddresses.add(normalizedAddress)
+    existingDocIds.add(normalizedAddress)
+    newAssets.push({
+      id: address,
+      data: simplexDeviceToAsset(device, assetId),
+    })
   })
 
   if (newAssets.length === 0) {
@@ -716,7 +720,7 @@ async function importSimplexDevicesToAssetsList(devices, onProgress) {
     let lastError = null
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        await addDocsBatch(assetsCollection, batch)
+        await setDocsBatch(assetsCollection, batch)
         return true
       } catch (error) {
         lastError = error
@@ -2397,6 +2401,9 @@ export default function AssetsPage() {
                 </BreadcrumbItem>
               </BreadcrumbList>
             </Breadcrumb>
+          </div>
+          <div className="ml-auto flex items-center gap-2 px-8">
+            <FirePanelStatusBadges />
           </div>
         </header>
 

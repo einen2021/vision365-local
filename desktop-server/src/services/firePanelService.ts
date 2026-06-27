@@ -22,9 +22,17 @@ function enqueueCommand<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+/** Remove hidden control chars (paste/JSON) and collapse whitespace. */
+function cleanCommandText(command: string) {
+  return command
+    .replace(/[\x00-\x1f\x7f]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
 function timeoutForCommand(command: string, overrideMs?: number) {
   if (overrideMs && overrideMs > 0) return overrideMs;
-  const trimmed = command.trim().toLowerCase();
+  const trimmed = cleanCommandText(command).toLowerCase();
   if (trimmed.includes("cshow *") || trimmed.includes("cshow*"))
     return BULK_COMMAND_TIMEOUT_MS;
   if (trimmed.startsWith("list")) return LIST_COMMAND_TIMEOUT_MS;
@@ -33,7 +41,7 @@ function timeoutForCommand(command: string, overrideMs?: number) {
 }
 
 function idleMsForCommand(command: string) {
-  const trimmed = command.trim().toLowerCase();
+  const trimmed = cleanCommandText(command).toLowerCase();
   if (
     trimmed.startsWith("list") ||
     trimmed.includes("cshow *") ||
@@ -49,19 +57,22 @@ function isDefiniteComplete(response: string) {
 }
 
 function isQuickComplete(command: string, response: string) {
-  const trimmed = command.trim().toLowerCase();
+  const trimmed = cleanCommandText(command).toLowerCase();
   if (trimmed.startsWith("cshow") && trimmed.includes("cval")) {
     return /CVAL=\d+/i.test(response);
+  }
+  if (trimmed.startsWith("login")) {
+    return /ACCESS GRANTED/i.test(response) || /INVALID PASSCODE/i.test(response);
   }
   return false;
 }
 
 function isListCommand(command: string) {
-  return command.trim().toLowerCase().startsWith("list");
+  return cleanCommandText(command).toLowerCase().startsWith("list");
 }
 
 function isCvalCommand(command: string) {
-  const trimmed = command.trim().toLowerCase();
+  const trimmed = cleanCommandText(command).toLowerCase();
   return trimmed.startsWith("cshow") && trimmed.includes("cval");
 }
 
@@ -79,14 +90,11 @@ function addLog(message: string) {
   serverLog(`[fire-panel] ${message}`);
 }
 
-// trim() strips \r/\n — never use it on commands that already have line endings
+// Panel service port expects CR (PuTTY default). LF causes login passcode failures.
 function normalizeCommand(command: string) {
-  if (command.endsWith("\r") || command.endsWith("\n")) {
-    return command;
-  }
-  const trimmed = command.trim();
-  if (trimmed.startsWith("cshow")) return `${trimmed}\r`;
-  return `${trimmed}\n`;
+  const cleaned = cleanCommandText(command);
+  if (!cleaned) return "\r";
+  return `${cleaned}\r`;
 }
 
 function ensureConnected() {
@@ -198,7 +206,7 @@ function sendCommandOnce(command: string, timeoutMs?: number) {
       idleTimer = setTimeout(() => {
         if (response.length === 0) return;
         // List output ends with _DNE — keep reading until the panel marks done
-        if (isListCommand(normalized) && !isDefiniteComplete(response)) {
+        if (isListCommand(command) && !isDefiniteComplete(response)) {
           return;
         }
         finish("(idle)");
@@ -222,7 +230,7 @@ function sendCommandOnce(command: string, timeoutMs?: number) {
         return;
       }
 
-      if (isQuickComplete(normalized, response)) {
+      if (isQuickComplete(command, response)) {
         scheduleIdleComplete();
         return;
       }
@@ -245,7 +253,7 @@ export async function sendFirePanelCommand(
   timeoutMs?: number,
 ) {
   ensureConnected();
-  addLog(`Manual command: ${command.trim()}`);
+  addLog(`Manual command: ${cleanCommandText(command)}`);
   const response = await sendCommand(command, timeoutMs);
   return { response };
 }

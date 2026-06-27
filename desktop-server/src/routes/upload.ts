@@ -1,7 +1,9 @@
 import { Hono } from "hono";
 import { type AppPaths } from "../services/storageService";
 import { saveUpload, deleteUpload } from "../services/uploadService";
-import { safePath } from "../services/storageService";
+import {
+  findLocalAssetFile,
+} from "../services/localAssetPaths";
 import fs from "fs";
 import path from "path";
 
@@ -43,12 +45,13 @@ export function createUploadRoutes(paths: AppPaths) {
     }
   });
 
-  /** Serve local files */
+  /** Serve local files from app data directory */
   upload.get("/local/*", (c) => {
-    const relativePath = c.req.path.replace("/local/", "");
-    const fullPath = safePath(paths.root, relativePath);
+    const wildcard = c.req.param("*");
+    const rawPath = wildcard || c.req.path.replace(/^\/local\/?/, "");
+    const fullPath = findLocalAssetFile(paths.root, rawPath);
 
-    if (!fs.existsSync(fullPath)) {
+    if (!fullPath) {
       return c.json({ error: "File not found" }, 404);
     }
 

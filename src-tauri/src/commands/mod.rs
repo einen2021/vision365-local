@@ -12,6 +12,45 @@ pub struct WindowState {
 }
 
 #[tauri::command]
+pub fn resolve_local_asset_src(app: AppHandle, url: String) -> Result<String, String> {
+    if !url.starts_with("/local/") {
+        return Err("Not a local asset URL".into());
+    }
+
+    let relative = url
+        .trim_start_matches("/local/")
+        .trim_start_matches('/')
+        .replace('\\', "/");
+
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+
+    let mut candidates = vec![app_data.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))];
+    if !relative.starts_with("uploads/") {
+        candidates.push(
+            app_data.join("uploads").join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        );
+    }
+    if relative.starts_with("uploads/floor-plans/") {
+        candidates.push(
+            app_data.join(relative["uploads/".len()..].replace('/', std::path::MAIN_SEPARATOR_STR)),
+        );
+    }
+    if relative.starts_with("floor-plans/") {
+        candidates.push(
+            app_data.join("uploads").join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        );
+    }
+
+    for path in candidates {
+        if path.is_file() {
+            return Ok(path.to_string_lossy().to_string());
+        }
+    }
+
+    Err(format!("Local asset not found: {url}"))
+}
+
+#[tauri::command]
 pub fn get_app_data_path(app: AppHandle) -> Result<String, String> {
     app.path()
         .app_data_dir()

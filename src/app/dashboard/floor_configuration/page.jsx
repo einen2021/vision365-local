@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from "react"
 import { AppSidebar } from "@/components/app-sidebar"
+import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges"
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -44,7 +45,7 @@ import secureLocalStorage from "react-secure-storage"
 import { parseStoredUser } from "@/lib/sessionUser"
 import dynamic from "next/dynamic"
 import { useAppData } from "@/hooks/useAppData"
-import { db, storage } from "@/config/firebase"
+import { db } from "@/config/firebase"
 import { collection, doc, setDoc, getDocs, updateDoc } from "firebase/firestore"
 import {
   buildingsMatch,
@@ -58,7 +59,7 @@ import {
   resolveMappingDeviceFields,
 } from "@/lib/floorMapAssets"
 import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress"
-import { ref, uploadBytes, getDownloadURL } from "firebase/storage"
+import { uploadFloorPlanImage } from "@/lib/floorPlanStorage"
 import FirestoreService from "@/services/firestoreService"
 import { PageHelpBanner } from "@/components/page-help-banner"
 import { FaqHelpButton } from "@/components/faq-help-button"
@@ -822,14 +823,13 @@ export default function CreateFloorPlanPage() {
       }
 
       const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      
-      // Upload image to Firebase Storage
-      const timestamp = Date.now()
-      const imageFileName = `${floorPlanName}_${timestamp}.${selectedImage.name.split('.').pop()}`
-      const storageRef = ref(storage, `floor-plans/${buildingNameWithSuffix}/${imageFileName}`)
-      
-      await uploadBytes(storageRef, selectedImage)
-      const imageUrl = await getDownloadURL(storageRef)
+
+      // Copy image into app data (floor-plans/{building}/) and get /local/ URL
+      const imageUrl = await uploadFloorPlanImage(
+        buildingNameWithSuffix,
+        floorPlanName,
+        selectedImage,
+      )
       
       // Create floor plan document in {buildingName}BuildingDB/floorMaps/floors/{floorPlanName}
       await FirestoreService.createFloorPlan(buildingNameWithSuffix, floorPlanName, imageUrl)
@@ -1467,6 +1467,9 @@ export default function CreateFloorPlanPage() {
               </div>
             )}
           </div>
+          <div className="ml-auto flex items-center gap-2 px-4 md:px-8">
+            <FirePanelStatusBadges />
+          </div>
         </header>
 
         <div className="flex flex-1 flex-col gap-4 md:gap-6 p-4 md:p-6 pt-0">
@@ -1726,26 +1729,11 @@ export default function CreateFloorPlanPage() {
                               className="w-6 h-6 object-contain"
                               onError={handleImageError}
                             />
-                            <div className="absolute top-full left-1/2 transform -translate-x-1/2 mt-2 w-48 bg-gray-800 text-white text-sm rounded-md shadow-lg opacity-0 group-hover:opacity-100 transition-opacity duration-300 z-20 p-2">
+                            <div className="absolute top-full left-1/2 transform -translate-x-1/2 mt-2 max-w-[12rem] bg-gray-800 text-white text-sm rounded-md shadow-lg opacity-0 group-hover:opacity-100 transition-opacity duration-300 z-20 px-2 py-1">
                               <div className="absolute top-0 left-1/2 transform -translate-x-1/2 -mt-1 w-0 h-0 border-l-[8px] border-r-[8px] border-b-[8px] border-gray-800 border-t-transparent"></div>
-                              <p className="font-bold">{mapping.assetName}</p>
-                              <p className="text-xs text-gray-300">{mapping.category}</p>
-                              
-                              {mapping.details && (
-                                <div className="mt-2 text-xs space-y-1">
-                                  {(() => {
-                                    const keysToIgnore = new Set(["img_url", "customImageUrl", "category", "assetName", "name", "id", "deviceName"]);
-                                    return Object.entries(mapping.details)
-                                      .filter(([key, value]) => !keysToIgnore.has(key) && value)
-                                      .map(([key, value]) => (
-                                        <p key={key} className="capitalize truncate">
-                                          <span className="font-semibold">{key.replace(/_/g, " ")}:</span> {String(value)}
-                                        </p>
-                                      ));
-                                  })()}
-                                </div>
-                              )}
-
+                              <p className="truncate">
+                                {resolveAssetDeviceAddress(mapping) || mapping.deviceAddress || mapping.assetName}
+                              </p>
                               <button
                                 onClick={() => removeAssetMapping(mapping.id)}
                                 className="absolute top-1 right-1 text-gray-400 hover:text-gray-100"

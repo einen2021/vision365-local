@@ -6,6 +6,7 @@ import { usePageAuth } from "@/hooks/usePageAuth";
 import { Loader2, Plus, Trash2 } from "lucide-react";
 import { AppSidebar } from "@/components/app-sidebar";
 import { ModeToggle } from "@/components/theme-toggle";
+import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -426,6 +427,9 @@ export default function EditBuildingDetailsPage() {
               </BreadcrumbItem>
             </BreadcrumbList>
           </Breadcrumb>
+          <div className="ml-auto flex items-center gap-2">
+            <FirePanelStatusBadges />
+          </div>
         </header>
 
         <div className="flex flex-1 flex-col gap-4 p-4 pt-0">

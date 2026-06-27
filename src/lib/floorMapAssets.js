@@ -212,22 +212,61 @@ export async function loadFloorMapAssetsFromAssetsList(db, buildingName, floorPl
   return mappings
 }
 
+/** True when two floor-map placements refer to the same physical asset. */
+export function isDuplicateFloorPlacement(a, b) {
+  if (!a || !b) return false
+  if (a.assetsListId && b.assetsListId && a.assetsListId === b.assetsListId) return true
+  if (a.id && b.id && a.id === b.id) return true
+  if (a.id && b.assetsListId && a.id === b.assetsListId) return true
+  if (a.assetsListId && b.id && a.assetsListId === b.id) return true
+
+  const samePosition =
+    typeof a.x === "number" &&
+    typeof b.x === "number" &&
+    typeof a.y === "number" &&
+    typeof b.y === "number" &&
+    a.x === b.x &&
+    a.y === b.y
+  if (!samePosition) return false
+
+  const addrA = resolveAssetDeviceAddress(a)
+  const addrB = resolveAssetDeviceAddress(b)
+  if (addrA && addrB) return addrA === addrB
+  return true
+}
+
+function collectAllPlacements(assetMappings) {
+  const all = []
+  Object.values(assetMappings || {}).forEach((assetsByName) => {
+    Object.values(assetsByName || {}).forEach((locations) => {
+      if (Array.isArray(locations)) all.push(...locations)
+    })
+  })
+  return all
+}
+
 /** Merge AssetsList placements into nested assetMappings used by the view page. */
 export function mergeAssetsListIntoAssetMappings(assetMappings, assetsListMappings) {
   const merged = { ...assetMappings }
+  const existingPlacements = collectAllPlacements(merged)
 
   assetsListMappings.forEach((asset) => {
+    if (existingPlacements.some((loc) => isDuplicateFloorPlacement(loc, asset))) {
+      return
+    }
+
     const category = asset.category || "uploaded"
     const assetName = asset.assetName
 
     if (!merged[category]) merged[category] = {}
     if (!merged[category][assetName]) merged[category][assetName] = []
 
-    const alreadyExists = merged[category][assetName].some(
-      (loc) => loc.id === asset.id || loc.assetsListId === asset.assetsListId,
+    const alreadyExists = merged[category][assetName].some((loc) =>
+      isDuplicateFloorPlacement(loc, asset),
     )
     if (!alreadyExists) {
       merged[category][assetName].push(asset)
+      existingPlacements.push(asset)
     }
   })
 

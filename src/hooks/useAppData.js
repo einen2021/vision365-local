@@ -34,8 +34,20 @@ export function useAppData(options = {}) {
   const buildingNames = ctx.getAssignedBuildings();
   const scopedCommunities = ctx.getScopedCommunities();
 
+  const {
+    firePanelMonitoring: _fm,
+    firePanelMonitorLogs: _fml,
+    firePanelState: _fps,
+    firePanelStateLoading: _fpsl,
+    startFirePanelMonitoring: _sfm,
+    stopFirePanelMonitoring: _stopfm,
+    toggleFirePanelMonitoring: _tfm,
+    fetchFirePanelState: _ffps,
+    ...appData
+  } = ctx;
+
   return {
-    ...ctx,
+    ...appData,
     effectiveRole,
     role: effectiveRole,
     buildingNames,

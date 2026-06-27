@@ -5,6 +5,7 @@ import secureLocalStorage from "react-secure-storage";
 import { useToast } from "@/hooks/use-toast";
 import { AppSidebar } from "@/components/app-sidebar";
 import { ModeToggle } from "@/components/theme-toggle";
+import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -520,6 +521,9 @@ export default function EditBuildingStatus() {
               </BreadcrumbItem>
             </BreadcrumbList>
           </Breadcrumb>
+          <div className="ml-auto flex items-center gap-2">
+            <FirePanelStatusBadges />
+          </div>
         </header>
 
         <div className="flex flex-1 flex-col gap-4 p-4 pt-0">

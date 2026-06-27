@@ -1,6 +1,7 @@
 "use client"
 import { useState, useEffect, useRef, useCallback } from "react"
 import { AppSidebar } from "@/components/app-sidebar"
+import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges"
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -1673,6 +1674,9 @@ export default function ManageFloorPlansPage() {
               </div>
             )}
           </div>
+          <div className="ml-auto flex items-center gap-2 px-4 md:px-8">
+            <FirePanelStatusBadges />
+          </div>
         </header>
 
         <div className="flex flex-1 flex-col gap-4 md:gap-6 p-4 md:p-6 pt-0">
@@ -2765,13 +2769,7 @@ export default function ManageFloorPlansPage() {
                                   <div
                                     className={`absolute ${isMobile ? "top-8" : "top-10"} left-1/2 transform -translate-x-1/2 bg-black text-white text-xs px-2 py-1 rounded whitespace-nowrap max-w-32 truncate opacity-0 group-hover:opacity-100 transition-opacity z-20`}
                                   >
-                                    {asset.assetName}
-                                    <div className="text-xs opacity-75">
-                                      Natural: ({asset.x}, {asset.y})
-                                    </div>
-                                    <div className="text-xs opacity-75">
-                                      Display: ({Math.round(displayX)}, {Math.round(displayY)})
-                                    </div>
+                                    {resolveAssetDeviceAddress(asset) || asset.deviceAddress || asset.assetName}
                                   </div>
                                   {/* Delete button for individual assets in edit mode */}
                                   {isEditMode && (

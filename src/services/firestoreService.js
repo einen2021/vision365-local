@@ -7,6 +7,7 @@ import {
   setDoc,
   updateDoc,
   deleteDoc,
+  deleteField,
   query,
   where,
   orderBy,
@@ -20,10 +21,14 @@ import {
   listAll,
   deleteObject,
 } from "firebase/storage";
+import { uploadFloorPlanImage } from "@/lib/floorPlanStorage";
 import {
+  buildingsMatch,
+  buildClearFloorMapPositionPayload,
   getFloorMapName,
   hasFloorPosition,
   loadFloorMapAssetsFromAssetsList,
+  matchesFloorMap,
 } from "@/lib/floorMapAssets";
 
 /**
@@ -448,6 +453,85 @@ class FirestoreService {
   }
 
   /**
+   * Remove floor-map placement fields from AssetsList and building asset docs.
+   */
+  static async clearPlacementsForFloorMap(buildingName, floorPlanName) {
+    const shortBuilding = buildingName.replace(/BuildingDB$/i, "");
+    const now = new Date().toISOString();
+    const updates = [];
+
+    const categoryKeys = [
+      "fire-life-safety",
+      "electrical",
+      "hvac",
+      "plumbing",
+      "elv",
+      "security",
+      "vertical-transport",
+      "lighting",
+      "bms",
+      "landscaping",
+      "additional",
+    ];
+
+    const assetsListSnap = await getDocs(collection(db, "AssetsList"));
+    assetsListSnap.forEach((docSnap) => {
+      const data = docSnap.data();
+      if (!buildingsMatch(data.building, shortBuilding)) return;
+      if (!matchesFloorMap(data, floorPlanName)) return;
+      if (!hasFloorPosition(data)) return;
+
+      updates.push(
+        updateDoc(doc(db, "AssetsList", docSnap.id), {
+          ...buildClearFloorMapPositionPayload(),
+          building: "",
+          updatedAt: now,
+        }),
+      );
+    });
+
+    for (const categoryKey of categoryKeys) {
+      try {
+        const categorySnapshot = await getDocs(
+          collection(db, buildingName, "asset", categoryKey),
+        );
+        categorySnapshot.forEach((assetDoc) => {
+          const data = assetDoc.data();
+          if (!matchesFloorMap(data, floorPlanName)) return;
+          if (!hasFloorPosition(data)) return;
+
+          updates.push(
+            updateDoc(
+              doc(db, buildingName, "asset", categoryKey, assetDoc.id),
+              {
+                x: deleteField(),
+                y: deleteField(),
+                relativeX: deleteField(),
+                relativeY: deleteField(),
+                floorPlanName: deleteField(),
+                floorMapName: deleteField(),
+                position: deleteField(),
+                updatedAt: now,
+              },
+            ),
+          );
+        });
+      } catch (error) {
+        console.error(
+          `Error clearing floor placements in ${categoryKey}:`,
+          error,
+        );
+      }
+    }
+
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+
+    return updates.length;
+  }
+
+  /**
    * Delete a floor map
    * @param {string} buildingName - Building name (with BuildingDB suffix)
    * @param {string} floorPlanName - Floor plan name
@@ -455,6 +539,8 @@ class FirestoreService {
    */
   static async deleteFloorMap(buildingName, floorPlanName) {
     try {
+      await this.clearPlacementsForFloorMap(buildingName, floorPlanName);
+
       const floorRef = doc(
         db,
         buildingName,
@@ -510,13 +596,11 @@ class FirestoreService {
    */
   static async updateFloorMapImage(buildingName, floorPlanName, imageFile) {
     try {
-      // Upload image to Firebase Storage
-      const storageRef = ref(
-        storage,
-        `floor-plans/${buildingName}/${floorPlanName}_${Date.now()}.${imageFile.name.split(".").pop()}`,
+      const imageUrl = await uploadFloorPlanImage(
+        buildingName,
+        floorPlanName,
+        imageFile,
       );
-      await uploadBytes(storageRef, imageFile);
-      const imageUrl = await getDownloadURL(storageRef);
 
       // Update floor plan document with new image URL
       const floorRef = doc(

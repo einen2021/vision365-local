@@ -4,6 +4,7 @@ import { useEffect, useState, Suspense } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import dynamic from "next/dynamic"
 import { AppSidebar } from "@/components/app-sidebar"
+import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges"
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -128,6 +129,9 @@ function AssetDetailsContent() {
                 </BreadcrumbItem>
               </BreadcrumbList>
             </Breadcrumb>
+          </div>
+          <div className="ml-auto flex items-center gap-2 px-8">
+            <FirePanelStatusBadges />
           </div>
         </header>
 

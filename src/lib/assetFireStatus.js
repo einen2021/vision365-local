@@ -16,6 +16,7 @@ export function normalizeSimplexStatus(entry) {
   return {
     F: Number(entry.F ?? entry.f ?? 0),
     T: Number(entry.T ?? entry.t ?? 0),
+    S: Number(entry.S ?? entry.s ?? 0),
   };
 }
 
@@ -43,16 +44,61 @@ export function isFireTroubleActive(activeValue) {
 function resolveStatusFromCache(cache, deviceAddress, assetId) {
   if (!cache) return null;
 
-  const addr = normalizeDeviceAddress(deviceAddress);
-  if (addr && cache.byDeviceAddress[addr] !== undefined) {
-    return normalizeSimplexStatus(cache.byDeviceAddress[addr]);
+  const addressKeys = collectDeviceAddressKeys(deviceAddress);
+  for (const addr of addressKeys) {
+    if (cache.byDeviceAddress[addr] !== undefined) {
+      return normalizeSimplexStatus(cache.byDeviceAddress[addr]);
+    }
   }
 
-  if (assetId && cache.byAssetId[assetId] !== undefined) {
-    return normalizeSimplexStatus(cache.byAssetId[assetId]);
+  const idKeys = collectAssetIdKeys(assetId);
+  for (const id of idKeys) {
+    if (cache.byAssetId[id] !== undefined) {
+      return normalizeSimplexStatus(cache.byAssetId[id]);
+    }
   }
 
   return null;
+}
+
+/** All cache keys to try for a panel / Simplex device address. */
+export function collectDeviceAddressKeys(deviceAddress) {
+  const keys = new Set();
+  const raw = String(deviceAddress || "").trim();
+  if (!raw) return keys;
+
+  keys.add(raw.toUpperCase());
+  keys.add(normalizeDeviceAddress(raw));
+
+  const resolved = resolveAssetDeviceAddress({ deviceAddress: raw });
+  if (resolved) {
+    keys.add(resolved.toUpperCase());
+    keys.add(normalizeDeviceAddress(resolved));
+  }
+
+  return keys;
+}
+
+/** All cache keys to try for a floor-map / AssetsList asset id. */
+export function collectAssetIdKeys(assetId) {
+  const keys = new Set();
+  const raw = String(assetId || "").trim();
+  if (!raw) return keys;
+  keys.add(raw);
+  keys.add(raw.toLowerCase());
+  return keys;
+}
+
+export function indexStatusByAddressKeys(byDeviceAddress, deviceAddress, status) {
+  for (const key of collectDeviceAddressKeys(deviceAddress)) {
+    byDeviceAddress[key] = status;
+  }
+}
+
+export function indexStatusByAssetIdKeys(byAssetId, assetId, status) {
+  for (const key of collectAssetIdKeys(assetId)) {
+    byAssetId[key] = status;
+  }
 }
 
 /** Resolve { F, T } from cache or fallback active value */
@@ -121,7 +167,7 @@ function mapsEqual(a, b) {
   for (const key of keysA) {
     const left = normalizeSimplexStatus(a[key]);
     const right = normalizeSimplexStatus(b[key]);
-    if (left.F !== right.F || left.T !== right.T) return false;
+    if (left.F !== right.F || left.T !== right.T || left.S !== right.S) return false;
   }
   return true;
 }
@@ -180,14 +226,7 @@ function metaMapsEqual(a, b) {
 export function getAssetMarkerTooltip(marker, metaByAssetId = {}) {
   const id = marker?.id || marker?.assetId || marker?.buildingAssetId || "";
   const meta = (id && metaByAssetId[id]) || {};
-
-  const location = String(
-    meta.deviceLocation || marker?.deviceLocation || "",
-  ).trim();
   const address = String(resolveAssetDeviceAddress({ ...marker, ...meta }) || "").trim();
-
-  if (location && address) return `${location} · ${address}`;
-  if (location) return location;
   if (address) return address;
   return marker?.assetName || marker?.itemType || id || "Asset";
 }

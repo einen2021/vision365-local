@@ -220,6 +220,26 @@ export async function addDocsBatch(collectionRef, items) {
   return items.length;
 }
 
+/** Set many documents with explicit IDs in one request */
+export async function setDocsBatch(collectionRef, items) {
+  if (!items.length) return 0;
+
+  const now = new Date().toISOString();
+  const operations = items.map(({ id, data }) => ({
+    type: "set",
+    path: [...collectionRef._path, String(id)],
+    data: {
+      ...data,
+      createdAt: data.createdAt || now,
+      updatedAt: data.updatedAt || now,
+    },
+    options: {},
+  }));
+
+  await apiCall({ op: "batch", operations });
+  return items.length;
+}
+
 /** Delete many documents in batched requests (500 ops per batch). */
 export async function deleteDocsBatch(docRefs) {
   if (!docRefs.length) return 0;

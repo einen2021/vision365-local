@@ -14,12 +14,12 @@
     "desktop:dev:frontend": "next dev --webpack -p 3000",
     "desktop:dev": "concurrently -k -n next,api -c blue,green \"npm run desktop:dev:frontend\" \"npm run desktop:server\"",
     "desktop:build:frontend": "node scripts/desktop-build-frontend.mjs",
-    "desktop:build": "npm run desktop:server:pkg && npm run desktop:build:frontend && cd src-tauri && cargo tauri build",
-    "desktop:build:windows": "npm run desktop:server:pkg && npm run desktop:build:frontend && cd src-tauri && cargo tauri build --target x86_64-pc-windows-msvc",
-    "desktop:build:macos": "npm run desktop:server:build && npm run desktop:build:frontend && cd src-tauri && cargo tauri build --target aarch64-apple-darwin",
-    "desktop:build:linux": "npm run desktop:server:build && npm run desktop:build:frontend && cd src-tauri && cargo tauri build --target x86_64-unknown-linux-gnu",
+    "desktop:build": "npm run desktop:server:pkg && npm run desktop:build:frontend && cd src-tauri && npx tauri build",
+    "desktop:build:windows": "scripts\\desktop-build-windows.cmd",
+    "desktop:build:macos": "npm run desktop:server:build && npm run desktop:build:frontend && cd src-tauri && npx tauri build --target aarch64-apple-darwin",
+    "desktop:build:linux": "npm run desktop:server:build && npm run desktop:build:frontend && cd src-tauri && npx tauri build --target x86_64-unknown-linux-gnu",
     "db:migrate": "npx tsx desktop-server/src/db/migrate-cli.ts",
-    "tauri": "cd src-tauri && cargo tauri"
+    "tauri": "cd src-tauri && npx tauri"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.4",
