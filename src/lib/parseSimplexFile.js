@@ -100,6 +100,29 @@ function resolveStatusF(data) {
   return null;
 }
 
+/** ~2:M1-2-0 style header at the start of a device block. */
+const SIMPLEX_M_HEADER_RE = /^~(?:(\d+):)?M(\d+)-(\d+)(?:-(\d+))?/i;
+
+function matchSimplexBlockHeader(block) {
+  const headerMatch = block.match(SIMPLEX_M_HEADER_RE);
+  if (headerMatch) return headerMatch;
+
+  const namMatch = block.match(/NAM=((?:\d+:)?M\d+-\d+(?:-\d+)?)/i);
+  if (namMatch) {
+    return namMatch[1].match(/^(?:(\d+):)?M(\d+)-(\d+)(?:-(\d+))?$/i);
+  }
+
+  return null;
+}
+
+function getSimplexBlockBodyText(block) {
+  const headerAtStart = block.match(SIMPLEX_M_HEADER_RE);
+  if (headerAtStart) {
+    return block.slice(headerAtStart[0].length).replace(/^\s+/, "");
+  }
+  return block;
+}
+
 /**
  * Parse Simplex panel cshow * output into device records.
  * Supports file content (newline-separated blocks) and telnet (inline ~ blocks).
@@ -115,23 +138,11 @@ export function parseSimplexFile(content) {
   const results = [];
 
   for (const block of blocks) {
-    let headerMatch = block.match(/^~(?:(\d+):)?M(\d+)-(\d+)(?:-(\d+))?(?:\s|$)/);
-
-    // Saved exports sometimes use ~@ or ~panel-node headers; M address is in NAM=
-    if (!headerMatch) {
-      const namMatch = block.match(/NAM=((?:\d+:)?M\d+-\d+(?:-\d+)?)/i);
-      if (namMatch) {
-        headerMatch = namMatch[1].match(/^(?:(\d+):)?M(\d+)-(\d+)(?:-(\d+))?$/i);
-      }
-    }
-
+    const headerMatch = matchSimplexBlockHeader(block);
     if (!headerMatch) continue;
 
     const [, panelFromName, loopNumber, deviceNumber, subAddNumber] = headerMatch;
-    const headerAtStart = block.match(/^~(?:(\d+):)?M(\d+)-(\d+)/);
-    const bodyText = headerAtStart
-      ? block.slice(headerAtStart[0].length)
-      : block;
+    const bodyText = getSimplexBlockBodyText(block);
 
     const data = {};
     parseKeyValues(bodyText, data);
@@ -149,14 +160,16 @@ export function parseSimplexFile(content) {
       deviceAddress: stripNullChars(data.NAM),
       loopNumber,
       deviceNumber,
-      subAdd: subAddNumber || 0,
+      subAdd: subAddNumber !== undefined ? Number(subAddNumber) : 0,
+      panel,
+      includeZeroSubAdd: subAddNumber !== undefined,
     });
 
     results.push({
       Panel: panel ? Number(panel) : null,
       LoopNumber: Number(loopNumber),
       DeviceNumber: Number(deviceNumber),
-      SubAdd: subAddNumber ? Number(subAddNumber) : 0,
+      SubAdd: subAddNumber !== undefined ? Number(subAddNumber) : 0,
       PanelAddress: stripNullChars(data.ADD || ""),
       DeviceAddress: deviceAddress,
       DeviceLocation: location,

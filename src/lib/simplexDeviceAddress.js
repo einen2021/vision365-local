@@ -10,27 +10,54 @@ export function stripPanelAddressPrefix(value) {
   return cleaned.replace(/^\d+:/i, "").trim();
 }
 
+const M_ADDRESS_RE = /^M\d+-\d+(?:-\d+)?$/i;
+const PANEL_M_ADDRESS_RE = /^(?:(\d+):)?(M\d+-\d+(?:-\d+)?)$/i;
+
+/** Parse a Simplex address token, keeping panel prefix when present. */
+export function parseSimplexAddressToken(value) {
+  const cleaned = stripNullChars(value);
+  if (!cleaned) return null;
+
+  const match = cleaned.match(PANEL_M_ADDRESS_RE);
+  if (!match) return null;
+
+  const [, panel, mAddress] = match;
+  const normalizedM = mAddress.toUpperCase();
+  return {
+    panel: panel || null,
+    mAddress: normalizedM,
+    full: panel ? `${panel}:${normalizedM}` : normalizedM,
+  };
+}
+
 /** Build M-address from loop / device / optional sub-address. */
-export function buildSimplexMAddress(loopNumber, deviceNumber, subAdd = 0) {
+export function buildSimplexMAddress(loopNumber, deviceNumber, subAdd = 0, includeZeroSubAdd = false) {
   const loop = Number(loopNumber);
   const device = Number(deviceNumber);
   if (!loop || !device) return "";
   const base = `M${loop}-${device}`;
   const sub = Number(subAdd);
-  if (sub > 0) return `${base}-${sub}`;
+  if (sub > 0 || (includeZeroSubAdd && sub === 0)) {
+    return `${base}-${sub}`;
+  }
   return base;
 }
-
-const M_ADDRESS_RE = /^M\d+-\d+(?:-\d+)?$/i;
 
 export function isSimplexMAddress(value) {
   return M_ADDRESS_RE.test(stripPanelAddressPrefix(value));
 }
 
+function attachPanelPrefix(panel, mAddress) {
+  const normalized = String(mAddress || "").trim().toUpperCase();
+  if (!normalized) return "";
+  const panelId = stripNullChars(panel);
+  if (!panelId) return normalized;
+  return `${panelId}:${normalized}`;
+}
+
 /**
  * Canonical Simplex device address.
- * Strips panel prefixes, prefers M-address from deviceAddress / partNumber,
- * then falls back to loop+device from the cshow header.
+ * Keeps panel prefix when present (e.g. 2:M1-2-0). Attaches panel from context when known.
  */
 export function resolveSimplexDeviceAddress({
   deviceAddress = "",
@@ -38,22 +65,25 @@ export function resolveSimplexDeviceAddress({
   loopNumber,
   deviceNumber,
   subAdd = 0,
+  panel = null,
+  includeZeroSubAdd = false,
 } = {}) {
-  const candidates = [
-    stripPanelAddressPrefix(deviceAddress),
-    stripPanelAddressPrefix(partNumber),
-    buildSimplexMAddress(loopNumber, deviceNumber, subAdd),
-  ];
+  for (const raw of [deviceAddress, partNumber]) {
+    const parsed = parseSimplexAddressToken(raw);
+    if (!parsed) continue;
+    if (parsed.panel) return parsed.full;
+    return attachPanelPrefix(panel, parsed.mAddress);
+  }
 
-  for (const candidate of candidates) {
-    if (isSimplexMAddress(candidate)) {
-      return candidate.toUpperCase();
-    }
+  const built = buildSimplexMAddress(loopNumber, deviceNumber, subAdd, includeZeroSubAdd);
+  if (built) {
+    return attachPanelPrefix(panel, built.toUpperCase());
   }
 
   const fallback =
     stripPanelAddressPrefix(deviceAddress) || stripPanelAddressPrefix(partNumber);
-  return fallback ? fallback.toUpperCase() : "";
+  if (!fallback) return "";
+  return attachPanelPrefix(panel, fallback);
 }
 
 /** Resolve address from a stored AssetsList document. */
@@ -65,5 +95,9 @@ export function resolveAssetDeviceAddress(asset) {
     loopNumber: asset.loopNumber,
     deviceNumber: asset.deviceNumber,
     subAdd: asset.subAdd,
+    panel: asset.panel ?? asset.Panel ?? null,
+    includeZeroSubAdd:
+      Number(asset.subAdd) === 0 &&
+      /-\d+$/i.test(stripPanelAddressPrefix(asset.deviceAddress || asset.partNumber || "")),
   });
 }

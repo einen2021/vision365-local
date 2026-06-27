@@ -220,6 +220,26 @@ export async function addDocsBatch(collectionRef, items) {
   return items.length;
 }
 
+/** Delete many documents in batched requests (500 ops per batch). */
+export async function deleteDocsBatch(docRefs) {
+  if (!docRefs.length) return 0;
+
+  const BATCH_SIZE = 500;
+  let deleted = 0;
+
+  for (let i = 0; i < docRefs.length; i += BATCH_SIZE) {
+    const chunk = docRefs.slice(i, i + BATCH_SIZE);
+    const operations = chunk.map((docRef) => ({
+      type: "delete",
+      path: docRef._path,
+    }));
+    await apiCall({ op: "batch", operations });
+    deleted += chunk.length;
+  }
+
+  return deleted;
+}
+
 export function writeBatch(db) {
   const operations = [];
   return {

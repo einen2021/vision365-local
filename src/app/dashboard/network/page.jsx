@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AppSidebar } from "@/components/app-sidebar";
 import {
   SidebarProvider,
@@ -35,11 +35,84 @@ import {
 } from "lucide-react";
 import { usePageAuth } from "@/hooks/usePageAuth";
 import { useToast } from "@/hooks/use-toast";
-import { useFirePanelStore, POLL_INTERVAL_MS } from "@/stores/firePanelStore";
+import { apiFetch } from "@/lib/apiClient";
+import { useFirePanelStore } from "@/stores/firePanelStore";
+import { collection, doc, getDocs, updateDoc } from "firebase/firestore";
+import { db } from "@/config/firebase";
+import { normalizeDeviceAddress } from "@/lib/assetFireStatus";
+import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
+import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
+
+const PANEL_STATE_REFRESH_MS = 5000;
+const MONITOR_INTERVAL_MS = 1000;
+
+const CVAL_COMMANDS = [
+  { label: "Fire", cmd: "cshow a0 cval", field: "totalFire", listCmd: "list f" },
+  {
+    label: "Supervisory",
+    cmd: "cshow a1 cval",
+    field: "totalSupervisory",
+    listCmd: "list s",
+  },
+  { label: "Trouble", cmd: "cshow a2 cval", field: "totalTrouble", listCmd: "list t" },
+];
+
+const LIST_COMMAND_TIMEOUT_MS = 15000;
+
+function isListResponseComplete(response) {
+  return /_DNE/i.test(String(response));
+}
+
+function parseCVal(response) {
+  const match = String(response).match(/CVAL=(\d+)/i);
+  return match ? Number(match[1]) : null;
+}
+
+
+
+function extractCVal(response) {
+  const regex =
+    /^-?\s*(cshow a([012]) cval)\r?\n+\r?~A\2\s*\r?\n+CVAL=(\d+)\r?\n+-?\s*$/i;
+
+  const match = response.trim().match(regex);
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    command: match[1].toLowerCase(),
+    panel: Number(match[2]),
+    cval: Number(match[3]),
+  };
+}
+
+function responseHasCVal(response) {
+  return /CVAL=\d+/i.test(String(response));
+}
+
+/** Map monitor category label to simplexStatus key (F / T / S). */
+function simplexKeyForCategoryLabel(label) {
+  if (label === "Trouble") return "T";
+  if (label === "Supervisory") return "S";
+  return "F";
+}
+
+function readSimplexStatus(asset) {
+  const raw = asset?.simplexStatus;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return {
+      F: Number(raw.F ?? 0),
+      T: Number(raw.T ?? 0),
+      S: Number(raw.S ?? 0),
+    };
+  }
+  return { F: 0, T: 0, S: 0 };
+}
 
 const COMMAND_PLACEHOLDER = "cshow a0 cval";
 
-function AlarmCard({ title, icon: Icon, total, register, tone }) {
+function AlarmCard({ title, icon: Icon, total, register, tone, lastSync }) {
   const active = total > 0;
   const toneClasses = {
     fire: "border-red-500/40 bg-red-500/5",
@@ -67,6 +140,11 @@ function AlarmCard({ title, icon: Icon, total, register, tone }) {
           <p className="rounded border bg-muted/40 p-2 font-mono text-lg font-semibold">
             {total}
           </p>
+          {lastSync ? (
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              Synced {new Date(lastSync).toLocaleString()}
+            </p>
+          ) : null}
         </div>
       </CardContent>
     </Card>
@@ -85,29 +163,196 @@ export default function NetworkTelnetPage() {
   const connectedHost = useFirePanelStore((s) => s.connectedHost);
   const connectedPort = useFirePanelStore((s) => s.connectedPort);
   const connectedAt = useFirePanelStore((s) => s.connectedAt);
-  const monitoring = useFirePanelStore((s) => s.monitoring);
-  const panelData = useFirePanelStore((s) => s.panelData);
-  const readLogs = useFirePanelStore((s) => s.readLogs);
   const lastError = useFirePanelStore((s) => s.lastError);
   const loading = useFirePanelStore((s) => s.loading);
   const rawResponse = useFirePanelStore((s) => s.rawResponse);
   const connect = useFirePanelStore((s) => s.connect);
   const disconnect = useFirePanelStore((s) => s.disconnect);
-  const startMonitoring = useFirePanelStore((s) => s.startMonitoring);
-  const stopMonitoring = useFirePanelStore((s) => s.stopMonitoring);
   const sendCommand = useFirePanelStore((s) => s.sendCommand);
 
   const [command, setCommand] = useState("");
-  const [showRaw, setShowRaw] = useState(false);
+  const [panelState, setPanelState] = useState(null);
+  const [panelStateLoading, setPanelStateLoading] = useState(true);
+  const [monitoring, setMonitoring] = useState(false);
+  const [monitorLogs, setMonitorLogs] = useState([]);
+  const monitoringRef = useRef(false);
+  const panelStateRef = useRef(null);
 
-  const handleConnect = async () => {
-    const result = await connect();
-    if (result.ok) {
-      toast({
-        title: "Connected",
-        description: `Connected to ${host.trim()}:${port}`,
-      });
+  const appendMonitorLog = (line) => {
+    const entry = `[${new Date().toLocaleTimeString()}] ${line}`;
+    setMonitorLogs((prev) => [...prev.slice(-299), entry]);
+  };
+
+  const sendPanelCommand = async (cmd, timeoutMs = 3000) => {
+    const res = await apiFetch("/api/telnet/fire-panel/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command: cmd, timeoutMs }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Command failed");
+    return data.response || "";
+  };
+
+  /** Send a list command and block until the panel response is received. */
+  const sendListCommandAndWait = async (listCmd) => {
+    appendMonitorLog(`>> ${listCmd} (waiting for response...)`);
+    const response = await sendPanelCommand(listCmd, LIST_COMMAND_TIMEOUT_MS);
+    if (!isListResponseComplete(response)) {
+      appendMonitorLog(`!! ${listCmd}: response incomplete (no _DNE)`);
+    } else {
+      appendMonitorLog(`<< ${listCmd} complete (${response.length} chars)`);
     }
+    return response;
+  };
+
+  const savePanelState = async (counts) => {
+    const res = await apiFetch("/api/telnet/fire-panel/panel-state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(counts),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Failed to save panel state");
+    if (!data.unchanged) {
+      setPanelState(data);
+      panelStateRef.current = data;
+    }
+    return data;
+  };
+
+  const runMonitorLoop = async () => {
+    while (monitoringRef.current) {
+      const counts = {
+        totalFire: 0,
+        totalSupervisory: 0,
+        totalTrouble: 0,
+      };
+
+      for (const { label, cmd, field } of CVAL_COMMANDS) {
+        if (!monitoringRef.current) break;
+        appendMonitorLog(`>> ${label}: ${cmd}`);
+        const previousCounts = panelStateRef.current ?? {
+          totalFire: 0,
+          totalSupervisory: 0,
+          totalTrouble: 0,
+        };
+        try {
+          const response = await sendPanelCommand(cmd);
+          // if (responseHasCVal(response)) {
+          //   console.log(`[fire-panel monitor] ${cmd}: response contains CVAL`);
+          // } else {
+          //   console.warn(
+          //     `[fire-panel monitor] ${cmd}: response does NOT contain CVAL`,
+          //     response,
+          //   );
+          // }
+
+          const parsed = extractCVal(response);
+          
+          const cval = parsed?.cval;
+          if (cval === null) {
+            counts[field] = previousCounts[field] ?? 0;
+            appendMonitorLog(
+              `!! ${label}: CVAL not parsed — keeping ${counts[field]} (${response.trim() || "(empty)"})`,
+            );
+          } else {
+            counts[field] = cval;
+            appendMonitorLog(
+              `<< ${response.trim() || "(empty)"} (CVAL=${counts[field]})`,
+            );
+          }
+        } catch (error) {
+          counts[field] = previousCounts[field] ?? 0;
+          appendMonitorLog(
+            `!! ${label}: ${error.message} — keeping ${counts[field]}`,
+          );
+          console.error(`[fire-panel monitor] ${cmd} failed:`, error);
+        }
+      }
+
+      if (!monitoringRef.current) break;
+
+      const previous = panelStateRef.current ?? {
+        totalFire: 0,
+        totalSupervisory: 0,
+        totalTrouble: 0,
+      };
+      const incrementedValues = CVAL_COMMANDS.filter(
+        ({ field }) => counts[field] > previous[field],
+      );
+
+      console.log(`[fire-panel monitor] incrementedValues:`, incrementedValues);
+
+      try {
+        const saved = await savePanelState(counts);
+        if (saved.unchanged) {
+          appendMonitorLog("DB firePanelState unchanged — skip write");
+        } else {
+          appendMonitorLog(
+            `DB firePanelState → fire=${saved.totalFire} supervisory=${saved.totalSupervisory} trouble=${saved.totalTrouble}`,
+          );
+
+          for (const { label, listCmd } of incrementedValues) {
+            if (!monitoringRef.current) break;
+            appendMonitorLog(`>> ${label} changed — ${listCmd}`);
+            try {
+              const listResponse = await sendListCommandAndWait(listCmd);
+              console.log(`[fire-panel monitor] ${listCmd}:`, listResponse);
+
+              const regex = /\b\d+:M\d+-\d+-\d+\b/g;
+              const deviceAddresses = listResponse.match(regex) ?? [];
+              console.log(`[ADD - extracted addresses] ${listCmd} addresses:`, deviceAddresses);
+              const statusKey = simplexKeyForCategoryLabel(label);
+              const panelAddressSet = new Set(
+                deviceAddresses.map((addr) => normalizeDeviceAddress(addr)),
+              );
+
+              const snapshot = await getDocs(collection(db, "AssetsList"));
+              let updatedCount = 0;
+
+              for (const docSnap of snapshot.docs) {
+                const data = docSnap.data();
+                const assetAddress = normalizeDeviceAddress(
+                  resolveAssetDeviceAddress(data) || data.deviceAddress || "",
+                );
+                if (!panelAddressSet.has(assetAddress)) continue;
+
+                const current = readSimplexStatus(data);
+                if (Number(current[statusKey]) === 1) continue;
+
+                const next = { ...current, [statusKey]: 1 };
+                await updateDoc(doc(db, "AssetsList", docSnap.id), {
+                  simplexStatus: next,
+                  updatedAt: new Date().toISOString(),
+                });
+                updatedCount += 1;
+              }
+
+              if (updatedCount > 0) {
+                appendMonitorLog(
+                  `AssetsList updated ${updatedCount} asset(s) → ${statusKey}=1 (${label})`,
+                );
+                await useAssetFireStatusStore.getState().syncFromAssetsList();
+              }
+            } catch (error) {
+              appendMonitorLog(`!! ${listCmd} failed: ${error.message}`);
+              console.error(`[fire-panel monitor] ${listCmd} failed:`, error);
+            }
+          }
+        }
+      } catch (error) {
+        appendMonitorLog(`!! save failed: ${error.message}`);
+      }
+
+      await new Promise((r) => setTimeout(r, MONITOR_INTERVAL_MS));
+    }
+  };
+
+  const stopMonitoring = () => {
+    monitoringRef.current = false;
+    setMonitoring(false);
+    appendMonitorLog("--- stopped ---");
   };
 
   const handleMonitorData = () => {
@@ -122,20 +367,66 @@ export default function NetworkTelnetPage() {
 
     if (monitoring) {
       stopMonitoring();
-      toast({ title: "Monitoring stopped", description: "Panel data reads paused" });
       return;
     }
 
-    const result = startMonitoring();
+    monitoringRef.current = true;
+    setMonitoring(true);
+    appendMonitorLog("--- started ---");
+    void runMonitorLoop();
+  };
+
+  useEffect(() => {
+    return () => {
+      monitoringRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!connected && monitoring) {
+      stopMonitoring();
+    }
+  }, [connected, monitoring]);
+
+  const fetchPanelState = async () => {
+    try {
+      const res = await apiFetch("/api/telnet/fire-panel/panel-state");
+      if (!res.ok) return;
+      const data = await res.json();
+      setPanelState(data);
+      panelStateRef.current = data;
+    } catch {
+      // API may be unavailable on first load
+    } finally {
+      setPanelStateLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchPanelState();
+    const timer = setInterval(fetchPanelState, PANEL_STATE_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, []);
+
+  const displayTotals = {
+    fire: panelState?.totalFire ?? 0,
+    trouble: panelState?.totalTrouble ?? 0,
+    supervisory: panelState?.totalSupervisory ?? 0,
+  };
+  const lastPanelSync = panelState?.lastPanelSync ?? null;
+
+  const handleConnect = async () => {
+    const result = await connect();
     if (result.ok) {
       toast({
-        title: "Monitoring started",
-        description: `Reading panel data every ${POLL_INTERVAL_MS / 1000}s (runs globally)`,
+        title: "Connected",
+        description: `Connected to ${host.trim()}:${port}`,
       });
     }
   };
 
   const handleDisconnect = async () => {
+    stopMonitoring();
     const result = await disconnect();
     if (result.ok) {
       toast({ title: "Disconnected", description: "Session closed" });
@@ -206,7 +497,7 @@ export default function NetworkTelnetPage() {
             <div>
               <h1 className="text-2xl font-semibold">Fire Panel Network</h1>
               <p className="text-sm text-muted-foreground">
-                Connect to the panel, then click Monitor Data to read alarms globally
+                Connect to the panel and send manual telnet commands
               </p>
             </div>
           </div>
@@ -266,6 +557,7 @@ export default function NetworkTelnetPage() {
                   <>
                     <Button
                       className="w-full"
+                      type="button"
                       variant={monitoring ? "outline" : "default"}
                       onClick={handleMonitorData}
                       disabled={loading}
@@ -309,68 +601,66 @@ export default function NetworkTelnetPage() {
                 </Alert>
               ) : null}
 
+              {lastPanelSync ? (
+                <p className="text-xs text-muted-foreground">
+                  Last firePanelState sync:{" "}
+                  {new Date(lastPanelSync).toLocaleString()}
+                </p>
+              ) : null}
+
               <Card>
                 <CardHeader className="pb-2">
-                  <CardTitle className="text-base">Read logs</CardTitle>
+                  <CardTitle className="text-base">Log console</CardTitle>
                   <CardDescription>
-                    Telnet commands and panelData read steps
+                    CVAL monitor output (a0 fire, a1 supervisory, a2 trouble)
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
-                  {readLogs.length > 0 ? (
+                  {monitorLogs.length > 0 ? (
                     <pre className="max-h-56 overflow-auto rounded border bg-muted/40 p-3 text-xs font-mono whitespace-pre-wrap">
-                      {readLogs.join("\n")}
+                      {monitorLogs.join("\n")}
                     </pre>
                   ) : (
                     <p className="text-xs text-muted-foreground">
-                      Connect and click Monitor Data to see read logs here.
+                      Click Monitor Data to start reading CVAL registers.
                     </p>
                   )}
                 </CardContent>
               </Card>
 
-              {panelData?.polledAt ? (
+              <div className="space-y-2">
                 <p className="text-xs text-muted-foreground">
-                  Last poll: {panelData.host}:{panelData.port} ·{" "}
-                  {new Date(panelData.polledAt).toLocaleString()}
+                  {panelStateLoading
+                    ? "Loading firePanelState from database..."
+                    : "Panel CVAL totals from firePanelState"}
                 </p>
-              ) : null}
-
-              {panelData?.alarms ? (
                 <div className="grid gap-4 md:grid-cols-3">
                   <AlarmCard
                     title="Fire"
                     icon={Flame}
                     register="a0"
-                    total={panelData.alarms.fire.total}
+                    total={displayTotals.fire}
                     tone="fire"
-                  />
-                  <AlarmCard
-                    title="Trouble"
-                    icon={AlertTriangle}
-                    register="a1"
-                    total={panelData.alarms.trouble.total}
-                    tone="trouble"
+                    lastSync={lastPanelSync}
                   />
                   <AlarmCard
                     title="Supervisory"
                     icon={Eye}
-                    register="a2"
-                    total={panelData.alarms.supervisory.total}
+                    register="a1"
+                    total={displayTotals.supervisory}
                     tone="supervisory"
+                    lastSync={lastPanelSync}
+                  />
+                  <AlarmCard
+                    title="Trouble"
+                    icon={AlertTriangle}
+                    register="a2"
+                    total={displayTotals.trouble}
+                    tone="trouble"
+                    lastSync={lastPanelSync}
                   />
                 </div>
-              ) : (
-                <Card>
-                  <CardContent className="flex min-h-[280px] items-center justify-center p-6 text-sm text-muted-foreground">
-                    {monitoring
-                      ? "Waiting for panel data..."
-                      : isConnected
-                        ? "Connected — click Monitor Data to start reading"
-                        : "Connect to the panel to begin"}
-                  </CardContent>
-                </Card>
-              )}
+              </div>
 
               <Card>
                 <CardHeader>
@@ -405,23 +695,6 @@ export default function NetworkTelnetPage() {
                   </CardContent>
                 ) : null}
               </Card>
-
-              {panelData ? (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="w-fit"
-                  onClick={() => setShowRaw((v) => !v)}
-                >
-                  {showRaw ? "Hide" : "Show"} raw JSON
-                </Button>
-              ) : null}
-
-              {showRaw && panelData ? (
-                <pre className="overflow-auto rounded border bg-muted/40 p-3 text-xs font-mono">
-                  {JSON.stringify(panelData, null, 2)}
-                </pre>
-              ) : null}
             </div>
           </div>
         </main>

@@ -36,6 +36,7 @@ import {
   Smartphone,
   ChevronUp,
   Target,
+  Search,
 } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -51,6 +52,7 @@ import {
   buildFloorMapPositionPayload,
   getAssetsListIdFromMapping,
   getAssetPlacementLabel,
+  matchesAssetAddressSearch,
   hasFloorPosition,
   pickMappingDeviceFields,
   resolveMappingDeviceFields,
@@ -104,6 +106,7 @@ export default function CreateFloorPlanPage() {
   const [availableSystems, setAvailableSystems] = useState([])
   const [selectedSystem, setSelectedSystem] = useState("")
   const [isLoadingGeneralAssets, setIsLoadingGeneralAssets] = useState(false)
+  const [generalAssetAddressSearch, setGeneralAssetAddressSearch] = useState("")
 
   // Asset management - Building Assets
   const [buildingAssets, setBuildingAssets] = useState(null)
@@ -1063,7 +1066,11 @@ export default function CreateFloorPlanPage() {
       )
     }
 
-    const filteredAssets = generalAssets.filter((asset) => asset.system === selectedSystem)
+    const systemAssets = generalAssets.filter((asset) => asset.system === selectedSystem)
+    const filteredAssets = systemAssets.filter((asset) =>
+      matchesAssetAddressSearch(asset, generalAssetAddressSearch),
+    )
+    const addressSearchActive = generalAssetAddressSearch.trim().length > 0
 
     const assetsByCategory = filteredAssets.reduce((acc, asset) => {
       const category = asset.category || "Uncategorized"
@@ -1074,15 +1081,6 @@ export default function CreateFloorPlanPage() {
       return acc
     }, {})
 
-    if (filteredAssets.length === 0) {
-      return (
-        <Alert>
-          <AlertTitle>No Assets Found</AlertTitle>
-          <AlertDescription>No assets found for system "{selectedSystem}"</AlertDescription>
-        </Alert>
-      )
-    }
-
     return (
       <div className="space-y-4 max-h-[400px] overflow-y-auto">
         <div className="p-3 bg-green-50 border border-green-200 rounded-lg">
@@ -1092,6 +1090,20 @@ export default function CreateFloorPlanPage() {
               <span className="font-medium text-green-800">{selectedSystem}</span>
             </div>
             <Badge variant="secondary">{filteredAssets.length} assets</Badge>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="general-asset-address-search">Search by Address</Label>
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              id="general-asset-address-search"
+              placeholder="e.g. M1-210, 1F/L1/210..."
+              value={generalAssetAddressSearch}
+              onChange={(e) => setGeneralAssetAddressSearch(e.target.value)}
+              className="pl-10"
+            />
           </div>
         </div>
 
@@ -1113,8 +1125,18 @@ export default function CreateFloorPlanPage() {
           </div>
         )}
 
-        <div className="space-y-2">
-          {Object.entries(assetsByCategory).map(([category, assets]) => (
+        {filteredAssets.length === 0 ? (
+          <Alert>
+            <AlertTitle>No Assets Found</AlertTitle>
+            <AlertDescription>
+              {generalAssetAddressSearch.trim()
+                ? `No assets match address "${generalAssetAddressSearch.trim()}" for system "${selectedSystem}"`
+                : `No assets found for system "${selectedSystem}"`}
+            </AlertDescription>
+          </Alert>
+        ) : (
+          <div className="space-y-2">
+            {Object.entries(assetsByCategory).map(([category, assets]) => (
             <div key={category} className="border rounded-lg">
               <Button
                 variant="ghost"
@@ -1133,13 +1155,13 @@ export default function CreateFloorPlanPage() {
                   <span className="font-medium">{category}</span>
                   <Badge variant="secondary">{assets.length}</Badge>
                 </div>
-                {expandedCategories.has(category) ? (
+                {addressSearchActive || expandedCategories.has(category) ? (
                   <ChevronUp className="h-4 w-4" />
                 ) : (
                   <ChevronDown className="h-4 w-4" />
                 )}
               </Button>
-              {expandedCategories.has(category) && (
+              {(addressSearchActive || expandedCategories.has(category)) && (
                 <div className="p-3 pt-0 space-y-1">
                   {assets.map((asset) => (
                     <Button
@@ -1184,6 +1206,7 @@ export default function CreateFloorPlanPage() {
             </div>
           ))}
         </div>
+        )}
       </div>
     )
   }

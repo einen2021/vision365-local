@@ -54,7 +54,7 @@ import { db, storage } from "@/config/firebase"
 import { useAppData } from "@/hooks/useAppData"
 import { getBrandOptionsFromRegistry, loadBrandRegistry } from "@/utils/brandRegistryService"
 import secureLocalStorage from "react-secure-storage"
-import { collection, addDoc, addDocsBatch, getDocs, query, where, orderBy, limit, doc, updateDoc, deleteDoc } from "firebase/firestore"
+import { collection, addDoc, addDocsBatch, deleteDocsBatch, getDocs, query, where, orderBy, limit, doc, updateDoc, deleteDoc } from "firebase/firestore"
 import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage"
 import { PageHelpBanner } from "@/components/page-help-banner"
 import { FaqHelpButton } from "@/components/faq-help-button"
@@ -590,6 +590,8 @@ function simplexDeviceToAsset(device, assetId) {
     loopNumber: device.LoopNumber,
     deviceNumber: device.DeviceNumber,
     subAdd: device.SubAdd,
+    panel: device.Panel,
+    includeZeroSubAdd: device.SubAdd === 0,
   })
 
   return {
@@ -667,15 +669,17 @@ async function importSimplexDevicesToAssetsList(devices, onProgress) {
       loopNumber: device.LoopNumber,
       deviceNumber: device.DeviceNumber,
       subAdd: device.SubAdd,
+      panel: device.Panel,
+      includeZeroSubAdd: device.SubAdd === 0,
     })
     if (!address) {
       skippedCount++
       return
     }
-    if (existingDeviceAddresses.has(address.toLowerCase())) {
-      skippedCount++
-      return
-    }
+    // if (existingDeviceAddresses.has(address.toLowerCase())) {
+    //   skippedCount++
+    //   return
+    // }
 
     const assetId = generateAssetId(
       SIMPLEX_COLLECT_BRAND,
@@ -785,6 +789,7 @@ export default function AssetsPage() {
   const [deletingAssetId, setDeletingAssetId] = useState(null)
   const [selectedAssetKeys, setSelectedAssetKeys] = useState([])
   const [isBulkDeleting, setIsBulkDeleting] = useState(false)
+  const [bulkDeleteProgress, setBulkDeleteProgress] = useState({ total: 0, processed: 0 })
   const [editAssetDialog, setEditAssetDialog] = useState({
     open: false,
     asset: null,
@@ -811,14 +816,13 @@ export default function AssetsPage() {
   const docModalInputRef = useRef(null)
   const { toast } = useToast()
   const panelConnected = useFirePanelStore((s) => s.connected)
-  const panelMonitoring = useFirePanelStore((s) => s.monitoring)
   const [isCollecting, setIsCollecting] = useState(false)
   const [isImportingSimplexText, setIsImportingSimplexText] = useState(false)
   const [simplexPasteOpen, setSimplexPasteOpen] = useState(false)
   const [simplexPasteText, setSimplexPasteText] = useState("")
   const [simplexTxtFileName, setSimplexTxtFileName] = useState("")
   const simplexFileInputRef = useRef(null)
-  const canCollectAssets = panelConnected && !panelMonitoring
+  const canCollectAssets = panelConnected
 
   const parseExcelToObjects = (workbook, sheetName) => {
     if (!workbook || !sheetName) {
@@ -1285,24 +1289,61 @@ export default function AssetsPage() {
     setSelectedAssetKeys((prev) => [...new Set([...prev, ...filteredKeys])])
   }
 
+  const deleteAssetStorageFiles = async (assets) => {
+    const storagePaths = assets.flatMap((asset) =>
+      Object.values(DOC_TYPE_DEFS)
+        .map((def) => asset[def.storagePathField])
+        .filter(Boolean),
+    )
+
+    const chunkSize = 20
+    for (let i = 0; i < storagePaths.length; i += chunkSize) {
+      const chunk = storagePaths.slice(i, i + chunkSize)
+      await Promise.allSettled(
+        chunk.map((path) => {
+          try {
+            return deleteObject(ref(storage, path))
+          } catch {
+            return null
+          }
+        }),
+      )
+    }
+  }
+
   const deleteAssetRecord = async (asset) => {
     const docRef = getAssetDocRef(asset)
-
-    const storagePaths = Object.values(DOC_TYPE_DEFS)
-      .map((def) => asset[def.storagePathField])
-      .filter(Boolean)
-
     await deleteDoc(docRef)
+    await deleteAssetStorageFiles([asset])
+  }
 
-    await Promise.allSettled(
-      storagePaths.map((path) => {
-        try {
-          return deleteObject(ref(storage, path))
-        } catch {
-          return null
-        }
-      }),
-    )
+  const deleteAssetRecordsBatch = async (assets, onProgress) => {
+    const BATCH_SIZE = 500
+    const deletedAssets = []
+    let failedCount = 0
+
+    for (let i = 0; i < assets.length; i += BATCH_SIZE) {
+      const chunk = assets.slice(i, i + BATCH_SIZE)
+      try {
+        const docRefs = chunk.map((asset) => getAssetDocRef(asset))
+        await deleteDocsBatch(docRefs)
+        deletedAssets.push(...chunk)
+      } catch (err) {
+        console.error("Bulk delete batch error:", err)
+        failedCount += chunk.length
+      }
+
+      onProgress?.({
+        total: assets.length,
+        processed: Math.min(i + chunk.length, assets.length),
+      })
+    }
+
+    if (deletedAssets.length > 0) {
+      await deleteAssetStorageFiles(deletedAssets)
+    }
+
+    return { deletedAssets, failedCount }
   }
 
   // Handle image selection for existing assets
@@ -1642,29 +1683,43 @@ export default function AssetsPage() {
     if (!confirmed) return
 
     setIsBulkDeleting(true)
+    setBulkDeleteProgress({ total: selectedAssets.length, processed: 0 })
     let successCount = 0
     let errorCount = 0
     const deletedKeys = new Set()
 
-    for (const asset of selectedAssets) {
-      try {
-        await deleteAssetRecord(asset)
+    try {
+      const { deletedAssets, failedCount } = await deleteAssetRecordsBatch(
+        selectedAssets,
+        setBulkDeleteProgress,
+      )
+      deletedAssets.forEach((asset) => {
         deletedKeys.add(getAssetRowKey(asset))
         successCount++
-      } catch (err) {
-        console.error("Bulk delete asset error:", err)
-        errorCount++
-      }
+      })
+      errorCount = failedCount
+    } catch (err) {
+      console.error("Bulk delete asset error:", err)
+      toast({
+        title: "Bulk Delete Failed",
+        description: err.message || "Failed to delete selected assets. Please try again.",
+        variant: "destructive",
+      })
     }
 
-    setExistingAssets((prev) => prev.filter((asset) => !deletedKeys.has(getAssetRowKey(asset))))
-    setSelectedAssetKeys((prev) => prev.filter((key) => !deletedKeys.has(key)))
+    if (deletedKeys.size > 0) {
+      setExistingAssets((prev) => prev.filter((asset) => !deletedKeys.has(getAssetRowKey(asset))))
+      setSelectedAssetKeys((prev) => prev.filter((key) => !deletedKeys.has(key)))
+    }
 
-    toast({
-      title: "Bulk Delete Complete",
-      description: `Deleted ${successCount} asset(s)${errorCount > 0 ? `, ${errorCount} failed` : ""}.`,
-      variant: errorCount > 0 ? "destructive" : "default",
-    })
+    if (successCount > 0 || errorCount === 0) {
+      toast({
+        title: "Bulk Delete Complete",
+        description: `Deleted ${successCount} asset(s)${errorCount > 0 ? `, ${errorCount} failed` : ""}.`,
+        variant: errorCount > 0 ? "destructive" : "default",
+      })
+    }
+    setBulkDeleteProgress({ total: 0, processed: 0 })
     setIsBulkDeleting(false)
   }
 
@@ -2077,9 +2132,7 @@ export default function AssetsPage() {
     if (!canCollectAssets) {
       toast({
         title: "Cannot collect assets",
-        description: panelMonitoring
-          ? "Stop monitoring on the Network page before collecting assets."
-          : "Connect to the fire panel on the Network page first.",
+        description: "Connect to the fire panel on the Network page first.",
         variant: "destructive",
       })
       return
@@ -2423,9 +2476,7 @@ export default function AssetsPage() {
                   <p className="text-[10px] text-muted-foreground min-w-[12rem] flex-1">
                     {!panelConnected
                       ? "Collect needs Network connection. TXT / paste imports Simplex cshow * export (M-devices)."
-                      : panelMonitoring
-                        ? "Stop monitoring before Collect. TXT / paste work without the panel."
-                        : "Collect from panel, or import the same cshow * text from a .txt file or paste."}
+                      : "Collect from panel, or import the same cshow * text from a .txt file or paste."}
                   </p>
                 </div>
 
@@ -3121,7 +3172,9 @@ export default function AssetsPage() {
                           {isBulkDeleting ? (
                             <>
                               <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                              Deleting...
+                              Deleting{bulkDeleteProgress.total > 0
+                                ? ` ${bulkDeleteProgress.processed}/${bulkDeleteProgress.total}`
+                                : "..."}
                             </>
                           ) : (
                             <>

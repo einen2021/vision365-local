@@ -1,9 +1,5 @@
 import { create } from "zustand";
 import { apiFetch } from "@/lib/apiClient";
-import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
-
-export const POLL_INTERVAL_MS = 500;
-const MAX_LOG_LINES = 300;
 
 /** Parse API JSON safely — avoids cryptic errors when HTML error pages are returned */
 async function parseJsonResponse(res) {
@@ -27,13 +23,9 @@ export const useFirePanelStore = create((set, get) => ({
   connectedHost: "",
   connectedPort: 23,
   connectedAt: null,
-  monitoring: false,
-  panelData: null,
-  readLogs: [],
   lastError: "",
   loading: false,
   rawResponse: "",
-  pollTimer: null,
 
   setHost: (host) => set({ host }),
   setPort: (port) => set({ port }),
@@ -53,10 +45,6 @@ export const useFirePanelStore = create((set, get) => ({
           port: status.port ? String(status.port) : get().port,
           lastError: "",
         });
-        // Resume polling if monitoring was active before navigation
-        if (get().monitoring) {
-          get().startPolling();
-        }
       } else if (!get().loading) {
         set({ connected: false });
       }
@@ -65,94 +53,14 @@ export const useFirePanelStore = create((set, get) => ({
     }
   },
 
-  runPoll: async () => {
-    if (!get().monitoring) return;
-
-    try {
-      const pollRes = await apiFetch("/api/telnet/fire-panel/poll", {
-        method: "POST",
-      });
-      const pollData = await parseJsonResponse(pollRes);
-      const updates = {};
-
-      if (pollData.logs) {
-        updates.readLogs = pollData.logs.slice(-MAX_LOG_LINES);
-      }
-
-      if (pollData.connected === false) {
-        get().stopPolling();
-        set({
-          connected: false,
-          monitoring: false,
-          lastError: "Panel connection lost",
-          ...updates,
-        });
-        return;
-      }
-
-      if (pollRes.ok) {
-        set({ panelData: pollData, lastError: "", ...updates });
-        // Refresh floor-map F/T markers right after panel poll updates AssetsList
-        void useAssetFireStatusStore.getState().syncFromAssetsList();
-      } else {
-        set({ lastError: pollData.error || "Poll failed", ...updates });
-      }
-    } catch {
-      // keep connection — retry on next interval
-    }
-  },
-
-  startPolling: () => {
-    const { pollTimer, connected, monitoring } = get();
-    if (pollTimer || !connected || !monitoring) return;
-
-    const scheduleNext = () => {
-      if (!get().monitoring) return;
-      const timer = setTimeout(async () => {
-        await get().runPoll();
-        if (get().monitoring) scheduleNext();
-      }, POLL_INTERVAL_MS);
-      set({ pollTimer: timer });
-    };
-
-    get().runPoll().finally(() => {
-      if (get().monitoring) scheduleNext();
-    });
-  },
-
-  stopPolling: () => {
-    const { pollTimer } = get();
-    if (pollTimer) clearTimeout(pollTimer);
-    set({ pollTimer: null });
-  },
-
-  startMonitoring: () => {
-    if (!get().connected) return { ok: false, error: "Not connected" };
-
-    set({ monitoring: true, lastError: "" });
-    get().startPolling();
-    return { ok: true };
-  },
-
-  stopMonitoring: () => {
-    get().stopPolling();
-    set({ monitoring: false });
-    return { ok: true };
-  },
-
   connect: async () => {
     const { host, port } = get();
     if (!host.trim()) return { ok: false };
-
-    get().stopPolling();
 
     set({
       loading: true,
       lastError: "",
       rawResponse: "",
-      panelData: null,
-      readLogs: [],
-      monitoring: false,
     });
 
     try {
@@ -181,8 +89,7 @@ export const useFirePanelStore = create((set, get) => ({
   },
 
   disconnect: async () => {
-    get().stopPolling();
-    set({ loading: true, monitoring: false });
+    set({ loading: true });
 
     try {
       await apiFetch("/api/telnet/fire-panel/disconnect", { method: "POST" });
@@ -190,8 +97,6 @@ export const useFirePanelStore = create((set, get) => ({
         connected: false,
         rawResponse: "",
         lastError: "",
-        panelData: null,
-        readLogs: [],
         loading: false,
       });
       return { ok: true };
@@ -205,9 +110,6 @@ export const useFirePanelStore = create((set, get) => ({
     const trimmed = command.trim();
     if (!trimmed) return { ok: false };
 
-    // Pause monitoring so manual commands are not stuck behind a poll cycle
-    const wasMonitoring = get().monitoring;
-    get().stopPolling();
     set({ loading: true, lastError: "" });
 
     const lower = trimmed.toLowerCase();
@@ -227,23 +129,12 @@ export const useFirePanelStore = create((set, get) => ({
         body: JSON.stringify({ command: trimmed, timeoutMs }),
       });
       const data = await parseJsonResponse(res);
-      if (data.logs) {
-        set({ readLogs: data.logs.slice(-MAX_LOG_LINES) });
-      }
       if (!res.ok) throw new Error(data.error || "Command failed");
 
       set({ rawResponse: data.response || "", loading: false });
-      if (wasMonitoring) {
-        set({ monitoring: true });
-        get().startPolling();
-      }
       return { ok: true };
     } catch (error) {
       set({ loading: false, lastError: error.message || "Failed to send command" });
-      if (wasMonitoring) {
-        set({ monitoring: true });
-        get().startPolling();
-      }
       return { ok: false };
     }
   },

@@ -1,13 +1,5 @@
 import net from "net";
 import { serverLog } from "../log";
-import { alarmListsFingerprint, syncPanelAlarmsToDatabase, type AlarmSyncResult } from "./firePanelAlarmSync";
-
-const TOTAL_FIRE = "cshow a0 cval\r";
-const FIRE_LIST = "list f\n";
-const TOTAL_TROUBLE = "cshow a2 cval\r";
-const TROUBLE_LIST = "list t\n";
-const TOTAL_SUPERVISORY = "cshow a1 cval\r";
-const SUPERVISORY_LIST = "list s\n";
 
 const CONNECT_DELAY_MS = 300;
 const COMMAND_TIMEOUT_MS = 2000;
@@ -17,15 +9,9 @@ const BULK_COMMAND_TIMEOUT_MS = 60000;
 const IDLE_COMPLETE_MS = 100;
 const LIST_IDLE_COMPLETE_MS = 250;
 
-let oldFire = 0;
-let oldTrouble = 0;
-let oldSupervisory = 0;
-let lastAlarmFingerprint = "";
-
 let client: net.Socket | null = null;
 let currentHost = "";
 let currentPort = 23;
-let readLogs: string[] = [];
 
 /** Serialize telnet commands — only one in flight on the socket at a time */
 let commandChain: Promise<unknown> = Promise.resolve();
@@ -70,15 +56,27 @@ function isQuickComplete(command: string, response: string) {
   return false;
 }
 
-function addLog(message: string) {
-  const line = `[${new Date().toLocaleTimeString()}] ${message}`;
-  readLogs.push(line);
-  if (readLogs.length > 300) readLogs = readLogs.slice(-300);
-  serverLog(`[fire-panel] ${message}`);
+function isListCommand(command: string) {
+  return command.trim().toLowerCase().startsWith("list");
 }
 
-function clearLogs() {
-  readLogs = [];
+function isCvalCommand(command: string) {
+  const trimmed = command.trim().toLowerCase();
+  return trimmed.startsWith("cshow") && trimmed.includes("cval");
+}
+
+function logCvalPresence(command: string, response: string) {
+  if (!isCvalCommand(command)) return;
+  const match = response.match(/CVAL=(\d+)/i);
+  if (match) {
+    addLog(`CVAL present in response: CVAL=${match[1]}`);
+  } else {
+    addLog("CVAL not present in response");
+  }
+}
+
+function addLog(message: string) {
+  serverLog(`[fire-panel] ${message}`);
 }
 
 // trim() strips \r/\n — never use it on commands that already have line endings
@@ -125,16 +123,12 @@ export function connectFirePanel(host: string, port: number) {
       client = socket;
       currentHost = host;
       currentPort = port;
-      oldFire = 0;
-      oldTrouble = 0;
-      oldSupervisory = 0;
-      clearLogs();
       attachSocketHandlers(socket);
       addLog(`Connected to ${host}:${port}`);
 
       // Wait for panel welcome banner before sending commands (like original script)
       setTimeout(() => {
-        addLog("Ready — starting reads");
+        addLog("Ready");
         resolve();
       }, CONNECT_DELAY_MS);
     });
@@ -149,7 +143,6 @@ export function disconnectFirePanel() {
     client = null;
     addLog("Disconnected");
   }
-  lastAlarmFingerprint = "";
 }
 
 export function getFirePanelStatus() {
@@ -184,6 +177,7 @@ function sendCommandOnce(command: string, timeoutMs?: number) {
       clearTimeout(hardTimeout);
       if (idleTimer) clearTimeout(idleTimer);
       socket.removeListener("data", onData);
+      logCvalPresence(normalized, response);
       addLog(
         `<< ${label} ${response.slice(0, 300)}${response.length > 300 ? "..." : ""}`,
       );
@@ -202,9 +196,12 @@ function sendCommandOnce(command: string, timeoutMs?: number) {
     const scheduleIdleComplete = () => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
-        if (response.length > 0) {
-          finish("(idle)");
+        if (response.length === 0) return;
+        // List output ends with _DNE — keep reading until the panel marks done
+        if (isListCommand(normalized) && !isDefiniteComplete(response)) {
+          return;
         }
+        finish("(idle)");
       }, idleMs);
     };
 
@@ -243,119 +240,6 @@ function sendCommandOnce(command: string, timeoutMs?: number) {
   });
 }
 
-async function readCategory(
-  label: string,
-  totalCmd: string,
-  listCmd: string,
-  oldCount: number,
-  setOldCount: (n: number) => void,
-) {
-  addLog(`Reading ${label} count...`);
-  try {
-    const raw = await sendCommand(totalCmd);
-    const match = raw.match(/CVAL=(\d+)/);
-    if (!match) {
-      addLog(`${label}: CVAL not found in response`);
-      return { total: 0, raw, list: null, error: `${label} count not found` };
-    }
-
-    const count = Number(match[1]);
-    addLog(`${label} count: ${count}`);
-    let list: string | null = null;
-
-    if (count > 0) {
-      addLog(`Fetching ${label} list...`);
-      list = await sendCommand(listCmd);
-    }
-    setOldCount(count);
-
-    return { total: count, raw, list, count, error: null };
-  } catch (err) {
-    const msg = (err as Error).message;
-    addLog(`${label} read error: ${msg}`);
-    return { total: 0, raw: null, list: null, error: msg };
-  }
-}
-
-export function getReadLogs() {
-  return [...readLogs];
-}
-
-export async function readFirePanel() {
-  ensureConnected();
-  addLog("--- readPanel() start ---");
-
-  const previousFireCount = oldFire;
-  const fire = await readCategory(
-    "Fire",
-    TOTAL_FIRE,
-    FIRE_LIST,
-    oldFire,
-    (n) => {
-      oldFire = n;
-    },
-  );
-  const trouble = await readCategory(
-    "Trouble",
-    TOTAL_TROUBLE,
-    TROUBLE_LIST,
-    oldTrouble,
-    (n) => {
-      oldTrouble = n;
-    },
-  );
-  const supervisory = await readCategory(
-    "Supervisory",
-    TOTAL_SUPERVISORY,
-    SUPERVISORY_LIST,
-    oldSupervisory,
-    (n) => {
-      oldSupervisory = n;
-    },
-  );
-
-  addLog("--- readPanel() done ---");
-
-  const alarmPayload = {
-    fire: { total: fire.total, list: fire.list },
-    trouble: { total: trouble.total, list: trouble.list },
-    supervisory: { total: supervisory.total, list: supervisory.list },
-  };
-
-  const fingerprint = alarmListsFingerprint(alarmPayload);
-  let alarmSync: AlarmSyncResult = {
-    matchedAssets: 0,
-    buildingsUpdated: [],
-    skipped: true,
-  };
-
-  if (fingerprint !== lastAlarmFingerprint) {
-    alarmSync = await syncPanelAlarmsToDatabase(alarmPayload, { previousFireCount });
-    lastAlarmFingerprint = fingerprint;
-    if ((alarmSync.messagesAdded ?? 0) > 0) {
-      addLog(`Added ${alarmSync.messagesAdded} fire alarm message(s) to alarmMessage`);
-    }
-  } else {
-    addLog("Alarm lists unchanged — skipped database sync");
-  }
-
-  if (alarmSync.matchedAssets > 0) {
-    addLog(
-      `Synced ${alarmSync.matchedAssets} asset(s) across ${alarmSync.buildingsUpdated.length} building(s)`,
-    );
-  }
-
-  return {
-    host: currentHost,
-    port: currentPort,
-    polledAt: new Date().toISOString(),
-    connected: Boolean(client),
-    alarms: { fire, trouble, supervisory },
-    alarmSync,
-    logs: [...readLogs],
-  };
-}
-
 export async function sendFirePanelCommand(
   command: string,
   timeoutMs?: number,
@@ -363,5 +247,5 @@ export async function sendFirePanelCommand(
   ensureConnected();
   addLog(`Manual command: ${command.trim()}`);
   const response = await sendCommand(command, timeoutMs);
-  return { response, logs: [...readLogs] };
+  return { response };
 }

@@ -137,6 +137,25 @@ export function pickMappingDeviceFields(asset = {}) {
   }
 }
 
+/** Case-insensitive match for asset address search in floor-map pickers. */
+export function matchesAssetAddressSearch(asset = {}, query = "") {
+  const q = String(query || "").trim().toLowerCase()
+  if (!q) return true
+
+  const haystack = [
+    resolveAssetDeviceAddress(asset),
+    asset.deviceAddress,
+    asset.partNumber,
+    asset.deviceLocation,
+    asset.description,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+
+  return haystack.includes(q)
+}
+
 /** Primary label for floor-map asset picker rows — prefer panel device address. */
 export function getAssetPlacementLabel(asset = {}) {
   const address = resolveAssetDeviceAddress(asset)

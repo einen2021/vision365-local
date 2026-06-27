@@ -1,10 +1,9 @@
 import { Hono } from "hono";
+import { getStoredPanelAlarmTotals, getStoredPanelState, savePanelStateCounts } from "../services/firePanelAlarmSync";
 import {
   connectFirePanel,
   disconnectFirePanel,
   getFirePanelStatus,
-  getReadLogs,
-  readFirePanel,
   sendFirePanelCommand,
 } from "../services/firePanelService";
 
@@ -37,12 +36,47 @@ export function createFirePanelRoutes() {
     return c.json(getFirePanelStatus());
   });
 
-  app.post("/poll", async (c) => {
+  app.get("/alarm-totals", async (c) => {
     try {
-      const panelData = await readFirePanel();
-      return c.json(panelData);
+      const totals = await getStoredPanelAlarmTotals();
+      return c.json(totals);
     } catch (error) {
-      return c.json({ error: (error as Error).message, logs: getReadLogs() }, 500);
+      return c.json({ error: (error as Error).message }, 500);
+    }
+  });
+
+  app.get("/panel-state", async (c) => {
+    try {
+      const state = await getStoredPanelState();
+      return c.json(state);
+    } catch (error) {
+      return c.json({ error: (error as Error).message }, 500);
+    }
+  });
+
+  app.post("/panel-state", async (c) => {
+    const body = await c.req.json();
+    const totalFire = Number(body.totalFire);
+    const totalTrouble = Number(body.totalTrouble);
+    const totalSupervisory = Number(body.totalSupervisory);
+
+    if (
+      !Number.isFinite(totalFire) ||
+      !Number.isFinite(totalTrouble) ||
+      !Number.isFinite(totalSupervisory)
+    ) {
+      return c.json({ error: "totalFire, totalTrouble, and totalSupervisory are required" }, 400);
+    }
+
+    try {
+      const state = await savePanelStateCounts({
+        totalFire,
+        totalTrouble,
+        totalSupervisory,
+      });
+      return c.json(state);
+    } catch (error) {
+      return c.json({ error: (error as Error).message }, 500);
     }
   });
 
@@ -60,7 +94,7 @@ export function createFirePanelRoutes() {
       const result = await sendFirePanelCommand(command, timeoutMs);
       return c.json(result);
     } catch (error) {
-      return c.json({ error: (error as Error).message, logs: getReadLogs() }, 500);
+      return c.json({ error: (error as Error).message }, 500);
     }
   });
 
