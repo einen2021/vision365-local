@@ -4,7 +4,12 @@ import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import secureLocalStorage from "react-secure-storage";
 import { publicRoutes } from "@/config/role-routes";
-import { isUserLoggedIn } from "@/lib/roleAccess";
+import {
+  getDefaultHomeRoute,
+  getAllowedRoutesForRole,
+  isPathAllowed,
+  isUserLoggedIn,
+} from "@/lib/roleAccess";
 import { parseStoredUser } from "@/lib/sessionUser";
 import { LoginPageShell } from "@/components/login-page-shell";
 import { useApp } from "@/contexts/AppContext";
@@ -25,7 +30,7 @@ function AuthCheckingPlaceholder() {
   );
 }
 
-/** Admin-only route guard */
+/** Route guard — admin has full access, client is limited to the main page */
 export function RoleGuard({ children }) {
   const router = useRouter();
   const pathname = usePathname() || "/";
@@ -55,11 +60,18 @@ export function RoleGuard({ children }) {
       return;
     }
 
-    // Only admin role allowed
     const role = String(user?.role || "").toLowerCase();
-    if (role !== "admin") {
+    if (role !== "admin" && role !== "client") {
       router.replace("/unauthorized");
       return;
+    }
+
+    if (isDashboardPath(pathname)) {
+      const allowedRoutes = getAllowedRoutesForRole(role);
+      if (!isPathAllowed(pathname, allowedRoutes)) {
+        router.replace(getDefaultHomeRoute(role));
+        return;
+      }
     }
 
     setView("app");

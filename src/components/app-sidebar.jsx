@@ -5,10 +5,9 @@ import {
   Building,
   Building2,
   GalleryVerticalEnd,
-  Home,
-  HousePlug,
   MapPlus,
   Network,
+  HousePlug,
   LogOut,
 } from "lucide-react";
 import { NavMain } from "@/components/nav-main";
@@ -23,6 +22,7 @@ import {
 } from "@/components/ui/sidebar";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/contexts/AppContext";
+import { getAllowedRoutesForRole, isPathAllowed } from "@/lib/roleAccess";
 
 const teams = [
   {
@@ -54,30 +54,23 @@ const navMain = [
     ],
   },
   {
-    title: "Dashboard",
-    url: "/dashboard/",
-    icon: Home,
-    items: [{ title: "Community Overview", url: "/dashboard/community-overview" }],
-  },
-  {
     title: "Assets",
     url: "/dashboard/",
     icon: HousePlug,
     items: [
       { title: "Upload Assets", url: "/dashboard/assets" },
       { title: "Create Assets", url: "/dashboard/assets/create" },
-      { title: "Map Assets", url: "/dashboard/assets/map_assets" },
       { title: "View/Edit Assets", url: "/dashboard/assets/view" },
     ],
   },
   {
-    title: "Floor Mapping",
+    title: "Graphics",
     url: "/dashboard/",
     icon: MapPlus,
     items: [
       { title: "Building Setup", url: "/dashboard/floor_configuration" },
-      { title: "View Navigation", url: "/dashboard/floor_configuration/view" },
-      { title: "Edit Floor Maps", url: "/dashboard/floor_configuration/edit" },
+      { title: "Graphics View", url: "/dashboard/floor_configuration/view" },
+      { title: "Edit Floors", url: "/dashboard/floor_configuration/edit" },
     ],
   },
   {
@@ -88,17 +81,39 @@ const navMain = [
   },
 ];
 
+function buildNavItemsForRole(role) {
+  const allowedRoutes = getAllowedRoutesForRole(role);
+  const isAdmin = String(role || "").toLowerCase() === "admin";
+
+  if (isAdmin) {
+    return navMain;
+  }
+
+  return navMain.map((section) => ({
+    ...section,
+    items: (section.items || []).map((subItem) => ({
+      ...subItem,
+      disabled: !isPathAllowed(subItem.url, allowedRoutes),
+    })),
+  }));
+}
+
 export function AppSidebar(props) {
   const router = useRouter();
-  const { userEmail, logout } = useApp();
+  const { userEmail, userRole, logout } = useApp();
 
   const user = useMemo(
     () => ({
-      name: "Admin",
-      email: userEmail || "admin@vision365.com",
+      name: String(userRole || "").toLowerCase() === "client" ? "Client" : "Admin",
+      email: userEmail || "client@vision365.com",
       avatar: "",
     }),
-    [userEmail],
+    [userEmail, userRole],
+  );
+
+  const navItems = useMemo(
+    () => buildNavItemsForRole(userRole || "admin"),
+    [userRole],
   );
 
   const handleLogout = () => {
@@ -112,7 +127,7 @@ export function AppSidebar(props) {
         <TeamSwitcher teams={teams} />
       </SidebarHeader>
       <SidebarContent>
-        <NavMain items={navMain} />
+        <NavMain items={navItems} />
       </SidebarContent>
       <SidebarFooter>
         <NavUser user={user} onLogout={handleLogout} logoutIcon={LogOut} />

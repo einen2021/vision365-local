@@ -1,4 +1,4 @@
-import { roleRoutes, commonRoutes } from "@/config/role-routes";
+import { roleRoutes, commonRoutes, clientMainRoute } from "@/config/role-routes";
 
 export function normalizeRoleKey(role) {
   return String(role || "").trim().toLowerCase();
@@ -12,8 +12,14 @@ export function isUserLoggedIn(user) {
   return Boolean(user?.email && user?.isLoggedIn !== false);
 }
 
-export function getDefaultHomeRoute() {
-  return "/dashboard/community-overview";
+export function getDefaultHomeRoute(role) {
+  const key = normalizeRoleKey(role);
+  if (key === "client") return clientMainRoute;
+  return clientMainRoute;
+}
+
+export function getAllowedRoutesForRole(role) {
+  return buildAllowedRoutes(role).routes;
 }
 
 export function normalizePathname(path) {

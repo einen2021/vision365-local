@@ -7,11 +7,23 @@ const ADMIN_DEFAULTS = {
   designation: "Administrator",
 };
 
+const CLIENT_DEFAULTS = {
+  email: "client@vision365.com",
+  password: "Client123",
+  role: "client",
+  designation: "Client",
+};
+
 export function getDefaultDbSeed(): Record<string, unknown> {
   return {
     UserDB: {
       admin: {
         ...ADMIN_DEFAULTS,
+        communities: [],
+        buildings: {},
+      },
+      client: {
+        ...CLIENT_DEFAULTS,
         communities: [],
         buildings: {},
       },
@@ -49,9 +61,17 @@ export function sanitizeDbSeed(raw: Record<string, unknown> | null | undefined):
     }
   }
 
-  if (!(seed.UserDB as Record<string, unknown>).admin) {
-    (seed.UserDB as Record<string, unknown>).admin = {
+  const seedUserDb = seed.UserDB as Record<string, unknown>;
+  if (!seedUserDb.admin) {
+    seedUserDb.admin = {
       ...ADMIN_DEFAULTS,
+      communities: [],
+      buildings: {},
+    };
+  }
+  if (!seedUserDb.client) {
+    seedUserDb.client = {
+      ...CLIENT_DEFAULTS,
       communities: [],
       buildings: {},
     };

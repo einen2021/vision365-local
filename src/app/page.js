@@ -8,13 +8,13 @@ import { getDefaultHomeRoute } from "@/lib/roleAccess";
 
 export default function HomePage() {
   const router = useRouter();
-  const { isAuthenticated } = useApp();
+  const { isAuthenticated, userRole } = useApp();
 
   useEffect(() => {
     if (isAuthenticated) {
-      router.replace(getDefaultHomeRoute());
+      router.replace(getDefaultHomeRoute(userRole));
     }
-  }, [isAuthenticated, router]);
+  }, [isAuthenticated, userRole, router]);
 
   return (
     <div className="flex min-h-svh flex-col items-center justify-center bg-muted p-6 md:p-10">

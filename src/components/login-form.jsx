@@ -11,9 +11,8 @@ import { db } from "@/config/firebase";
 import { collection, query, where, getDocs } from "@/lib/mockFirestore";
 import { getDefaultHomeRoute } from "@/lib/roleAccess";
 import { useApp } from "@/contexts/AppContext";
-import { waitForDesktopApi } from "@/lib/apiClient";
 
-/** Admin-only login form — credentials stored in data/db.json */
+/** Login form — credentials stored in data/db.json */
 export function LoginForm({ className, ...props }) {
   const { toast } = useToast();
   const router = useRouter();
@@ -55,10 +54,10 @@ export function LoginForm({ className, ...props }) {
       }
 
       const role = String(userData.role || "").trim().toLowerCase();
-      if (role !== "admin") {
+      if (role !== "admin" && role !== "client") {
         toast({
           title: "Access Denied",
-          description: "Only admin users can log in to this app.",
+          description: "This account is not allowed to log in.",
           variant: "destructive",
         });
         return;
@@ -66,19 +65,19 @@ export function LoginForm({ className, ...props }) {
 
       const sessionUser = {
         email: String(email || "").trim(),
-        role: "admin",
+        role,
         designation: userData.designation || "",
         isLoggedIn: true,
       };
 
-      await login(sessionUser.email, "admin", sessionUser);
+      await login(sessionUser.email, role, sessionUser);
 
       toast({
         title: "Login Successful",
         description: "Redirecting to dashboard...",
       });
 
-      router.push(getDefaultHomeRoute());
+      router.push(getDefaultHomeRoute(role));
     } catch (error) {
       console.error("Login error:", error);
       const message =
@@ -100,7 +99,7 @@ export function LoginForm({ className, ...props }) {
   return (
     <form className={cn("flex flex-col gap-6", className)} {...props} onSubmit={handleSubmit}>
       <div className="flex flex-col items-center gap-2 text-center">
-        <h1 className="text-2xl font-bold">Admin Login</h1>
+        <h1 className="text-2xl font-bold">Login</h1>
         <p className="text-balance text-sm text-muted-foreground">
           Vision365 Minimal — JSON data store
         </p>
@@ -112,14 +111,20 @@ export function LoginForm({ className, ...props }) {
             id="email"
             name="email"
             type="email"
-            placeholder="admin@vision365.com"
-            defaultValue="admin@vision365.com"
+            placeholder="client@vision365.com"
+            defaultValue="client@vision365.com"
             required
           />
         </div>
         <div className="grid gap-2">
           <Label htmlFor="password">Password</Label>
-          <Input id="password" name="password" type="password" defaultValue="admin123" required />
+          <Input
+            id="password"
+            name="password"
+            type="password"
+            defaultValue="Client123"
+            required
+          />
         </div>
         <Button type="submit" className="w-full" disabled={loading}>
           {loading ? "Logging in..." : "Login"}

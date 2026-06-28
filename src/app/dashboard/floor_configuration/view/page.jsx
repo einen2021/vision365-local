@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useSearchParams } from "next/navigation";
 import { AppSidebar } from "@/components/app-sidebar";
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
 import { MonitoringLiveStatus } from "@/components/monitoring-live-status";
@@ -33,6 +34,11 @@ import { PlanImageCanvas } from "@/components/floor-plan/plan-image-canvas";
 import { AssetControlModal } from "@/components/asset-control-modal";
 import { FaqHelpButton } from "@/components/faq-help-button";
 import { NAV_LEVELS, buildBreadcrumbs, buildBuildingFloorMarkers, filterPlacedNavMarkers } from "@/lib/nestedFloorPlan";
+import { normalizeBuildingName } from "@/lib/buildingNames";
+import {
+  findCommunityIdForBuilding,
+  parseFloorPlanViewSearchParams,
+} from "@/lib/fireAlertFloorNavigation";
 import { useFloorMapAssetStatusLive } from "@/hooks/useFloorMapAssetStatusLive";
 
 const ClientModeToggle = dynamic(
@@ -46,6 +52,9 @@ const ClientModeToggle = dynamic(
  */
 export default function ViewNestedFloorPlansPage() {
   const { toast } = useToast();
+  const searchParams = useSearchParams();
+  const deepLinkRef = useRef(null);
+  const deepLinkAppliedRef = useRef(false);
   const { communities, isLoadingCommunities, isReady, effectiveRole } = useAppData({
     toastOnCommunitiesError: true,
   });
@@ -157,6 +166,88 @@ export default function ViewNestedFloorPlansPage() {
     setLevel(NAV_LEVELS.SUBSECTION);
   };
 
+  const applyNestedDeepLink = useCallback(
+    async ({ floorId, sectionId, subsectionId }) => {
+      if (!selectedBuilding || !floorId || !sectionId) return;
+
+      const fullFloor = await FirestoreService.getNestedFloor(
+        selectedBuilding,
+        floorId,
+      );
+      if (!fullFloor) return;
+
+      const fullSection = await FirestoreService.getNestedSection(
+        selectedBuilding,
+        floorId,
+        sectionId,
+      );
+      if (!fullSection) return;
+
+      setFloor(fullFloor);
+      setSection(fullSection);
+      setSectionAssetMappings(fullSection?.assetMappings || []);
+
+      if (subsectionId) {
+        const fullSubsection = await FirestoreService.getNestedSubsection(
+          selectedBuilding,
+          floorId,
+          sectionId,
+          subsectionId,
+        );
+        setSubsection(fullSubsection);
+        setAssetMappings(fullSubsection?.assetMappings || []);
+        setLevel(NAV_LEVELS.SUBSECTION);
+        return;
+      }
+
+      setSubsection(null);
+      setAssetMappings([]);
+      setLevel(NAV_LEVELS.SECTION);
+    },
+    [selectedBuilding],
+  );
+
+  useEffect(() => {
+    const parsed = parseFloorPlanViewSearchParams(searchParams);
+    if (!parsed) return;
+    deepLinkRef.current = parsed;
+    deepLinkAppliedRef.current = false;
+  }, [searchParams]);
+
+  useEffect(() => {
+    const pending = deepLinkRef.current;
+    if (!pending || !isReady || communities.length === 0) return;
+    if (normalizeBuildingName(selectedBuilding) === pending.building) return;
+
+    const communityId = findCommunityIdForBuilding(communities, pending.building);
+    if (communityId) setSelectedCommunity(communityId);
+    setSelectedBuilding(pending.building);
+  }, [isReady, communities, selectedBuilding]);
+
+  useEffect(() => {
+    const pending = deepLinkRef.current;
+    if (!pending || deepLinkAppliedRef.current) return;
+    if (isLoading || !selectedBuilding || floors.length === 0) return;
+    if (normalizeBuildingName(selectedBuilding) !== pending.building) return;
+
+    deepLinkAppliedRef.current = true;
+
+    void applyNestedDeepLink(pending).catch((error) => {
+      console.error("Fire alert deep link failed:", error);
+      toast({
+        title: "Could not open floor plan",
+        description: error?.message || "The alarm location could not be loaded.",
+        variant: "destructive",
+      });
+    });
+  }, [
+    isLoading,
+    selectedBuilding,
+    floors.length,
+    applyNestedDeepLink,
+    toast,
+  ]);
+
   const goBack = () => {
     if (level === NAV_LEVELS.SUBSECTION) {
       setLevel(NAV_LEVELS.SECTION);
@@ -215,7 +306,7 @@ export default function ViewNestedFloorPlansPage() {
           <div>
             <h1 className="text-2xl font-bold flex items-center gap-2">
               <Eye className="h-6 w-6" />
-              Hospital Navigation
+              Graphics View
               <FaqHelpButton articleId="page-floor-view" size="md" />
             </h1>
             <p className="text-muted-foreground text-sm mt-1">

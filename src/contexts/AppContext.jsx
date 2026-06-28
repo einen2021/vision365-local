@@ -1,21 +1,17 @@
 "use client";
 
-/**
- * Simplified AppContext for admin-only JSON-backed app.
- * All data is loaded from data/db.json via mock Firestore.
- */
-
-import React, {
+import {
   createContext,
+  useCallback,
   useContext,
-  useState,
   useEffect,
   useRef,
-  useCallback,
+  useState,
 } from "react";
+import { FireAlertModal } from "@/components/fire-alert-modal";
 import { usePathname } from "next/navigation";
 import secureLocalStorage from "react-secure-storage";
-import { collection as mockCollection, getDocs as mockGetDocs } from "@/lib/mockFirestore";
+import { collection as mockCollection, getDocs as mockGetDocs, setDoc } from "@/lib/mockFirestore";
 import { collection, doc, getDoc, getDocs, updateDoc } from "firebase/firestore";
 import { getUserCommunities } from "@/utils/communityService";
 import { loadBrandRegistry } from "@/utils/brandRegistryService";
@@ -45,6 +41,12 @@ import {
   setFirePanelMonitoringPersisted,
   setMonitorLoopActive,
 } from "@/lib/firePanelMonitorSession";
+import { useFireAlert } from "./FireModalContext";
+
+/**
+ * Simplified AppContext for admin-only JSON-backed app.
+ * All data is loaded from data/db.json via mock Firestore.
+ */
 
 const AppContext = createContext(undefined);
 
@@ -92,7 +94,7 @@ export const AppProvider = ({ children }) => {
   const [effectiveFetchRole, setEffectiveFetchRole] = useState("admin");
   const [userEmail, setUserEmail] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
-
+  const [activeDevices, setActiveDevices] = useState([]);
   const [communities, setCommunities] = useState([]);
   const [globalAssets, setGlobalAssets] = useState([]);
   const [brandRegistry, setBrandRegistry] = useState([]);
@@ -114,6 +116,13 @@ export const AppProvider = ({ children }) => {
     staff: false,
     jobs: false,
   });
+
+  // Global fire alert modal
+  const [isFireAlertOpen, setIsFireAlertOpen] = useState(false);
+  const openFireAlertModal = useCallback(() => setIsFireAlertOpen(true), []);
+  const closeFireAlertModal = useCallback(() => setIsFireAlertOpen(false), []);
+
+  const { showFireAlert, setAddressLoading, setDeviceList,muteSiren } = useFireAlert();
 
   // Global fire-panel CVAL monitor (persists across routes and reloads)
   const [firePanelMonitoring, setFirePanelMonitoring] = useState(
@@ -232,6 +241,7 @@ export const AppProvider = ({ children }) => {
   }, [appendFirePanelMonitorLog, flushFirePanelMonitorLogs]);
 
   const silenceAlarm = useCallback(async () => {
+    muteSiren()
     const loginResponse = await sendFirePanelCommand("login 444");
     if (!loginResponse.includes("ACCESS GRANTED")) {
       throw new Error("Panel login failed");
@@ -315,9 +325,9 @@ export const AppProvider = ({ children }) => {
             );
           } else {
             counts[field] = cval;
-            appendFirePanelMonitorLog(
-              `<< ${response.trim() || "(empty)"} (CVAL=${counts[field]})`,
-            );
+          appendFirePanelMonitorLog(
+            `<< ${response.trim() || "(empty)"} (CVAL=${counts[field]})`,
+          );
           }
         } catch (error) {
           allCvalsParsed = false;
@@ -346,6 +356,15 @@ export const AppProvider = ({ children }) => {
         ({ field }) => counts[field] > previous[field],
       );
 
+    // show fire alert if fire alarm is triggered
+    incrementedValues.forEach(async (value) => {
+      if(value.label === "Fire" && counts[value.field] > 0 && previous[value.field] < counts[value.field]) {
+        showFireAlert();
+      }
+    });
+      
+
+
       try {
         const saved = await saveFirePanelState(counts);
         if (saved.unchanged) {
@@ -363,18 +382,19 @@ export const AppProvider = ({ children }) => {
               if (!isMonitorLoopActive()) break;
               appendFirePanelMonitorLog(`>> ${label} changed — ${listCmd}`);
               try {
+                // get alarm device addresses
+                setAddressLoading(true);
                 const listResponse = await sendFirePanelListCommandAndWait(listCmd);
                 const regex = /\b\d+:M\d+-\d+-\d+\b/g;
                 const deviceAddresses = listResponse.match(regex) ?? [];
                 const statusKey = simplexKeyForCategoryLabel(label);
                 let updatedCount = 0;
-
                 for (const deviceAddress of deviceAddresses) {
                   const assetRef = doc(db, "AssetsList", deviceAddress);
                   const docSnap = await getDoc(assetRef);
                   if (!docSnap.exists()) continue;
-
-                  const data = docSnap.data();
+                  const data = { ...docSnap.data(), id: docSnap.id };
+                  setDeviceList((prev) => [...prev, data]);
                   const current = readSimplexStatus(data);
                   if (Number(current[statusKey]) === 1) continue;
 
@@ -383,6 +403,7 @@ export const AppProvider = ({ children }) => {
                     simplexStatus: next,
                     updatedAt: new Date().toISOString(),
                   });
+
                   useAssetFireStatusStore.getState().patchSimplexStatus(
                     docSnap.id,
                     resolveAssetDeviceAddress(data) || data.deviceAddress || deviceAddress,
@@ -390,6 +411,8 @@ export const AppProvider = ({ children }) => {
                   );
                   updatedCount += 1;
                 }
+                setAddressLoading(false);
+
 
                 if (updatedCount > 0) {
                   appendFirePanelMonitorLog(
@@ -400,6 +423,7 @@ export const AppProvider = ({ children }) => {
               } catch (error) {
                 appendFirePanelMonitorLog(`!! ${listCmd} failed: ${error.message}`);
                 console.error(`[fire-panel monitor] ${listCmd} failed:`, error);
+                setAddressLoading(false);
               }
             }
           } finally {
@@ -409,7 +433,7 @@ export const AppProvider = ({ children }) => {
         }
       } catch (error) {
         appendFirePanelMonitorLog(`!! save failed: ${error.message}`);
-      }
+      }  
 
       await new Promise((r) => setTimeout(r, MONITOR_INTERVAL_MS));
     }
@@ -470,6 +494,12 @@ export const AppProvider = ({ children }) => {
   useEffect(() => {
     void useFirePanelStore.getState().syncStatus();
   }, []);
+
+  // useEffect(() => {
+  //   if (activeDevices.length == 0) {
+  //     hideFireAlert();
+  //   } 
+  // }, [activeDevices.length]);
 
   useEffect(() => {
     if (firePanelConnected) {
@@ -534,6 +564,8 @@ export const AppProvider = ({ children }) => {
 
     loadAll();
   }, [isAuthenticated, userEmail, isInitialized]);
+
+  
 
   useEffect(() => {
     const names = new Set();
@@ -686,8 +718,17 @@ export const AppProvider = ({ children }) => {
     fetchFirePanelState,
     systemReset,
     silenceAlarm,
-    acknowledge
+    acknowledge,
+    // Global fire alert modal
+    isFireAlertOpen,
+    openFireAlertModal,
+    closeFireAlertModal,
   };
 
-  return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
+  return (
+    <AppContext.Provider value={value}>
+      {children}
+      <FireAlertModal open={isFireAlertOpen} onClose={closeFireAlertModal} />
+    </AppContext.Provider>
+  );
 };

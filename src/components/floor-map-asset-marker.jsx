@@ -11,10 +11,9 @@ import {
 } from "@/lib/assetFireStatus";
 import { useAssetFireActive } from "@/stores/assetFireStatusStore";
 
-const getRadarColor = getFireRadarColor;
-const getDimColor = getFireDimColor;
-const getRadarBorderColor = getFireBorderColor;
-const shouldAnimate = shouldFireRipple;
+const MARKER_HALO_SIZE = 30;
+const MARKER_ICON_SIZE = 16;
+const FIRE_RIPPLE_DELAYS = ["0s", "0.6s", "1.2s"];
 
 function FloorMapAssetMarkerInner({
   mapping,
@@ -38,10 +37,10 @@ function FloorMapAssetMarkerInner({
     },
     {},
   );
-  const radarColor = getRadarColor(currentActive);
-  const borderColor = getRadarBorderColor(currentActive);
-  const dimColor = getDimColor(currentActive);
-  const pulseHigh = shouldAnimate(currentActive);
+  const radarColor = getFireRadarColor(currentActive);
+  const borderColor = getFireBorderColor(currentActive);
+  const dimColor = getFireDimColor(currentActive);
+  const isOnFire = shouldFireRipple(currentActive);
 
   return (
     <div
@@ -61,8 +60,8 @@ function FloorMapAssetMarkerInner({
       <div
         className="relative"
         style={{
-          width: 44,
-          height: 44,
+          width: MARKER_HALO_SIZE,
+          height: MARKER_HALO_SIZE,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -74,49 +73,50 @@ function FloorMapAssetMarkerInner({
             left: "50%",
             top: "50%",
             transform: "translate(-50%, -50%)",
-            width: 44,
-            height: 44,
+            width: MARKER_HALO_SIZE,
+            height: MARKER_HALO_SIZE,
             background: dimColor,
             borderRadius: "50%",
             pointerEvents: "none",
           }}
         />
 
-        {pulseHigh ? (
-          <div
-            className="absolute rounded-full"
-            style={{
-              left: "50%",
-              top: "50%",
-              transform: "translate(-50%, -50%)",
-              width: 44,
-              height: 44,
-              background: radarColor,
-              borderRadius: "50%",
-              animation: "radar-pulse 1.8s infinite",
-              opacity: 0.9,
-            }}
-          />
-        ) : null}
+        {isOnFire
+          ? FIRE_RIPPLE_DELAYS.map((delay) => (
+              <div
+                key={delay}
+                className="fire-marker-ripple"
+                style={{
+                  width: MARKER_HALO_SIZE,
+                  height: MARKER_HALO_SIZE,
+                  border: `2px solid ${borderColor}`,
+                  background: radarColor,
+                  animationDelay: delay,
+                }}
+              />
+            ))
+          : null}
 
         <div
           style={{
-            width: 20,
-            height: 20,
+            width: MARKER_ICON_SIZE,
+            height: MARKER_ICON_SIZE,
             borderRadius: "50%",
             background: "#ffffff",
             border: `2px solid ${borderColor}`,
-            boxShadow: "0 1px 3px rgba(0,0,0,0.2)",
+            boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
+            position: "relative",
+            zIndex: 1,
           }}
         >
           <img
             src={getIconForCategory(mapping.category, customImageUrl)}
             alt={mapping.assetName || "asset"}
             title={markerTooltip}
-            className="w-5 h-5 object-contain rounded-full"
+            className="h-3.5 w-3.5 object-contain rounded-full"
             onError={handleImageError}
           />
         </div>

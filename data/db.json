@@ -7,6 +7,14 @@
       "designation": "Administrator",
       "communities": [],
       "buildings": {}
+    },
+    "client": {
+      "email": "client@vision365.com",
+      "password": "Client123",
+      "role": "client",
+      "designation": "Client",
+      "communities": [],
+      "buildings": {}
     }
   },
   "communities": {},

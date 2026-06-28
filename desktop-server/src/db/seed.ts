@@ -3,7 +3,7 @@ import path from "path";
 import bcrypt from "bcryptjs";
 import { getCollection } from "./client";
 import { readDb, writeDb } from "./documentStore";
-import { sanitizeDbSeed } from "./defaultSeed";
+import { getDefaultDbSeed, sanitizeDbSeed } from "./defaultSeed";
 
 const BCRYPT_ROUNDS = 12;
 
@@ -13,7 +13,7 @@ export async function seedIfEmpty(_appDataPath: string) {
   const existing = await snapshot.findOne({ _id: 1 });
 
   if (existing) {
-    await migrateUsersToBcrypt();
+    await ensureDefaultUsers();
     return;
   }
 
@@ -39,8 +39,45 @@ export async function seedIfEmpty(_appDataPath: string) {
   }
 
   await writeDb(seedData);
-  await migrateUsersToBcrypt();
+  await ensureDefaultUsers();
   console.log("[seed] Database seeded successfully");
+}
+
+/** Ensure built-in users exist in UserDB and the bcrypt users collection */
+async function ensureDefaultUsers() {
+  const defaults = getDefaultDbSeed();
+  type SeedUser = {
+    email?: string;
+    password?: string;
+    role?: string;
+    designation?: string;
+    communities?: unknown[];
+    buildings?: Record<string, unknown>;
+  };
+
+  const defaultUserDb = (defaults.UserDB || {}) as Record<string, SeedUser>;
+
+  const db = await readDb();
+  const userDb = { ...((db.UserDB || {}) as Record<string, SeedUser>) };
+  let changed = false;
+
+  for (const [id, user] of Object.entries(defaultUserDb)) {
+    if (!userDb[id]) {
+      userDb[id] = {
+        ...user,
+        communities: [],
+        buildings: {},
+      };
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    await writeDb({ ...db, UserDB: userDb });
+    console.log("[seed] Added missing default users to UserDB");
+  }
+
+  await migrateUsersToBcrypt();
 }
 
 /** Migrate plaintext passwords from UserDB to bcrypt users collection */

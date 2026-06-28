@@ -48,16 +48,25 @@ export function NavMain({
                 <SidebarMenuSub>
                   {item.items?.map((subItem) => (
                     <SidebarMenuSubItem key={subItem.title}>
-                      <SidebarMenuSubButton asChild>
-                        <Link
-                          href={subItem.url}
-                          onClick={() => {
-                            if (isMobile) setOpenMobile(false)
-                          }}
+                      {subItem.disabled ? (
+                        <SidebarMenuSubButton
+                          aria-disabled="true"
+                          className="cursor-not-allowed opacity-50"
                         >
                           <span>{subItem.title}</span>
-                        </Link>
-                      </SidebarMenuSubButton>
+                        </SidebarMenuSubButton>
+                      ) : (
+                        <SidebarMenuSubButton asChild>
+                          <Link
+                            href={subItem.url}
+                            onClick={() => {
+                              if (isMobile) setOpenMobile(false)
+                            }}
+                          >
+                            <span>{subItem.title}</span>
+                          </Link>
+                        </SidebarMenuSubButton>
+                      )}
                     </SidebarMenuSubItem>
                   ))}
                 </SidebarMenuSub>

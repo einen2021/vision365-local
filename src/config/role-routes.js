@@ -24,6 +24,10 @@ export const commonRoutes = [
 
 export const faqRoute = "/dashboard/faq";
 
+/** Client users can only open the main graphics view page */
+export const clientMainRoute = "/dashboard/floor_configuration/view";
+
 export const roleRoutes = {
   admin: commonRoutes,
+  client: [clientMainRoute],
 };

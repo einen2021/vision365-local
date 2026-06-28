@@ -71,8 +71,8 @@ export async function login(email: string, password: string): Promise<LoginResul
   }
 
   const role = String(user.role || "").trim().toLowerCase();
-  if (role !== "admin") {
-    return { success: false, message: "Only admin users can log in" };
+  if (role !== "admin" && role !== "client") {
+    return { success: false, message: "This account is not allowed to log in" };
   }
 
   const token = crypto.randomBytes(32).toString("hex");
