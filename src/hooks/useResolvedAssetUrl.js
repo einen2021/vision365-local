@@ -9,12 +9,31 @@ import {
   resolveDesktopAssetUrl,
 } from "@/lib/apiClient";
 
+function canResolveSynchronously(source) {
+  if (!source) return true;
+  if (
+    source.startsWith("blob:") ||
+    source.startsWith("data:") ||
+    source.startsWith("http://") ||
+    source.startsWith("https://")
+  ) {
+    return true;
+  }
+  // /local/ paths need the desktop API or Tauri convertFileSrc
+  if (source.startsWith("/local/") || isDesktop()) return false;
+  return true;
+}
+
 /** Floor-plan / upload image URL that works in browser dev and Tauri desktop. */
 export function useResolvedAssetUrl(url) {
-  const [resolved, setResolved] = useState(() =>
-    resolveAssetUrl(normalizeLocalAssetUrl(url || "")),
-  );
   const blobUrlRef = useRef(null);
+
+  const [resolved, setResolved] = useState(() => {
+    const source = normalizeLocalAssetUrl(url || "");
+    if (!source) return "";
+    if (!canResolveSynchronously(source)) return "";
+    return resolveAssetUrl(source);
+  });
 
   useEffect(() => {
     let active = true;
@@ -45,9 +64,20 @@ export function useResolvedAssetUrl(url) {
         return;
       }
 
-      setResolved(resolveAssetUrl(source));
       await primeAssetUrlResolver();
-      if (active) setResolved(resolveAssetUrl(source));
+      if (!active) return;
+
+      if (source.startsWith("/local/")) {
+        const assetUrl = await resolveDesktopAssetUrl(source);
+        if (!active) return;
+        if (assetUrl.startsWith("blob:")) {
+          blobUrlRef.current = assetUrl;
+        }
+        setResolved(assetUrl);
+        return;
+      }
+
+      setResolved(resolveAssetUrl(source));
     }
 
     resolve();

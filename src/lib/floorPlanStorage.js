@@ -30,3 +30,27 @@ export async function uploadFloorPlanImage(
   await uploadBytes(storageRef, imageFile);
   return getDownloadURL(storageRef);
 }
+
+/**
+ * Upload nested plan images (building / floor / section / subsection).
+ * @param {string} buildingNameWithSuffix
+ * @param {string} levelPath - e.g. "building", "floors/ground/sections/nurses"
+ * @param {File} imageFile
+ */
+export async function uploadNestedPlanImage(
+  buildingNameWithSuffix,
+  levelPath,
+  imageFile,
+) {
+  const ext = (imageFile.name.split(".").pop() || "jpg").toLowerCase();
+  const safePath = String(levelPath || "plan")
+    .replace(/[^a-zA-Z0-9/_-]/g, "_")
+    .replace(/\/+/g, "/");
+  const imageFileName = `${safePath.replace(/\//g, "_")}_${Date.now()}.${ext}`;
+  const storageRef = ref(
+    storage,
+    buildFloorPlanStoragePath(buildingNameWithSuffix, imageFileName),
+  );
+  await uploadBytes(storageRef, imageFile);
+  return getDownloadURL(storageRef);
+}

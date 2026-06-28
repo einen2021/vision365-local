@@ -75,8 +75,8 @@ const navMain = [
     url: "/dashboard/",
     icon: MapPlus,
     items: [
-      { title: "Map Configuration", url: "/dashboard/floor_configuration" },
-      { title: "View Floor Maps", url: "/dashboard/floor_configuration/view" },
+      { title: "Building Setup", url: "/dashboard/floor_configuration" },
+      { title: "View Navigation", url: "/dashboard/floor_configuration/view" },
       { title: "Edit Floor Maps", url: "/dashboard/floor_configuration/edit" },
     ],
   },

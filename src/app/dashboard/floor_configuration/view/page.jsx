@@ -1,9 +1,9 @@
-"use client"
+"use client";
 
-import { useState, useEffect, useRef, useMemo, useCallback, memo } from "react"
-import { AppSidebar } from "@/components/app-sidebar"
-import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges"
-import { MonitoringLiveStatus } from "@/components/monitoring-live-status"
+import { useState, useEffect, useCallback } from "react";
+import { AppSidebar } from "@/components/app-sidebar";
+import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
+import { MonitoringLiveStatus } from "@/components/monitoring-live-status";
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -11,1443 +11,345 @@ import {
   BreadcrumbList,
   BreadcrumbPage,
   BreadcrumbSeparator,
-} from "@/components/ui/breadcrumb"
-import { Separator } from "@/components/ui/separator"
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Badge } from "@/components/ui/badge"
-import { Building2, Loader2, ImageIcon, MapPin, Eye, Info, Users, Smartphone, Power, PowerOff, CheckCircle, XCircle, Edit, Maximize2, Minimize2 } from "lucide-react"
-import { useToast } from "@/hooks/use-toast"
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import dynamic from "next/dynamic"
-import secureLocalStorage from "react-secure-storage"
-import { useAppData } from "@/hooks/useAppData"
-import { Button } from "@/components/ui/button"
-import { db } from "@/config/firebase"
-import { doc, getDoc, updateDoc, setDoc, collection, query, where, getDocs, onSnapshot } from "firebase/firestore"
-import FirestoreService from "@/services/firestoreService"
+} from "@/components/ui/breadcrumb";
+import { Separator } from "@/components/ui/separator";
+import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
-  loadFloorMapAssetsFromAssetsList,
-  mergeAssetsListIntoAssetMappings,
-  getFloorMapName,
-  hasFloorPosition,
-} from "@/lib/floorMapAssets"
-import { PageHelpBanner } from "@/components/page-help-banner"
-import { FaqHelpButton } from "@/components/faq-help-button"
-import { AssetControlModal } from "@/components/asset-control-modal"
-import { getIconForCategory, handleImageError } from "@/lib/assetIcons"
-import { useResolvedAssetUrl } from "@/hooks/useResolvedAssetUrl"
-import { FloorMapAssetMarker } from "@/components/floor-map-asset-marker"
-import {
-  getFireStatusDisplay,
-} from "@/lib/assetFireStatus"
-import { useAssetFireActive } from "@/stores/assetFireStatusStore"
-import { useFloorMapAssetStatusLive } from "@/hooks/useFloorMapAssetStatusLive"
+  ArrowLeft,
+  Building2,
+  Loader2,
+  Eye,
+} from "lucide-react";
+import dynamic from "next/dynamic";
+import { useToast } from "@/hooks/use-toast";
+import { useAppData } from "@/hooks/useAppData";
+import FirestoreService from "@/services/firestoreService";
+import { CommunityBuildingSelect } from "@/components/floor-plan/community-building-select";
+import { PlanImageCanvas } from "@/components/floor-plan/plan-image-canvas";
+import { AssetControlModal } from "@/components/asset-control-modal";
+import { FaqHelpButton } from "@/components/faq-help-button";
+import { NAV_LEVELS, buildBreadcrumbs, buildBuildingFloorMarkers, filterPlacedNavMarkers } from "@/lib/nestedFloorPlan";
+import { useFloorMapAssetStatusLive } from "@/hooks/useFloorMapAssetStatusLive";
 
-// Create a client-only ModeToggle
 const ClientModeToggle = dynamic(
-  () => import("@/components/theme-toggle").then((mod) => ({ default: mod.ModeToggle })),
-  {
-    ssr: false,
-    loading: () => <div className="h-9 w-9" />,
-  },
-)
+  () => import("@/components/theme-toggle").then((m) => ({ default: m.ModeToggle })),
+  { ssr: false, loading: () => <div className="h-9 w-9" /> },
+);
 
-// Utility function to detect mobile devices
-const isMobileDevice = () => {
-  if (typeof navigator === "undefined") return false
-  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)
-}
-
-function sanitizeDocumentId(id) {
-  if (!id) return ""
-  return id
-    .toString()
-    .toLowerCase()
-    .replace(/\s+/g, "_")
-    .replace(/[\/\\]/g, "_")
-    .replace(/[()]/g, "")
-    .replace(/[^a-zA-Z0-9_-]/g, "")
-    .substring(0, 100)
-}
-
-const FloorPlanAssetListRow = memo(function FloorPlanAssetListRow({
-  locationId,
-  sanitizedId,
-  displayName,
-  index,
-  coordinates,
-  fallbackActive,
-  deviceAddr,
-  live = true,
-}) {
-  const currentActive = useAssetFireActive(locationId || sanitizedId, deviceAddr, fallbackActive, live)
-  const statusDisplay = getFireStatusDisplay(currentActive)
-
-  return (
-    <div className="p-2 bg-muted rounded text-xs">
-      <div className="flex justify-between items-center font-medium">
-        <span>{displayName} #{index + 1}</span>
-        <span className="text-muted-foreground">({coordinates})</span>
-      </div>
-      <div className="flex items-center gap-2 mt-1">
-        <div
-          className="w-2 h-2 rounded-full"
-          style={{ backgroundColor: statusDisplay.color }}
-        />
-        <span style={{ color: statusDisplay.color, fontWeight: 500 }}>
-          {statusDisplay.label}
-        </span>
-      </div>
-    </div>
-  )
-})
-
-function FloorPlanThumbnail({ imageUrl, alt, className = "w-20 h-20 object-cover rounded mb-2 border" }) {
-  const src = useResolvedAssetUrl(imageUrl)
-  if (!imageUrl) return null
-  return (
-    <img
-      src={src}
-      alt={alt}
-      className={className}
-      onError={(e) => {
-        e.target.style.display = "none"
-      }}
-    />
-  )
-}
-
-export default function ViewFloorPlanPage() {
-  const [mounted, setMounted] = useState(false)
-  const [isMobile, setIsMobile] = useState(false)
-
-  // Community selection
+/**
+ * Nested navigation viewer matching the hospital wireframe:
+ * Building → Floor → Section → Subsection (assets).
+ */
+export default function ViewNestedFloorPlansPage() {
+  const { toast } = useToast();
   const { communities, isLoadingCommunities, isReady, effectiveRole } = useAppData({
     toastOnCommunitiesError: true,
-  })
-  const [selectedCommunity, setSelectedCommunity] = useState("")
+  });
 
-  // Building and floor plan selection
-  const [buildings, setBuildings] = useState([])
-  const [selectedBuilding, setSelectedBuilding] = useState("")
-  const [isLoadingBuildings, setIsLoadingBuildings] = useState(false)
+  const [mounted, setMounted] = useState(false);
+  const [selectedCommunity, setSelectedCommunity] = useState("");
+  const [buildings, setBuildings] = useState([]);
+  const [selectedBuilding, setSelectedBuilding] = useState("");
 
-  const [floorPlans, setFloorPlans] = useState([])
-  const [selectedFloorPlan, setSelectedFloorPlan] = useState("")
-  const [floorPlanData, setFloorPlanData] = useState(null)
-  const floorPlanImageUrl = useResolvedAssetUrl(floorPlanData?.imageUrl)
-  const [activeStatuses, setActiveStatuses] = useState({})
-  const [assetDeviceData, setAssetDeviceData] = useState({}) // Store deviceLocation and deviceAddress by document ID
-  const [isLoadingFloorPlans, setIsLoadingFloorPlans] = useState(false)
-  const [isLoadingFloorPlanData, setIsLoadingFloorPlanData] = useState(false)
-  const [buildingStatus, setBuildingStatus] = useState("")
+  const [overview, setOverview] = useState(null);
+  const [floors, setFloors] = useState([]);
+  const [level, setLevel] = useState(NAV_LEVELS.BUILDING);
+  const [floor, setFloor] = useState(null);
+  const [section, setSection] = useState(null);
+  const [subsection, setSubsection] = useState(null);
+  const [assetMappings, setAssetMappings] = useState([]);
+  const [sectionAssetMappings, setSectionAssetMappings] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [selectedAsset, setSelectedAsset] = useState(null);
+  const [isAssetModalOpen, setIsAssetModalOpen] = useState(false);
+  const [lastUpdate, setLastUpdate] = useState(null);
 
-  const [isConnected, setIsConnected] = useState(false)
-  const [connectionType, setConnectionType] = useState("none") // "sse", "polling", "none"
-  const [imageLoaded, setImageLoaded] = useState(false)
-  const [imageError, setImageError] = useState(false)
-  const [imageDimensions, setImageDimensions] = useState({ width: 0, height: 0 })
-  const [lastUpdate, setLastUpdate] = useState(null)
+  const assetStatusLive = useFloorMapAssetStatusLive(
+    level === NAV_LEVELS.SUBSECTION || level === NAV_LEVELS.SECTION,
+  );
 
-  // State for THEMORA building's acknowledge button
-  const [ackStatus, setAckStatus] = useState(false)
-  const [isAckLoading, setIsAckLoading] = useState(false)
-
-  // State for asset control modal
-  const [selectedAsset, setSelectedAsset] = useState(null)
-  const [isAssetModalOpen, setIsAssetModalOpen] = useState(false)
-  const userRole = effectiveRole || ""
-
-  // New state for tracking actual image dimensions and position
-  const [actualImageDimensions, setActualImageDimensions] = useState({
-    width: 0,
-    height: 0,
-    offsetX: 0,
-    offsetY: 0,
-    naturalWidth: 0,
-    naturalHeight: 0,
-  })
-  const [browserZoom, setBrowserZoom] = useState(1)
-
-  // Fullscreen state
-  const [isFullscreen, setIsFullscreen] = useState(false)
-  const mapContainerRef = useRef(null)
-
-  const imageRef = useRef(null)
-  const eventSourceRef = useRef(null)
-  const pollingIntervalRef = useRef(null)
-  const unsubscribesRef = useRef([]) // Store real-time listener unsubscribe functions
-  const { toast } = useToast()
-  const assetStatusLive = useFloorMapAssetStatusLive(imageLoaded)
+  useEffect(() => setMounted(true), []);
 
   useEffect(() => {
-    setMounted(true)
-    setIsMobile(isMobileDevice())
-  }, [])
+    if (!isReady || communities.length === 0 || selectedCommunity) return;
+    setSelectedCommunity(communities[0].id);
+  }, [isReady, communities, selectedCommunity]);
 
   useEffect(() => {
-    if (!isReady || communities.length === 0 || selectedCommunity) return
-    const first = communities[0]
-    if (first?.id) setSelectedCommunity(first.id)
-  }, [isReady, communities, selectedCommunity])
-
-  useEffect(() => {
-    if (selectedCommunity) {
-      const community = communities.find((c) => c.id === selectedCommunity)
-      if (community) {
-        setBuildings(community.buildings || [])
-      }
-    } else {
-      setBuildings([])
+    if (!selectedCommunity) {
+      setBuildings([]);
+      setSelectedBuilding("");
+      return;
     }
-    // Reset downstream selections
-    setSelectedBuilding("")
-    setSelectedFloorPlan("")
-    setFloorPlanData(null)
-    setActiveStatuses({})
-    setLastUpdate(null)
-    stopRealTimeUpdates()
-  }, [selectedCommunity, communities])
+    const community = communities.find((c) => c.id === selectedCommunity);
+    setBuildings(community?.buildings || []);
+    setSelectedBuilding("");
+  }, [selectedCommunity, communities]);
 
-  useEffect(() => {
-    if (selectedBuilding) {
-      fetchFloorPlans()
-      fetchBuildingStatus()
-      if (selectedBuilding === "THEMORA") {
-        fetchAckStatus()
-      }
-    } else {
-      setFloorPlans([])
-      setSelectedFloorPlan("")
-      setBuildingStatus("")
-    }
-  }, [selectedBuilding])
+  const resetNavigation = useCallback(() => {
+    setLevel(NAV_LEVELS.BUILDING);
+    setFloor(null);
+    setSection(null);
+    setSubsection(null);
+    setAssetMappings([]);
+  }, []);
 
-  // Setup real-time updates when floor plan image is loaded
-  useEffect(() => {
-    if (selectedBuilding && selectedFloorPlan && floorPlanData && imageLoaded) {
-      startRealTimeUpdates()
-    } else {
-      stopRealTimeUpdates()
-    }
-
-    return () => {
-      stopRealTimeUpdates()
-    }
-  }, [selectedBuilding, selectedFloorPlan, floorPlanData, imageLoaded])
-
-  // Handle fullscreen toggle
-  const handleFullscreen = () => {
-    if (!mapContainerRef.current) return
-
-    if (!isFullscreen) {
-      // Enter fullscreen
-      if (mapContainerRef.current.requestFullscreen) {
-        mapContainerRef.current.requestFullscreen().catch((err) => {
-          console.error("Error attempting to enable fullscreen:", err)
-          // Fallback: show modal overlay
-          setIsFullscreen(true)
-        })
-      } else if (mapContainerRef.current.mozRequestFullScreen) {
-        mapContainerRef.current.mozRequestFullScreen()
-      } else if (mapContainerRef.current.webkitRequestFullscreen) {
-        mapContainerRef.current.webkitRequestFullscreen()
-      } else if (mapContainerRef.current.msRequestFullscreen) {
-        mapContainerRef.current.msRequestFullscreen()
-      } else {
-        // Fallback: use modal overlay
-        setIsFullscreen(true)
-      }
-      setIsFullscreen(true)
-    } else {
-      // Exit fullscreen
-      if (document.fullscreenElement) {
-        document.exitFullscreen()
-      } else if (document.mozFullScreenElement) {
-        document.mozCancelFullScreen()
-      } else if (document.webkitFullscreenElement) {
-        document.webkitExitFullscreen()
-      } else if (document.msFullscreenElement) {
-        document.msExitFullscreen()
-      }
-      setIsFullscreen(false)
-    }
-  }
-
-  // Handle keyboard escape to exit fullscreen
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (e.key === "Escape" && isFullscreen && !document.fullscreenElement) {
-        setIsFullscreen(false)
-      }
-    }
-
-    if (isFullscreen) {
-      document.addEventListener("keydown", handleKeyDown)
-    }
-
-    return () => {
-      document.removeEventListener("keydown", handleKeyDown)
-    }
-  }, [isFullscreen])
-
-  // Recalculate image dimensions when fullscreen state changes
-  useEffect(() => {
-    if (imageLoaded && imageRef.current) {
-      // Use a longer delay to ensure DOM transition completes
-      setTimeout(() => {
-        calculateImageDimensions()
-      }, 150)
-    }
-  }, [isFullscreen, imageLoaded])
-
-  // Add resize observer to detect zoom changes
-  useEffect(() => {
-    if (!imageRef.current) return
-
-    const handleResize = () => {
-      if (imageLoaded && imageRef.current) {
-        calculateImageDimensions()
-      }
-    }
-
-    // Listen for window resize (which includes zoom changes)
-    window.addEventListener('resize', handleResize)
-
-    // Use ResizeObserver for more precise detection
-    const resizeObserver = new ResizeObserver(() => {
-      if (imageLoaded) {
-        calculateImageDimensions()
-      }
-    })
-
-    if (imageRef.current) {
-      resizeObserver.observe(imageRef.current)
-    }
-
-    return () => {
-      window.removeEventListener('resize', handleResize)
-      resizeObserver.disconnect()
-    }
-  }, [imageLoaded])
-
-  const detectZoom = () => {
-    // Detect browser zoom level
-    const zoom = window.devicePixelRatio || 1
-    return zoom
-  }
-
-  const calculateImageDimensions = () => {
-    if (!imageRef.current) return
-
-    const img = imageRef.current
-    const containerRect = img.getBoundingClientRect()
-    const zoom = detectZoom()
-    
-    // Account for browser zoom by dividing by zoom factor
-    const containerWidth = containerRect.width / zoom
-    const containerHeight = containerRect.height / zoom
-
-    // Get natural dimensions
-    const naturalWidth = img.naturalWidth
-    const naturalHeight = img.naturalHeight
-
-    // Calculate the scale to fit the image within the container while maintaining aspect ratio
-    const scaleX = containerWidth / naturalWidth
-    const scaleY = containerHeight / naturalHeight
-    const scale = Math.min(scaleX, scaleY)
-
-    // Calculate actual displayed dimensions
-    const displayedWidth = naturalWidth * scale
-    const displayedHeight = naturalHeight * scale
-
-    // Calculate offset (centering)
-    const offsetX = (containerWidth - displayedWidth) / 2
-    const offsetY = (containerHeight - displayedHeight) / 2
-
-    setBrowserZoom(zoom)
-    setActualImageDimensions({
-      width: displayedWidth,
-      height: displayedHeight,
-      offsetX: offsetX,
-      offsetY: offsetY,
-      naturalWidth: naturalWidth,
-      naturalHeight: naturalHeight,
-    })
-  }
-
-  const startRealTimeUpdates = () => {
-    stopRealTimeUpdates()
-    if (typeof EventSource !== "undefined") {
-      trySSEConnection()
-    } else {
-      startPolling()
-    }
-  }
-
-  const stopRealTimeUpdates = () => {
-    // Clean up real-time listeners
-    unsubscribesRef.current.forEach((unsubscribe) => {
-      if (typeof unsubscribe === "function") {
-        unsubscribe()
-      }
-    })
-    unsubscribesRef.current = []
-
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close()
-      eventSourceRef.current = null
-    }
-    if (pollingIntervalRef.current) {
-      clearInterval(pollingIntervalRef.current)
-      pollingIntervalRef.current = null
-    }
-    setIsConnected(false)
-    setConnectionType("none")
-  }
-
-  const trySSEConnection = () => {
-    // Since we're using Firebase SDK directly, we'll use Firestore real-time listeners
-    startRealtimeListeners()
-  }
-
-  const startPolling = () => {
-    // Fallback polling for browsers without real-time support
-    setConnectionType("polling")
-    setIsConnected(true)
-    fetchActiveStatuses()
-    pollingIntervalRef.current = setInterval(fetchActiveStatuses, 2000)
-  }
-
-  const startRealtimeListeners = () => {
-    if (!selectedBuilding || !selectedFloorPlan || !floorPlanData?.assetDocRefs) {
-      startPolling() // Fallback to polling
-      return
-    }
-
-    setConnectionType("firestore-realtime")
-    setIsConnected(true)
-
-    const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-    const categoryKeys = [
-      "fire-life-safety",
-      "electrical",
-      "hvac",
-      "plumbing",
-      "elv",
-      "security",
-      "vertical-transport",
-      "lighting",
-      "bms",
-      "landscaping",
-      "additional",
-    ]
-
-    // Set up listeners for each category to watch assets on this floor
-    categoryKeys.forEach((categoryKey) => {
-      try {
-        const categoryRef = collection(db, buildingNameWithSuffix, "asset", categoryKey)
-        
-        const unsubscribe = onSnapshot(
-          categoryRef,
-          (snapshot) => {
-            setActiveStatuses((prevStatuses) => {
-              const updatedStatuses = { ...prevStatuses }
-              let hasChanges = false
-
-              snapshot.forEach((assetDoc) => {
-                const data = assetDoc.data()
-                
-                // Only track assets on this floor
-                if (data.floorPlanName === selectedFloorPlan && typeof data.x === "number" && typeof data.y === "number") {
-                  const assetId = data.buildingAssetId || assetDoc.id
-                  
-                  const newStatus = {
-                    active: data.active || 0,
-                    activityStatus: data.activityStatus !== undefined ? data.activityStatus : 1,
-                    enabled: data.enabled !== undefined ? data.enabled : true,
-                    installed: data.installed || false,
-                    lastUpdated: new Date().toISOString(),
-                  }
-
-                  const prev = updatedStatuses[assetId]
-                  if (
-                    !prev ||
-                    prev.active !== newStatus.active ||
-                    prev.activityStatus !== newStatus.activityStatus ||
-                    prev.enabled !== newStatus.enabled ||
-                    prev.installed !== newStatus.installed
-                  ) {
-                    updatedStatuses[assetId] = newStatus
-                    hasChanges = true
-                  }
-                }
-              })
-
-              if (hasChanges) {
-                setLastUpdate(new Date())
-              }
-
-              return updatedStatuses
-            })
-          },
-          (error) => {
-            console.error(`Error setting up real-time listener for ${categoryKey}:`, error)
-            // Fallback to polling if real-time listener fails
-            startPolling()
-          }
-        )
-
-        unsubscribesRef.current.push(unsubscribe)
-      } catch (error) {
-        console.error(`Error setting up listener for category ${categoryKey}:`, error)
-      }
-    })
-  }
-
-  const fetchBuildingStatus = async () => {
-    if (!selectedBuilding) return
-
+  const loadBuildingData = useCallback(async () => {
+    if (!selectedBuilding) return;
+    setIsLoading(true);
+    resetNavigation();
     try {
-      const status = await FirestoreService.getBuildingStatus(selectedBuilding)
-      setBuildingStatus(status || "")
-    } catch (error) {
-      console.error("Error fetching building status:", error)
-      setBuildingStatus("")
-    }
-  }
-
-  const fetchFloorPlans = async () => {
-    if (!selectedBuilding) return
-
-    setIsLoadingFloorPlans(true)
-    try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const floorPlansList = await FirestoreService.getBuildingFloorMaps(buildingNameWithSuffix)
-      setFloorPlans(floorPlansList)
-    } catch (error) {
-      console.error("Error fetching floor plans:", error)
-      toast({
-        title: "Error",
-        description: "Failed to fetch floor plans",
-        variant: "destructive",
-      })
+      const tree = await FirestoreService.getNestedFloorPlanTree(selectedBuilding);
+      setOverview(tree.overview);
+      setFloors(tree.floors);
+      setLastUpdate(new Date());
+    } catch (e) {
+      console.error(e);
+      toast({ title: "Load failed", description: e.message, variant: "destructive" });
     } finally {
-      setIsLoadingFloorPlans(false)
+      setIsLoading(false);
     }
-  }
-
-  const fetchFloorPlanData = async (floorPlanName) => {
-    if (!floorPlanName || !selectedBuilding) return
-
-    setIsLoadingFloorPlanData(true)
-    setImageLoaded(false)
-    setImageError(false)
-    setActualImageDimensions({ width: 0, height: 0, offsetX: 0, offsetY: 0, naturalWidth: 0, naturalHeight: 0 })
-
-    try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const floorRef = doc(db, buildingNameWithSuffix, "floorMaps", "floors", floorPlanName)
-      const floorDoc = await getDoc(floorRef)
-
-      if (!floorDoc.exists()) {
-        throw new Error("Floor plan not found")
-      }
-
-      const floorData = floorDoc.data()
-
-      // Fetch assets from asset/{category}/ collections that have matching floorName
-      const categoryKeys = [
-        "fire-life-safety",
-        "electrical",
-        "hvac",
-        "plumbing",
-        "elv",
-        "security",
-        "vertical-transport",
-        "lighting",
-        "bms",
-        "landscaping",
-        "additional",
-      ]
-
-      const assetMappings = {}
-      const initialActiveStatuses = {}
-      const assetDocRefs = {} // Store refs for real-time listening
-
-      for (const categoryKey of categoryKeys) {
-        try {
-          const categoryCollection = collection(db, buildingNameWithSuffix, "asset", categoryKey)
-          const categorySnapshot = await getDocs(categoryCollection)
-
-          categorySnapshot.forEach((assetDoc) => {
-            const data = assetDoc.data()
-            
-            // Only include assets placed on this floor (floorMapName/floorPlanName + x,y)
-            const assetFloorName = getFloorMapName(data)
-            if (assetFloorName === floorPlanName && hasFloorPosition(data)) {
-              const category = data.mainCategory || categoryKey
-              const assetName = data.assetName || assetDoc.id
-
-              if (!assetMappings[category]) {
-                assetMappings[category] = {}
-              }
-              if (!assetMappings[category][assetName]) {
-                assetMappings[category][assetName] = []
-              }
-
-              const assetData = {
-                id: data.buildingAssetId || assetDoc.id,
-                x: data.x,
-                y: data.y,
-                relativeX: data.relativeX,
-                relativeY: data.relativeY,
-                floorMapName: assetFloorName,
-                floorPlanName: assetFloorName,
-                building: data.building || data.buildingName || selectedBuilding,
-                active: data.active || 0,
-                customImageUrl: data.customImageUrl || null,
-                deviceLocation: data.deviceLocation || "",
-                deviceAddress: data.deviceAddress || "",
-                installed: data.installed || false,
-                activityStatus: data.activityStatus !== undefined ? data.activityStatus : 1,
-                enabled: data.enabled !== undefined ? data.enabled : true,
-                assetName: assetName,
-                category: category,
-                categoryKey: categoryKey, // Store actual categoryKey for updates
-              }
-
-              assetMappings[category][assetName].push(assetData)
-
-              initialActiveStatuses[data.buildingAssetId || assetDoc.id] = {
-                active: assetData.active,
-                activityStatus: assetData.activityStatus,
-                enabled: assetData.enabled,
-                installed: assetData.installed,
-                lastUpdated: new Date().toISOString(),
-              }
-
-              // Store reference for real-time listening
-              assetDocRefs[data.buildingAssetId || assetDoc.id] = {
-                categoryKey,
-                docId: assetDoc.id,
-              }
-            }
-          })
-        } catch (error) {
-          console.error(`Error fetching category ${categoryKey}:`, error)
-          // Continue with other categories
-        }
-      }
-
-      const assetsListMappings = await loadFloorMapAssetsFromAssetsList(
-        db,
-        selectedBuilding,
-        floorPlanName,
-      )
-      const mergedAssetMappings = mergeAssetsListIntoAssetMappings(
-        assetMappings,
-        assetsListMappings,
-      )
-
-      assetsListMappings.forEach((asset) => {
-        initialActiveStatuses[asset.id] = {
-          active: asset.active || 0,
-          activityStatus: asset.activityStatus,
-          enabled: asset.enabled,
-          installed: asset.installed,
-          lastUpdated: new Date().toISOString(),
-        }
-        assetDocRefs[asset.id] = {
-          categoryKey: asset.categoryKey || "uploaded",
-          docId: asset.id,
-          source: "AssetsList",
-        }
-      })
-
-      const floorPlanDataObj = {
-        floorPlanName: floorData.floorPlanName || floorPlanName,
-        buildingName: floorData.buildingName || selectedBuilding,
-        imageUrl: floorData.imageUrl,
-        assetMappings: mergedAssetMappings,
-        createdAt: floorData.createdAt,
-        updatedAt: floorData.updatedAt,
-        assetDocRefs: assetDocRefs, // Store refs for real-time updates
-      }
-
-      setFloorPlanData(floorPlanDataObj)
-      setActiveStatuses(initialActiveStatuses)
-      setLastUpdate(new Date())
-    } catch (error) {
-      console.error("Error fetching floor plan data:", error)
-      toast({
-        title: "Error",
-        description: "Failed to fetch floor plan data",
-        variant: "destructive",
-      })
-    } finally {
-      setIsLoadingFloorPlanData(false)
-    }
-  }
-
-  const fetchActiveStatuses = async () => {
-    if (!selectedBuilding || !selectedFloorPlan) return
-
-    try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const categoryKeys = [
-        "fire-life-safety",
-        "electrical",
-        "hvac",
-        "plumbing",
-        "elv",
-        "security",
-        "vertical-transport",
-        "lighting",
-        "bms",
-        "landscaping",
-        "additional",
-      ]
-
-      const activeStatuses = {}
-
-      for (const categoryKey of categoryKeys) {
-        try {
-          const categoryCollection = collection(db, buildingNameWithSuffix, "asset", categoryKey)
-          const categorySnapshot = await getDocs(categoryCollection)
-
-          categorySnapshot.forEach((assetDoc) => {
-            const data = assetDoc.data()
-            
-            // Only include assets that are placed on this floor
-            if (data.floorPlanName === selectedFloorPlan && typeof data.x === "number" && typeof data.y === "number") {
-              const assetId = data.buildingAssetId || assetDoc.id
-              
-              activeStatuses[assetId] = {
-                active: data.active || 0,
-                activityStatus: data.activityStatus !== undefined ? data.activityStatus : 1,
-                enabled: data.enabled !== undefined ? data.enabled : true,
-                installed: data.installed || false,
-                lastUpdated: new Date().toISOString(),
-              }
-            }
-          })
-        } catch (error) {
-          console.error(`Error fetching category ${categoryKey}:`, error)
-          // Continue with other categories
-        }
-      }
-
-      setActiveStatuses(activeStatuses)
-      setLastUpdate(new Date())
-    } catch (error) {
-      console.error("Error fetching active statuses:", error)
-    }
-  }
-  
-  // Fetch Acknowledge status for THEMORA building
-  const fetchAckStatus = async () => {
-    setIsAckLoading(true)
-    try {
-      const actionsRef = doc(db, "THEMORABuildingDB", "actions")
-      const actionsSnap = await getDoc(actionsRef)
-      
-      if (actionsSnap.exists()) {
-        const actionsData = actionsSnap.data()
-        if (typeof actionsData.ack !== "undefined") {
-          setAckStatus(actionsData.ack)
-        } else {
-          setAckStatus(false) // Default to false if not found
-        }
-      } else {
-        setAckStatus(false) // Default to false if document doesn't exist
-      }
-    } catch (error) {
-      console.error("Error fetching ACK status:", error)
-      toast({
-        title: "Error",
-        description: "Failed to fetch building action status.",
-        variant: "destructive",
-      })
-    } finally {
-      setIsAckLoading(false)
-    }
-  }
-  
-  // Handle Acknowledge button click for THEMORA building
-  const handleAckClick = async () => {
-    setIsAckLoading(true)
-    const updatedAckState = !ackStatus
-
-    // Optimistic UI update
-    setAckStatus(updatedAckState)
-
-    try {
-      const userString = secureLocalStorage.getItem("user")
-      if (!userString) throw new Error("User not logged in.")
-      
-      const actionsRef = doc(db, "THEMORABuildingDB", "actions")
-      await updateDoc(actionsRef, {
-        ack: updatedAckState,
-      })
-      
-      toast({
-        title: "Success",
-        description: `Acknowledge status set to ${updatedAckState ? "Active" : "Inactive"}.`,
-      })
-    } catch (error) {
-      console.error("Error updating ACK status:", error)
-      setAckStatus(!updatedAckState) // Revert UI on failure
-      toast({
-        title: "Error",
-        description: "Failed to update Acknowledge status.",
-        variant: "destructive",
-      })
-    } finally {
-      setIsAckLoading(false)
-    }
-  }
-
-
-  const handleCommunitySelection = (communityId) => {
-    setSelectedCommunity(communityId)
-  }
-
-  const handleBuildingSelection = (buildingName) => {
-    setSelectedBuilding(buildingName)
-    setSelectedFloorPlan("")
-    setFloorPlanData(null)
-    setActiveStatuses({})
-    setLastUpdate(null)
-    stopRealTimeUpdates()
-  }
-
-  const handleFloorPlanSelection = (floorPlanName) => {
-    setSelectedFloorPlan(floorPlanName)
-    setFloorPlanData(null)
-    setActiveStatuses({})
-    setLastUpdate(null)
-    stopRealTimeUpdates()
-    fetchFloorPlanData(floorPlanName)
-  }
+  }, [selectedBuilding, resetNavigation, toast]);
 
   useEffect(() => {
-    setImageLoaded(false)
-    setImageError(false)
-  }, [floorPlanImageUrl])
-
-  const handleImageLoad = () => {
-    setImageError(false)
-    setImageLoaded(true)
-    if (imageRef.current) {
-      const { offsetWidth, offsetHeight } = imageRef.current
-      setImageDimensions({ width: offsetWidth, height: offsetHeight })
-      setTimeout(calculateImageDimensions, 100)
+    if (selectedBuilding) loadBuildingData();
+    else {
+      setOverview(null);
+      setFloors([]);
+      resetNavigation();
     }
-  }
+  }, [selectedBuilding, loadBuildingData, resetNavigation]);
 
-  // Handle asset click to open modal
-  const handleAssetClick = useCallback((mapping) => {
-    if (!selectedBuilding || !selectedFloorPlan) return
+  const openFloor = async (f) => {
+    const full = await FirestoreService.getNestedFloor(selectedBuilding, f.id);
+    setFloor(full || f);
+    setLevel(NAV_LEVELS.FLOOR);
+    setSection(null);
+    setSubsection(null);
+  };
 
-    if (buildingStatus !== "construction") {
-      toast({
-        title: "Feature Unavailable",
-        description: "Asset controls are only available for buildings with 'Construction' status",
-        variant: "destructive",
-      })
-      return
+  const openSection = async (sectionId) => {
+    const full = await FirestoreService.getNestedSection(
+      selectedBuilding,
+      floor.id,
+      sectionId,
+    );
+    setSection(full);
+    setSectionAssetMappings(full?.assetMappings || []);
+    setLevel(NAV_LEVELS.SECTION);
+    setSubsection(null);
+    setAssetMappings([]);
+  };
+
+  const openSubsection = async (subsectionId) => {
+    const full = await FirestoreService.getNestedSubsection(
+      selectedBuilding,
+      floor.id,
+      section.id,
+      subsectionId,
+    );
+    setSubsection(full);
+    setAssetMappings(full?.assetMappings || []);
+    setLevel(NAV_LEVELS.SUBSECTION);
+  };
+
+  const goBack = () => {
+    if (level === NAV_LEVELS.SUBSECTION) {
+      setLevel(NAV_LEVELS.SECTION);
+      setSubsection(null);
+      setAssetMappings([]);
+    } else if (level === NAV_LEVELS.SECTION) {
+      setLevel(NAV_LEVELS.FLOOR);
+      setSection(null);
+      setSectionAssetMappings([]);
+    } else if (level === NAV_LEVELS.FLOOR) {
+      setLevel(NAV_LEVELS.BUILDING);
+      setFloor(null);
     }
+  };
 
-    setSelectedAsset({
-      ...mapping,
-      buildingAssetId: mapping.id,
-      assetCategory: mapping.categoryKey,
-    })
-    setIsAssetModalOpen(true)
-  }, [selectedBuilding, selectedFloorPlan, buildingStatus, toast])
+  const buildingName = selectedBuilding;
+  const crumbs = buildBreadcrumbs(level, {
+    buildingName,
+    floor,
+    section,
+    subsection,
+  });
 
-  const assetMarkers = useMemo(() => {
-    if (!floorPlanData?.assetMappings || !imageLoaded || !assetStatusLive || actualImageDimensions.width === 0) {
-      return null
-    }
+  const floorList = overview?.floors?.length ? overview.floors : floors;
 
-    const flat = []
-    Object.entries(floorPlanData.assetMappings).forEach(([category, assets]) => {
-      Object.entries(assets).forEach(([assetName, locations]) => {
-        locations.forEach((location, index) => {
-          flat.push({
-            id: location.id || `${assetName}_${index}`,
-            assetName,
-            category,
-            categoryKey: location.categoryKey,
-            x: location.x,
-            y: location.y,
-            relativeX: location.relativeX,
-            relativeY: location.relativeY,
-            active: location.active || 0,
-            raw: location,
-            locationIndex: index,
-            deviceLocation: location.deviceLocation,
-          })
-        })
-      })
-    })
-
-    const { width, height, offsetX, offsetY, naturalWidth, naturalHeight } = actualImageDimensions
-
-    return flat.map((m) => {
-      const hasRelative = typeof m.relativeX === "number" && typeof m.relativeY === "number"
-      const hasNatural = typeof m.x === "number" && typeof m.y === "number"
-      if (!hasRelative && !hasNatural) return null
-
-      const baseLeft = hasRelative
-        ? offsetX + (m.relativeX / 100) * width
-        : m.x * (naturalWidth ? width / naturalWidth : 1) + offsetX
-      const baseTop = hasRelative
-        ? offsetY + (1 - m.relativeY / 100) * height
-        : m.y * (naturalHeight ? height / naturalHeight : 1) + offsetY
-
-      const left = baseLeft * browserZoom
-      const top = baseTop * browserZoom
-      const sanitizedId = sanitizeDocumentId(m.id || m.assetName)
-      const statusFromState = activeStatuses[m.id] || activeStatuses[sanitizedId]
-      const fallbackActive = statusFromState ? statusFromState.active : m.active || 0
-      const deviceAddr =
-        assetDeviceData[sanitizedId]?.deviceAddress ||
-        m.raw?.deviceAddress ||
-        m.deviceAddress
-      const deviceLocation =
-        assetDeviceData[sanitizedId]?.deviceLocation ||
-        m.raw?.deviceLocation ||
-        m.deviceLocation
-      const customImageUrl =
-        (m.raw && m.raw.customImageUrl) ||
-        assetDeviceData[sanitizedId]?.customImageUrl ||
-        null
-
-      return (
-        <FloorMapAssetMarker
-          key={`${m.id}-${m.locationIndex}`}
-          mapping={{ ...m, sanitizedId }}
-          left={left}
-          top={top}
-          browserZoom={browserZoom}
-          fallbackActive={fallbackActive}
-          deviceAddr={deviceAddr}
-          deviceLocation={deviceLocation}
-          customImageUrl={customImageUrl}
-          live={assetStatusLive}
-          onAssetClick={handleAssetClick}
-        />
-      )
-    })
-  }, [
-    floorPlanData?.assetMappings,
-    imageLoaded,
-    actualImageDimensions,
-    browserZoom,
-    activeStatuses,
-    assetDeviceData,
-    assetStatusLive,
-    handleAssetClick,
-  ])
-
-  const getSelectedCommunityInfo = () => {
-    if (!selectedCommunity) return null
-    return communities.find((c) => c.id === selectedCommunity)
-  }
-
-  // Fetch deviceLocation, deviceAddress, and customImageUrl for all assets from Firestore
-  const fetchAssetDeviceData = async (floorPlanName) => {
-    if (!selectedBuilding || !floorPlanName) return
-
-    try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const assetMappingsRef = collection(
-        db,
-        buildingNameWithSuffix,
-        "floorMaps",
-        "floors",
-        floorPlanName,
-        "assetMappings"
-      )
-      
-      const querySnapshot = await getDocs(assetMappingsRef)
-      const deviceDataMap = {}
-      
-      querySnapshot.forEach((doc) => {
-        const data = doc.data()
-        deviceDataMap[doc.id] = {
-          deviceLocation: data.deviceLocation || "",
-          deviceAddress: data.deviceAddress || "",
-          customImageUrl: data.customImageUrl || null,
-        }
-        if (data.id && data.id !== doc.id) {
-          const sanitizedId = sanitizeDocumentId(data.id)
-          if (sanitizedId && sanitizedId !== doc.id) {
-            deviceDataMap[sanitizedId] = {
-              deviceLocation: data.deviceLocation || "",
-              deviceAddress: data.deviceAddress || "",
-              customImageUrl: data.customImageUrl || null,
-            }
-          }
-        }
-      })
-      
-      setAssetDeviceData(deviceDataMap)
-    } catch (error) {
-      console.error("Error fetching device data:", error)
-    }
-  }
-
-  if (!mounted) {
-    return null
-  }
+  if (!mounted) return null;
 
   return (
     <SidebarProvider>
-      <style jsx>{`
-        @keyframes radar-pulse {
-          0% {
-            opacity: 0;
-            transform: translate(-50%, -50%) scale(0.8);
-          }
-          50% {
-            opacity: 1;
-            transform: translate(-50%, -50%) scale(1.2);
-          }
-          100% {
-            opacity: 0;
-            transform: translate(-50%, -50%) scale(1.4);
-          }
-        }
-      `}</style>
       <AppSidebar />
       <SidebarInset>
-        <header className="flex h-16 shrink-0 items-center gap-2 transition-[width,height] ease-linear group-has-[[data-collapsible=icon]]/sidebar-wrapper:h-12">
-          <div className="flex items-center gap-2 px-4 md:px-8">
-            <SidebarTrigger className="-ml-1" />
-            <ClientModeToggle />
-            <Separator orientation="vertical" className="mr-2 h-4" />
-            <Breadcrumb>
-              <BreadcrumbList>
-                <BreadcrumbItem className="hidden md:block">
-                  <BreadcrumbLink href="/dashboard">Home</BreadcrumbLink>
-                </BreadcrumbItem>
-                <BreadcrumbSeparator className="hidden md:block" />
-                <BreadcrumbItem>
-                  <BreadcrumbPage>Floor Plan Viewer</BreadcrumbPage>
-                </BreadcrumbItem>
-              </BreadcrumbList>
-            </Breadcrumb>
-            {isMobile && (
-              <div className="flex items-center gap-1 ml-auto">
-                <Smartphone className="h-4 w-4 text-muted-foreground" />
-                <span className="text-xs text-muted-foreground">Mobile</span>
-              </div>
-            )}
-          </div>
-          <div className="ml-auto flex items-center gap-2 px-4 md:px-8">
+        <header className="flex h-16 shrink-0 items-center gap-2 px-4 md:px-8">
+          <SidebarTrigger className="-ml-1" />
+          <ClientModeToggle />
+          <Separator orientation="vertical" className="mr-2 h-4" />
+          <Breadcrumb>
+            <BreadcrumbList>
+              <BreadcrumbItem className="hidden md:block">
+                <BreadcrumbLink href="/dashboard">Home</BreadcrumbLink>
+              </BreadcrumbItem>
+              <BreadcrumbSeparator className="hidden md:block" />
+              <BreadcrumbItem>
+                <BreadcrumbPage>View Floor Maps</BreadcrumbPage>
+              </BreadcrumbItem>
+            </BreadcrumbList>
+          </Breadcrumb>
+          <div className="ml-auto flex items-center gap-2">
+            {level !== NAV_LEVELS.BUILDING ? (
+              <MonitoringLiveStatus lastUpdate={lastUpdate} />
+            ) : null}
             <FirePanelStatusBadges />
           </div>
         </header>
 
-        <div className="flex flex-1 flex-col gap-4 md:gap-6 p-4 md:p-6 pt-0">
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <div>
-                <h1 className="text-2xl md:text-3xl font-bold tracking-tight">Floor Plan Viewer</h1>
-                <p className="text-muted-foreground text-sm md:text-base">
-                  Select a community, building and floor plan to view real-time asset activity
-                </p>
-              </div>
-              <MonitoringLiveStatus
-                lastUpdate={lastUpdate}
-                connectionType={connectionType}
-                isConnected={isConnected}
-              />
-            </div>
+        <div className="flex flex-1 flex-col gap-6 p-4 md:p-6 pt-0">
+          <div>
+            <h1 className="text-2xl font-bold flex items-center gap-2">
+              <Eye className="h-6 w-6" />
+              Hospital Navigation
+              <FaqHelpButton articleId="page-floor-view" size="md" />
+            </h1>
+            <p className="text-muted-foreground text-sm mt-1">
+              Building → floors → sections. Subsections are optional; assets can be placed on a section or inside a subsection.
+            </p>
           </div>
 
-          <div className="grid gap-4 md:gap-6 lg:grid-cols-2">
+          <CommunityBuildingSelect
+            communities={communities}
+            isLoadingCommunities={isLoadingCommunities}
+            selectedCommunity={selectedCommunity}
+            onCommunityChange={setSelectedCommunity}
+            buildings={buildings}
+            selectedBuilding={selectedBuilding}
+            onBuildingChange={setSelectedBuilding}
+            floorCount={floorList?.length}
+          />
+
+          {selectedBuilding ? (
             <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-lg">
-                  <Users className="h-5 w-5" />
-                  Community Selection
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="space-y-2">
-                  <Label htmlFor="communitySelect">Available Communities</Label>
-                  <Select
-                    value={selectedCommunity}
-                    onValueChange={handleCommunitySelection}
-                    disabled={isLoadingCommunities}
-                  >
-                    <SelectTrigger>
-                      <SelectValue placeholder={isLoadingCommunities ? "Loading communities..." : "Select a community"} />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {communities.map((community) => (
-                        <SelectItem key={community.id} value={community.id}>
-                          {community.communityName}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-
-                {selectedCommunity && getSelectedCommunityInfo() && (
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                    <div className="flex items-center gap-2">
-                      <Users className="h-4 w-4 text-blue-600" />
-                      <span className="text-sm font-medium text-blue-800">
-                        {getSelectedCommunityInfo().communityName}
-                      </span>
-                      <Badge variant="secondary" className="ml-2">
-                        {getSelectedCommunityInfo().totalBuildings} buildings
-                      </Badge>
-                    </div>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-lg">
-                  <Building2 className="h-5 w-5" />
-                  Building Selection
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="space-y-2">
-                  <Label htmlFor="buildingSelect">Available Buildings</Label>
-                  <Select value={selectedBuilding} onValueChange={handleBuildingSelection} disabled={!selectedCommunity}>
-                    <SelectTrigger>
-                      <SelectValue placeholder={!selectedCommunity ? "Select a community first" : "Select a building"} />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {buildings.map((building) => (
-                        <SelectItem key={building} value={building}>
-                          {building}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-
-                {selectedBuilding && (
-                  <div className="p-3 bg-green-50 border border-green-200 rounded-lg">
-                    <div className="flex items-center gap-2">
-                      <Building2 className="h-4 w-4 text-green-600" />
-                      <span className="text-sm font-medium text-green-800">Selected: {selectedBuilding}</span>
-                      <Badge variant="secondary" className="ml-2">
-                        {floorPlans.length} floor plans
-                      </Badge>
-                    </div>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          </div>
-
-          {/* Floor Plan Tiles */}
-          {selectedBuilding && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-lg">
-                  <Eye className="h-5 w-5" />
-                  Floor Plans
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                {isLoadingFloorPlans ? (
-                  <div className="flex items-center justify-center py-8">
-                    <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-                    <span className="ml-2 text-sm text-muted-foreground">Loading floor plans...</span>
-                  </div>
-                ) : floorPlans.length > 0 ? (
-                  <div className="flex flex-wrap gap-4">
-                    {floorPlans.map((floorPlan) => {
-                      const isSelected = selectedFloorPlan === floorPlan.name
-                      return (
-                        <button
-                          key={floorPlan.name}
-                          onClick={() => handleFloorPlanSelection(floorPlan.name)}
-                          className={`relative flex flex-col items-center justify-center p-4 border-2 rounded-lg transition-all hover:shadow-md min-w-[120px] ${
-                            isSelected
-                              ? "border-primary bg-primary/10 shadow-md"
-                              : "border-border bg-card hover:border-primary/50"
-                          }`}
-                          disabled={isLoadingFloorPlans}
-                        >
-                          {floorPlan.imageUrl ? (
-                            <FloorPlanThumbnail
-                              imageUrl={floorPlan.imageUrl}
-                              alt={floorPlan.floorPlanName || floorPlan.name}
-                            />
-                          ) : (
-                            <div className="w-20 h-20 bg-muted rounded mb-2 flex items-center justify-center">
-                              <ImageIcon className="h-8 w-8 text-muted-foreground" />
-                            </div>
-                          )}
-                          <span className={`text-sm font-medium text-center ${isSelected ? "text-primary" : "text-foreground"}`}>
-                            {floorPlan.floorPlanName || floorPlan.name}
-                          </span>
-                          {isSelected && (
-                            <div className="absolute top-2 right-2">
-                              <Badge variant="default" className="h-5 w-5 rounded-full p-0 flex items-center justify-center">
-                                <CheckCircle className="h-3 w-3" />
-                              </Badge>
-                            </div>
-                          )}
-                        </button>
-                      )
-                    })}
-                  </div>
-                ) : (
-                  <div className="text-center py-8">
-                    <Eye className="mx-auto h-8 w-8 text-muted-foreground" />
-                    <p className="mt-2 text-sm text-muted-foreground">No floor plans available</p>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          )}
-          
-          {/* Acknowledge button for THEMORA building */}
-          {selectedBuilding === "THEMORA" && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">Building Actions<FaqHelpButton articleId="page-floor-view" /></CardTitle>
-              </CardHeader>
-              <CardContent>
-                <Button
-                  onClick={handleAckClick}
-                  disabled={isAckLoading}
-                  className={`w-32 text-white ${
-                    ackStatus ? "bg-red-500 hover:bg-red-600" : "bg-green-500 hover:bg-green-600"
-                  }`}
-                >
-                  {isAckLoading ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    "Acknowledge"
-                  )}
-                </Button>
-              </CardContent>
-            </Card>
-          )}
-
-          <div className="grid gap-4 md:gap-6 lg:grid-cols-4">
-            <div className="lg:col-span-3">
-              <Card className="h-full">
-                <CardHeader>
-                  <div className="flex items-center justify-between">
-                    <CardTitle className="flex items-center gap-2 text-lg flex-1">
-                      <ImageIcon className="h-5 w-5" />
-                      {floorPlanData ? (
-                        <>
-                          {floorPlanData.floorPlanName} ({selectedBuilding})
-                          {buildingStatus && (
-                            <span className="text-sm font-normal text-muted-foreground">
-                              - {buildingStatus.charAt(0).toUpperCase() + buildingStatus.slice(1)}
-                            </span>
-                          )}
-                        </>
-                      ) : (
-                        "Floor Plan"
-                      )}
-                      {isLoadingFloorPlanData && <Loader2 className="h-4 w-4 animate-spin ml-2" />}
-                    </CardTitle>
-                    {floorPlanData && (
-                      <Button
-                        onClick={handleFullscreen}
-                        variant="outline"
-                        size="sm"
-                        className="gap-2"
-                        title={isFullscreen ? "Exit Fullscreen (ESC)" : "Enter Fullscreen"}
-                      >
-                        {isFullscreen ? (
-                          <Minimize2 className="h-4 w-4" />
-                        ) : (
-                          <Maximize2 className="h-4 w-4" />
-                        )}
+              <CardHeader className="flex flex-row items-center justify-between gap-4">
+                <div>
+                  <CardTitle className="flex items-center gap-2">
+                    {level !== NAV_LEVELS.BUILDING ? (
+                      <Button variant="ghost" size="sm" onClick={goBack}>
+                        <ArrowLeft className="mr-1 h-4 w-4" />
+                        {crumbs.length > 1 ? `Back to ${crumbs[crumbs.length - 2].label}` : "Back"}
                       </Button>
+                    ) : (
+                      <>
+                        <Building2 className="h-5 w-5" />
+                        {selectedBuilding}
+                      </>
+                    )}
+                  </CardTitle>
+                  {level !== NAV_LEVELS.BUILDING ? (
+                    <p className="text-sm text-muted-foreground mt-1">
+                      {crumbs.map((c) => c.label).join(" → ")}
+                    </p>
+                  ) : null}
+                </div>
+                {level !== NAV_LEVELS.BUILDING ? (
+                  <Badge variant="outline">Live</Badge>
+                ) : null}
+              </CardHeader>
+
+              <CardContent>
+                {isLoading ? (
+                  <div className="flex justify-center py-12">
+                    <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+                  </div>
+                ) : null}
+
+                {!isLoading && level === NAV_LEVELS.BUILDING && (
+                  <div className="space-y-4">
+                    {floorList.length === 0 ? (
+                      <Alert>
+                        <AlertTitle>No floors configured</AlertTitle>
+                        <AlertDescription>
+                          Set up floors in Building Setup first.
+                        </AlertDescription>
+                      </Alert>
+                    ) : (
+                      <PlanImageCanvas
+                        imageUrl={overview?.buildingImageUrl}
+                        alt={selectedBuilding}
+                        markers={buildBuildingFloorMarkers(floorList)}
+                        mode="nav"
+                        navMarkerStyle="floorButton"
+                        maxHeight="min(75vh, 700px)"
+                        onMarkerClick={(marker) => {
+                          const floorData =
+                            floors.find((x) => x.id === marker.floorId) ||
+                            floorList.find((x) => x.id === marker.floorId);
+                          if (floorData) openFloor(floorData);
+                        }}
+                      />
                     )}
                   </div>
-                </CardHeader>
-                <CardContent className="p-2 md:p-4">
-                  {isLoadingFloorPlanData ? (
-                    <div className="border rounded-lg h-[300px] md:h-[600px] flex items-center justify-center bg-muted/20">
-                      <div className="text-center">
-                        <Loader2 className="mx-auto h-8 w-8 animate-spin text-muted-foreground" />
-                        <p className="mt-3 text-sm text-muted-foreground">
-                          Loading floor plan data...
-                        </p>
-                      </div>
-                    </div>
-                  ) : floorPlanData ? (
-                    <div
-                      ref={mapContainerRef}
-                      className={`relative border rounded-lg overflow-hidden bg-gray-50 min-h-[300px] md:min-h-[600px] ${
-                        isFullscreen ? "fixed inset-0 z-50 rounded-none border-0 min-h-0" : ""
-                      }`}
-                    >
-                      {floorPlanData.imageUrl && floorPlanImageUrl ? (
-                        <img
-                          ref={imageRef}
-                          key={floorPlanImageUrl}
-                          src={floorPlanImageUrl}
-                          alt={floorPlanData.floorPlanName}
-                          className="block w-full h-auto max-w-full"
-                          onLoad={handleImageLoad}
-                          onError={() => {
-                            setImageLoaded(false)
-                            setImageError(true)
-                          }}
-                          style={{
-                            objectFit: "contain",
-                            objectPosition: "center",
-                            maxHeight: isFullscreen ? "100vh" : isMobile ? "400px" : "600px",
-                            touchAction: "manipulation",
-                          }}
-                        />
-                      ) : (
-                        <div className="flex h-[300px] md:h-[600px] items-center justify-center text-muted-foreground">
-                          <div className="text-center">
-                            <ImageIcon className="mx-auto h-12 w-12 opacity-50" />
-                            <p className="mt-2 text-sm">No floor plan image uploaded</p>
-                          </div>
-                        </div>
-                      )}
-                      {assetMarkers}
-                      {floorPlanData.imageUrl && floorPlanImageUrl && !imageLoaded && !imageError && (
-                        <div className="absolute inset-0 flex items-center justify-center bg-gray-100">
-                          <Loader2 className="mx-auto h-8 w-8 animate-spin text-gray-400" />
-                        </div>
-                      )}
-                      {imageError && (
-                        <div className="absolute inset-0 flex items-center justify-center bg-gray-100">
-                          <p className="text-sm text-destructive">Failed to load floor plan image</p>
-                        </div>
-                      )}
-                      {isFullscreen && (
-                        <Button
-                          onClick={handleFullscreen}
-                          variant="destructive"
-                          size="sm"
-                          className="absolute top-4 right-4 z-50 gap-2"
-                        >
-                          <Minimize2 className="h-4 w-4" />
-                          Exit Fullscreen
-                        </Button>
-                      )}
+                )}
 
-                    </div>
-                  ) : (
-                    <div className="border-2 border-dashed rounded-lg h-[300px] md:h-[600px] flex items-center justify-center">
-                      <div className="text-center">
-                        <ImageIcon className="mx-auto h-12 w-12 text-gray-400" />
-                        <p className="mt-4 text-base text-gray-500">Please select a floor plan to view</p>
-                      </div>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-            </div>
+                {!isLoading && level === NAV_LEVELS.FLOOR && floor && (
+                  <PlanImageCanvas
+                    imageUrl={floor.imageUrl}
+                    alt={floor.name}
+                    markers={filterPlacedNavMarkers(floor.sectionMarkers)}
+                    mode="nav"
+                    onMarkerClick={(m) => openSection(m.sectionId)}
+                    maxHeight="min(75vh, 700px)"
+                  />
+                )}
 
-            <div className="lg:col-span-1">
-              <Card className="h-full">
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2 text-lg">
-                <MapPin className="h-5 w-5" />
-                    {(() => {
-                      const activeCount = Object.values(activeStatuses || {}).filter(s => s && Number(s.active) > 0).length;
-                      return `ALARM HISTORY${activeCount ? ` • Active: ${activeCount}` : ""}`;
-                    })()}
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  {floorPlanData?.assetMappings && Object.keys(floorPlanData.assetMappings).length > 0 ? (
-                    <div className="space-y-4 max-h-[400px] md:max-h-[600px] overflow-y-auto">
-                      {Object.entries(floorPlanData.assetMappings).map(([category, assets]) => (
-                        <div key={category} className="space-y-2">
-                          <div className="flex items-center gap-2 font-medium text-sm border-b pb-1">
-                            {/* --- MODIFICATION 4: Use custom icon for category in side list --- */}
-                            <img
-                              src={getIconForCategory(category, assets.customImageUrl)}
-                              alt={category}
-                              className="w-5 h-5 object-contain"
-                              onError={handleImageError}
-                            />
-                            <span>{category}</span>
-                          </div>
-                          <div className="space-y-2 ml-7">
-                            {Object.entries(assets).map(([assetName, locations]) =>
-                              locations.map((location, index) => {
-                                const currentActiveStatus = activeStatuses[location.id]
-                                const fallbackActive = currentActiveStatus ? currentActiveStatus.active : location.active || 0
-                                const sanitizedId = sanitizeDocumentId(location.id || assetName)
-                                const deviceData = assetDeviceData[sanitizedId] || assetDeviceData[location.id] || {}
-                                const displayName = deviceData.deviceLocation || location.deviceLocation || assetName
-                                const deviceAddr =
-                                  deviceData.deviceAddress ||
-                                  location.deviceAddress ||
-                                  location.raw?.deviceAddress
-                                return (
-                                  <FloorPlanAssetListRow
-                                    key={location.id || `${assetName}-${index}`}
-                                    locationId={location.id}
-                                    sanitizedId={sanitizedId}
-                                    displayName={displayName}
-                                    index={index}
-                                    coordinates={`${location.x}, ${location.y}`}
-                                    fallbackActive={fallbackActive}
-                                    deviceAddr={deviceAddr}
-                                    live={assetStatusLive}
-                                  />
-                                )
-                              }),
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="text-center py-8">
-                      <MapPin className="mx-auto h-8 w-8 text-gray-400" />
-                      <p className="mt-2 text-sm text-gray-500">No assets mapped</p>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-            </div>
-          </div>
+                {!isLoading && level === NAV_LEVELS.SECTION && section && (
+                  <PlanImageCanvas
+                    imageUrl={section.imageUrl}
+                    alt={section.name}
+                    navMarkers={filterPlacedNavMarkers(section.subsectionMarkers)}
+                    assetMarkers={sectionAssetMappings}
+                    assetStatusLive={assetStatusLive}
+                    onMarkerClick={(m) => openSubsection(m.subsectionId)}
+                    onAssetClick={(mapping) => {
+                      setSelectedAsset(mapping);
+                      setIsAssetModalOpen(true);
+                    }}
+                    maxHeight="min(75vh, 700px)"
+                  />
+                )}
 
-          {/* Footer row: User Role | Time and date | logo */}
-          <div className="flex items-center justify-between text-sm text-muted-foreground px-4 py-3 border-t">
-            <div>{userRole || "User"}</div>
-            <div>{new Date().toLocaleString()}</div>
-            <div><img src="/logo.png" alt="Logo" className="h-6 w-auto" /></div>
-          </div>
+                {!isLoading && level === NAV_LEVELS.SUBSECTION && subsection && (
+                  <PlanImageCanvas
+                    imageUrl={subsection.imageUrl}
+                    alt={subsection.name}
+                    assetMarkers={assetMappings}
+                    assetStatusLive={assetStatusLive}
+                    onAssetClick={(mapping) => {
+                      setSelectedAsset(mapping);
+                      setIsAssetModalOpen(true);
+                    }}
+                    maxHeight="min(75vh, 700px)"
+                  />
+                )}
+              </CardContent>
+            </Card>
+          ) : null}
         </div>
-      </SidebarInset>
 
-      <AssetControlModal
-        isOpen={isAssetModalOpen}
-        onClose={() => setIsAssetModalOpen(false)}
-        asset={selectedAsset}
-        selectedBuilding={selectedBuilding}
-        buildingStatus={buildingStatus}
-        userRole={userRole}
-      />
+        <AssetControlModal
+          isOpen={isAssetModalOpen}
+          onClose={() => setIsAssetModalOpen(false)}
+          asset={selectedAsset}
+          userRole={effectiveRole || ""}
+          buildingName={selectedBuilding}
+        />
+      </SidebarInset>
     </SidebarProvider>
-  )
+  );
 }

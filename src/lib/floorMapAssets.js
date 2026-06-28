@@ -64,6 +64,32 @@ export function buildClearFloorMapPositionPayload() {
   }
 }
 
+/** Clears nested floor-plan placement fields (building → floor → section → subsection). */
+export function buildClearNestedFloorMapPositionPayload(
+  now = new Date().toISOString(),
+) {
+  return {
+    ...buildClearFloorMapPositionPayload(),
+    buildingName: "",
+    building: "",
+    placementLevel: "",
+    nestedPath: "",
+    floorId: "",
+    floorName: "",
+    floorImageUrl: "",
+    sectionId: "",
+    sectionName: "",
+    sectionImageUrl: "",
+    subsectionId: "",
+    subsectionName: "",
+    subsectionImageUrl: "",
+    floorDetails: null,
+    sectionDetails: null,
+    subsectionDetails: null,
+    updatedAt: now,
+  }
+}
+
 export function getAssetsListIdFromMapping(mapping) {
   return (
     mapping?.assetsListId ||
@@ -114,6 +140,45 @@ export function buildFloorMapAssetsListUpdate({
       relativeX,
       relativeY,
     }),
+    updatedAt: now,
+  }
+
+  const { deviceAddress, deviceLocation } = resolveMappingDeviceFields(mapping)
+  if (deviceAddress) payload.deviceAddress = deviceAddress
+  if (deviceLocation) payload.deviceLocation = deviceLocation
+
+  return payload
+}
+
+/** AssetsList / building-asset update for nested floor-plan placement. */
+export function buildNestedFloorMapAssetsListUpdate({
+  mapping,
+  now = new Date().toISOString(),
+}) {
+  const payload = {
+    ...buildFloorMapPositionPayload({
+      floorPlanName: mapping.floorPlanName || mapping.floorMapName,
+      building: mapping.buildingName || mapping.building,
+      x: mapping.x,
+      y: mapping.y,
+      relativeX: mapping.relativeX,
+      relativeY: mapping.relativeY,
+    }),
+    buildingName: mapping.buildingName || mapping.building || "",
+    placementLevel: mapping.placementLevel || "",
+    nestedPath: mapping.nestedPath || "",
+    floorId: mapping.floorId || "",
+    floorName: mapping.floorName || "",
+    floorImageUrl: mapping.floorImageUrl || "",
+    sectionId: mapping.sectionId || "",
+    sectionName: mapping.sectionName || "",
+    sectionImageUrl: mapping.sectionImageUrl || "",
+    subsectionId: mapping.subsectionId || "",
+    subsectionName: mapping.subsectionName || "",
+    subsectionImageUrl: mapping.subsectionImageUrl || "",
+    floorDetails: mapping.floorDetails || null,
+    sectionDetails: mapping.sectionDetails || null,
+    subsectionDetails: mapping.subsectionDetails || null,
     updatedAt: now,
   }
 

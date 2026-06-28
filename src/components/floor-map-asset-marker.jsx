@@ -52,7 +52,10 @@ function FloorMapAssetMarkerInner({
         transform: `translate(-50%, -50%) scale(${1 / browserZoom})`,
         transformOrigin: "center",
       }}
-      onClick={() => onAssetClick(mapping)}
+      onClick={(e) => {
+        e.stopPropagation();
+        onAssetClick?.(mapping);
+      }}
       title={markerTooltip}
     >
       <div

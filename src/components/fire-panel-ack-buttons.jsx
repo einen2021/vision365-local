@@ -8,14 +8,32 @@ import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 
 const ACK_BUTTONS = [
-  { label: "Fire", title: "Fire Ack", variant: "destructive" },
-  { label: "Trouble", title: "Trouble Ack", variant: "outline" },
-  { label: "Supervisory", title: "Sup Ack", variant: "outline" },
+  {
+    label: "Fire",
+    title: "Fire Ack",
+    variant: "destructive",
+    cvalField: "totalFire",
+    activeClassName: "border-red-500/40 bg-red-500/5",
+  },
+  {
+    label: "Trouble",
+    title: "Trouble Ack",
+    variant: "outline",
+    cvalField: "totalTrouble",
+    activeClassName: "border-yellow-500/40 bg-yellow-500/5",
+  },
+  {
+    label: "Supervisory",
+    title: "Sup Ack",
+    variant: "outline",
+    cvalField: "totalSupervisory",
+    activeClassName: "border-purple-500/40 bg-purple-500/5",
+  },
 ];
 
 /** Fire panel acknowledge commands for dashboard headers. */
 export function FirePanelAckButtons() {
-  const { acknowledge } = useFirePanelMonitor();
+  const { acknowledge, firePanelState } = useFirePanelMonitor();
   const connected = useFirePanelStore((s) => s.connected);
   const { toast } = useToast();
   const [loadingLabel, setLoadingLabel] = useState(null);
@@ -50,22 +68,37 @@ export function FirePanelAckButtons() {
 
   return (
     <>
-      {ACK_BUTTONS.map(({ label, title, variant }) => (
-        <Button
-          key={label}
-          type="button"
-          variant={variant}
-          size="sm"
-          disabled={!connected || loadingLabel !== null}
-          onClick={() => handleAck(label, title)}
-        >
-          {loadingLabel === label ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            title
-          )}
-        </Button>
-      ))}
+      {ACK_BUTTONS.map(({ label, title, variant, cvalField, activeClassName }) => {
+        const cval = firePanelState?.[cvalField] ?? 0;
+        const active = cval > 0;
+
+        return (
+          <Button
+            key={label}
+            type="button"
+            variant={variant}
+            size="sm"
+            className={active && variant === "outline" ? activeClassName : undefined}
+            disabled={!connected || loadingLabel !== null}
+            onClick={() => handleAck(label, title)}
+          >
+            {loadingLabel === label ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <>
+                {title}
+                <span
+                  className={`ml-1 rounded px-1 font-mono text-[11px] font-semibold tabular-nums ${
+                    active ? "" : "text-muted-foreground"
+                  }`}
+                >
+                  {cval}
+                </span>
+              </>
+            )}
+          </Button>
+        );
+      })}
     </>
   );
 }

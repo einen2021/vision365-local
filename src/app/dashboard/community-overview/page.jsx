@@ -20,11 +20,9 @@ import {
   Maximize2,
   Minimize2,
   Loader2,
-  RefreshCcw,
 } from 'lucide-react';
 import FirestoreService from '@/services/firestoreService';
 import { useAppData } from '@/hooks/useAppData';
-import { useApp } from '@/contexts/AppContext';
 import { getStoredSessionUser } from '@/lib/sessionUser';
 import { db } from '@/config/firebase';
 import { doc, getDoc, updateDoc, collection, onSnapshot } from 'firebase/firestore';
@@ -41,16 +39,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
 import { Input } from '@/components/ui/input';
 import { rowsForLiveAlarmLikeDisplay, rowsForLiveTroubleDisplay } from '@/lib/liveAlarmFeedWrite';
 import { PageHelpBanner } from "@/components/page-help-banner"
@@ -102,7 +90,6 @@ function CommunityOverviewContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { toast } = useToast();
-  const { systemReset } = useApp();
   const { communities: rawCommunities, isReady, effectiveRole } = useAppData({
     toastOnCommunitiesError: true,
   });
@@ -165,8 +152,6 @@ function CommunityOverviewContent() {
   const [isAssetModalOpen, setIsAssetModalOpen] = useState(false);
   const [selectedAsset, setSelectedAsset] = useState(null);
   const [buildingStatus, setBuildingStatus] = useState('');
-  const [isSystemResetting, setIsSystemResetting] = useState(false);
-  const [systemResetDialogOpen, setSystemResetDialogOpen] = useState(false);
 
   // 3D Building view states
   const [viewMode, setViewMode] = useState('floorMap'); // 'floorMap' or '3dBuilding'
@@ -1187,27 +1172,6 @@ function CommunityOverviewContent() {
     setAreaLabels(labels);
   }, [currentFloorMap]);
 
-  const handleSystemReset = async () => {
-    setIsSystemResetting(true);
-    try {
-      await systemReset();
-      setSystemResetDialogOpen(false);
-      toast({
-        title: 'System reset complete',
-        description: 'All asset fire (F) statuses were cleared in AssetsList.',
-      });
-    } catch (error) {
-      console.error('System reset failed:', error);
-      toast({
-        title: 'System reset failed',
-        description: error?.message || 'Could not reset asset statuses.',
-        variant: 'destructive',
-      });
-    } finally {
-      setIsSystemResetting(false);
-    }
-  };
-
   return (
     <SidebarProvider>
       <AppSidebar />
@@ -1231,53 +1195,8 @@ function CommunityOverviewContent() {
           </div>
           <div className="ml-auto flex items-center gap-2 px-4">
             <FirePanelStatusBadges />
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => setSystemResetDialogOpen(true)}
-              disabled={isSystemResetting}
-            >
-              {isSystemResetting ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <RefreshCcw className="mr-2 h-4 w-4" />
-              )}
-              System Reset
-            </Button>
           </div>
         </header>
-
-        <AlertDialog open={systemResetDialogOpen} onOpenChange={setSystemResetDialogOpen}>
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>System reset</AlertDialogTitle>
-              <AlertDialogDescription>
-                This clears fire (F) status on every asset in AssetsList. Floor map markers
-                will return to normal. Trouble and supervisory values are not changed.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel disabled={isSystemResetting}>Cancel</AlertDialogCancel>
-              <AlertDialogAction
-                onClick={(e) => {
-                  e.preventDefault();
-                  void handleSystemReset();
-                }}
-                disabled={isSystemResetting}
-              >
-                {isSystemResetting ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Resetting…
-                  </>
-                ) : (
-                  'Confirm reset'
-                )}
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
 
         <div className="flex flex-1 flex-col gap-4 p-4 pt-0">
           <PageHelpBanner />

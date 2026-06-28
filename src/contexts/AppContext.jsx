@@ -66,6 +66,7 @@ export const useFirePanelMonitor = () => {
     toggleFirePanelMonitoring,
     fetchFirePanelState,
     systemReset,
+    silenceAlarm,
     acknowledge
   } = useApp();
   return {
@@ -78,6 +79,7 @@ export const useFirePanelMonitor = () => {
     toggleFirePanelMonitoring,
     fetchFirePanelState,
     systemReset,
+    silenceAlarm,
     acknowledge
   };
 };
@@ -229,39 +231,47 @@ export const AppProvider = ({ children }) => {
     flushFirePanelMonitorLogs();
   }, [appendFirePanelMonitorLog, flushFirePanelMonitorLogs]);
 
+  const silenceAlarm = useCallback(async () => {
+    const loginResponse = await sendFirePanelCommand("login 444");
+    if (!loginResponse.includes("ACCESS GRANTED")) {
+      throw new Error("Panel login failed");
+    }
+    return sendFirePanelListCommandAndWait("set p217 on");
+  }, []);
+
   const systemReset = useCallback(async () => {
 
     const loginResponse = await sendFirePanelCommand('login 444');
     console.log({ loginResponse})
-    // if(loginResponse.includes("ACCESS GRANTED")){
-    //   const reset = await sendFirePanelListCommandAndWait("set p212 on")
-    //   console.log({ reset })
-    //   console.log("[RESETTING]: sending command")
-    // }
-    // const snapshot = await getDocs(collection(db, "AssetsList"));
+    if(loginResponse.includes("ACCESS GRANTED")){
+      const reset = await sendFirePanelListCommandAndWait("set p212 on")
+      console.log({ reset })
+      console.log("[RESETTING]: sending command")
+    }
+    const snapshot = await getDocs(collection(db, "AssetsList"));
 
-    // snapshot.docs.map(async(docSnap) => {
-    //   const data = docSnap.data();
-    //   // console.log({ data })
-    //   const current = readSimplexStatus(data);
-    //   if(current.F !== 1 && !data.building && data.building !== "") {
-    //     console.log("[RESETING]: Skipping.. address: ",data.deviceAddress)
-    //     return
-    //   };
-    //   const next = { ...current, F: 0 };
-    //   await updateDoc(doc(db, "AssetsList", data.deviceAddress), {
-    //     simplexStatus: next,
-    //     updatedAt: new Date().toISOString(),
-    //   });
-    //   useAssetFireStatusStore.getState().patchSimplexStatus(
-    //     data.deviceAddress,
-    //     resolveAssetDeviceAddress(data) || data.deviceAddress || "",
-    //     next,
-    //   );
+    snapshot.docs.map(async(docSnap) => {
+      const data = docSnap.data();
+      // console.log({ data })
+      const current = readSimplexStatus(data);
+      if(current.F !== 1 && !data.building && data.building !== "") {
+        console.log("[RESETING]: Skipping.. address: ",data.deviceAddress)
+        return
+      };
+      const next = { ...current, F: 0 };
+      await updateDoc(doc(db, "AssetsList", data.deviceAddress), {
+        simplexStatus: next,
+        updatedAt: new Date().toISOString(),
+      });
+      useAssetFireStatusStore.getState().patchSimplexStatus(
+        data.deviceAddress,
+        resolveAssetDeviceAddress(data) || data.deviceAddress || "",
+        next,
+      );
 
-    // })
+    })
 
-    // useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
+    useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
   }, []);
 
 
@@ -675,6 +685,7 @@ export const AppProvider = ({ children }) => {
     toggleFirePanelMonitoring,
     fetchFirePanelState,
     systemReset,
+    silenceAlarm,
     acknowledge
   };
 

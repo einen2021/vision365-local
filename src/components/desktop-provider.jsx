@@ -2,17 +2,31 @@
 
 import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
+import { Progress } from "@/components/ui/progress";
 import { setDesktopApiPort } from "@/lib/platform";
-import { resetApiBaseUrl, waitForDesktopApi, DESKTOP_API_PORT, primeAssetUrlResolver } from "@/lib/apiClient";
+import {
+  resetApiBaseUrl,
+  waitForDesktopApi,
+  DESKTOP_API_PORT,
+  primeAssetUrlResolver,
+} from "@/lib/apiClient";
+
+const DEFAULT_PROGRESS = {
+  step: 1,
+  total: 6,
+  percent: 0,
+  message: "Starting Vision365...",
+};
 
 /**
  * Blocks the UI until the local database server is running.
- * Shows a splash screen on desktop; no-op on web.
+ * Shows a splash screen with numbered progress on desktop; no-op on web.
  */
 export function DesktopProvider({ children }) {
   const [status, setStatus] = useState("checking");
   const [errorMsg, setErrorMsg] = useState("");
   const [logHint, setLogHint] = useState("");
+  const [progress, setProgress] = useState(DEFAULT_PROGRESS);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -35,12 +49,30 @@ export function DesktopProvider({ children }) {
         setDesktopApiPort(DESKTOP_API_PORT);
         resetApiBaseUrl();
 
+        await listen("vision365-startup-progress", (event) => {
+          const payload = event.payload;
+          if (payload && typeof payload === "object") {
+            setProgress({
+              step: Number(payload.step) || 1,
+              total: Number(payload.total) || 6,
+              percent: Number(payload.percent) || 0,
+              message: String(payload.message || "Initialising..."),
+            });
+          }
+        });
+
         await listen("vision365-api-ready", (event) => {
           const port = event.payload;
           if (typeof port === "number" && port > 0) {
             setDesktopApiPort(port);
             resetApiBaseUrl();
           }
+          setProgress({
+            step: 6,
+            total: 6,
+            percent: 100,
+            message: "Application ready",
+          });
         });
 
         await listen("vision365-api-error", async (event) => {
@@ -52,18 +84,36 @@ export function DesktopProvider({ children }) {
           setStatus("error");
         });
 
-        // Give Rust setup time to finish
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r) => setTimeout(r, 300));
 
         if (apiErrorReceived) return;
 
         const ready = await invoke("is_db_ready");
         if (ready === true) {
+          setProgress({
+            step: 6,
+            total: 6,
+            percent: 100,
+            message: "Application ready",
+          });
           setStatus("ready");
           return;
         }
 
+        setProgress((prev) => ({
+          ...prev,
+          step: Math.max(prev.step, 4),
+          message: "Connecting to database...",
+        }));
+
         await waitForDesktopApi(90000);
+
+        setProgress({
+          step: 6,
+          total: 6,
+          percent: 100,
+          message: "Application ready",
+        });
         setStatus("ready");
       } catch (err) {
         console.error("[DesktopProvider]", err);
@@ -76,7 +126,7 @@ export function DesktopProvider({ children }) {
         }
         setErrorMsg(
           err?.message ||
-            "Local database server failed to start. Please restart the application."
+            "Local database server failed to start. Please restart the application.",
         );
         setStatus("error");
       }
@@ -87,13 +137,18 @@ export function DesktopProvider({ children }) {
 
   if (status === "checking") {
     return (
-      <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-background">
+      <div className="flex min-h-screen flex-col items-center justify-center gap-6 bg-background px-6">
         <Loader2 className="h-10 w-10 animate-spin text-primary" />
-        <div className="text-center">
+        <div className="w-full max-w-md space-y-3 text-center">
           <p className="text-lg font-semibold">Starting Vision365</p>
           <p className="text-sm text-muted-foreground">
-            Initialising local database...
+            Step {progress.step} of {progress.total}
           </p>
+          <p className="text-sm font-medium">{progress.message}</p>
+          <div className="space-y-1">
+            <Progress value={progress.percent} className="h-2" />
+            <p className="text-xs text-muted-foreground">{progress.percent}%</p>
+          </div>
         </div>
       </div>
     );

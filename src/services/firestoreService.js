@@ -21,10 +21,13 @@ import {
   listAll,
   deleteObject,
 } from "firebase/storage";
-import { uploadFloorPlanImage } from "@/lib/floorPlanStorage";
+import { uploadFloorPlanImage, uploadNestedPlanImage } from "@/lib/floorPlanStorage";
+import { sanitizeFloorPlanId, buildingCollectionName } from "@/lib/nestedFloorPlan";
 import {
   buildingsMatch,
   buildClearFloorMapPositionPayload,
+  buildClearNestedFloorMapPositionPayload,
+  buildNestedFloorMapAssetsListUpdate,
   getFloorMapName,
   hasFloorPosition,
   loadFloorMapAssetsFromAssetsList,
@@ -755,6 +758,699 @@ class FirestoreService {
       console.error("Error creating floor plan:", error);
       throw error;
     }
+  }
+
+  // ==================== NESTED FLOOR PLAN OPERATIONS ====================
+
+  static _nestedBuildingRef(buildingName) {
+    const coll = buildingCollectionName(buildingName);
+    return doc(db, coll, "floorMaps", "building");
+  }
+
+  static _nestedFloorRef(buildingName, floorId) {
+    const coll = buildingCollectionName(buildingName);
+    return doc(db, coll, "floorMaps", "floors", floorId);
+  }
+
+  static _nestedSectionRef(buildingName, floorId, sectionId) {
+    const coll = buildingCollectionName(buildingName);
+    return doc(
+      db,
+      coll,
+      "floorMaps",
+      "floors",
+      floorId,
+      "sections",
+      sectionId,
+    );
+  }
+
+  static _nestedSubsectionRef(buildingName, floorId, sectionId, subsectionId) {
+    const coll = buildingCollectionName(buildingName);
+    return doc(
+      db,
+      coll,
+      "floorMaps",
+      "floors",
+      floorId,
+      "sections",
+      sectionId,
+      "subsections",
+      subsectionId,
+    );
+  }
+
+  /** Building overview: image + floor list (step 1). */
+  static async getBuildingOverview(buildingName) {
+    const ref = this._nestedBuildingRef(buildingName);
+    const snap = await getDoc(ref);
+    if (!snap.exists()) return null;
+    return { id: snap.id, ...snap.data() };
+  }
+
+  static async saveBuildingOverview(buildingName, { buildingImageUrl, floors = [] }) {
+    const ref = this._nestedBuildingRef(buildingName);
+    const now = new Date().toISOString();
+    const existing = await getDoc(ref);
+    const payload = {
+      buildingImageUrl: buildingImageUrl || "",
+      floors: floors.map((f, index) => ({
+        id: f.id || sanitizeFloorPlanId(f.name),
+        name: f.name,
+        order: typeof f.order === "number" ? f.order : index,
+        ...(typeof f.x === "number" ? { x: f.x, y: f.y } : {}),
+        ...(typeof f.relativeX === "number"
+          ? { relativeX: f.relativeX, relativeY: f.relativeY }
+          : {}),
+      })),
+      updatedAt: now,
+      ...(existing.exists() ? {} : { createdAt: now }),
+    };
+    await setDoc(ref, payload, { merge: true });
+    return payload;
+  }
+
+  static async uploadBuildingOverviewImage(buildingName, imageFile) {
+    const coll = buildingCollectionName(buildingName);
+    const imageUrl = await uploadNestedPlanImage(coll, "building/overview", imageFile);
+    const ref = this._nestedBuildingRef(buildingName);
+    const now = new Date().toISOString();
+    await setDoc(
+      ref,
+      { buildingImageUrl: imageUrl, updatedAt: now, createdAt: now },
+      { merge: true },
+    );
+    return imageUrl;
+  }
+
+  /** All floors for a building. */
+  static async getNestedFloors(buildingName) {
+    const coll = buildingCollectionName(buildingName);
+    const floorsRef = collection(db, coll, "floorMaps", "floors");
+    const snap = await getDocs(floorsRef);
+    const floors = [];
+    snap.forEach((d) => floors.push({ id: d.id, ...d.data() }));
+    floors.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    return floors;
+  }
+
+  static async getNestedFloor(buildingName, floorId) {
+    const ref = this._nestedFloorRef(buildingName, floorId);
+    const snap = await getDoc(ref);
+    if (!snap.exists()) return null;
+    return { id: snap.id, ...snap.data() };
+  }
+
+  static async saveNestedFloor(buildingName, floor) {
+    const id = floor.id || sanitizeFloorPlanId(floor.name);
+    const ref = this._nestedFloorRef(buildingName, id);
+    const now = new Date().toISOString();
+    const existing = await getDoc(ref);
+    const payload = {
+      id,
+      name: floor.name,
+      imageUrl: floor.imageUrl || "",
+      order: floor.order ?? 0,
+      sectionMarkers: floor.sectionMarkers || [],
+      updatedAt: now,
+      ...(existing.exists() ? {} : { createdAt: now }),
+    };
+    await setDoc(ref, payload, { merge: true });
+    return payload;
+  }
+
+  static async uploadNestedFloorImage(buildingName, floorId, imageFile) {
+    const coll = buildingCollectionName(buildingName);
+    const imageUrl = await uploadNestedPlanImage(
+      coll,
+      `floors/${floorId}`,
+      imageFile,
+    );
+    const ref = this._nestedFloorRef(buildingName, floorId);
+    await updateDoc(ref, { imageUrl, updatedAt: new Date().toISOString() });
+    return imageUrl;
+  }
+
+  static async deleteNestedFloor(buildingName, floorId) {
+    const sections = await this.getNestedSections(buildingName, floorId);
+    for (const section of sections) {
+      await this.deleteNestedSection(buildingName, floorId, section.id);
+    }
+    await this._clearSourceAssetsForFloor(buildingName, floorId);
+    await deleteDoc(this._nestedFloorRef(buildingName, floorId));
+
+    const overview = await this.getBuildingOverview(buildingName);
+    if (overview?.floors?.length) {
+      const updatedFloors = overview.floors.filter((f) => f.id !== floorId);
+      await this.saveBuildingOverview(buildingName, {
+        buildingImageUrl: overview.buildingImageUrl || "",
+        floors: updatedFloors,
+      });
+    }
+  }
+
+  /** Sections within a floor (step 2). */
+  static async getNestedSections(buildingName, floorId) {
+    const coll = buildingCollectionName(buildingName);
+    const ref = collection(
+      db,
+      coll,
+      "floorMaps",
+      "floors",
+      floorId,
+      "sections",
+    );
+    const snap = await getDocs(ref);
+    const sections = [];
+    snap.forEach((d) => sections.push({ id: d.id, ...d.data() }));
+    return sections;
+  }
+
+  static async getNestedSection(buildingName, floorId, sectionId) {
+    const ref = this._nestedSectionRef(buildingName, floorId, sectionId);
+    const snap = await getDoc(ref);
+    if (!snap.exists()) return null;
+    const data = { id: snap.id, ...snap.data() };
+    data.assetMappings = await this.getSectionAssetMappings(
+      buildingName,
+      floorId,
+      sectionId,
+    );
+    return data;
+  }
+
+  static async saveNestedSection(buildingName, floorId, section) {
+    const id = section.id || sanitizeFloorPlanId(section.name);
+    const ref = this._nestedSectionRef(buildingName, floorId, id);
+    const now = new Date().toISOString();
+    const existing = await getDoc(ref);
+    const payload = {
+      id,
+      name: section.name,
+      imageUrl: section.imageUrl || "",
+      subsectionMarkers: section.subsectionMarkers || [],
+      updatedAt: now,
+      ...(existing.exists() ? {} : { createdAt: now }),
+    };
+    await setDoc(ref, payload, { merge: true });
+
+    // Keep floor-level navigation markers in sync
+    const floor = await this.getNestedFloor(buildingName, floorId);
+    if (floor) {
+      const markers = [...(floor.sectionMarkers || [])];
+      const idx = markers.findIndex((m) => m.sectionId === id);
+      const entry = {
+        id: `section_${id}`,
+        sectionId: id,
+        name: section.name,
+        ...(idx >= 0 ? markers[idx] : {}),
+      };
+      if (idx >= 0) markers[idx] = { ...markers[idx], name: section.name };
+      else markers.push(entry);
+      await updateDoc(this._nestedFloorRef(buildingName, floorId), {
+        sectionMarkers: markers,
+        updatedAt: now,
+      });
+    }
+
+    return payload;
+  }
+
+  static async updateFloorSectionMarkers(buildingName, floorId, sectionMarkers) {
+    await updateDoc(this._nestedFloorRef(buildingName, floorId), {
+      sectionMarkers,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  static async uploadNestedSectionImage(buildingName, floorId, sectionId, imageFile) {
+    const coll = buildingCollectionName(buildingName);
+    const imageUrl = await uploadNestedPlanImage(
+      coll,
+      `floors/${floorId}/sections/${sectionId}`,
+      imageFile,
+    );
+    const ref = this._nestedSectionRef(buildingName, floorId, sectionId);
+    await updateDoc(ref, { imageUrl, updatedAt: new Date().toISOString() });
+    return imageUrl;
+  }
+
+  static async deleteNestedSection(buildingName, floorId, sectionId) {
+    const subsections = await this.getNestedSubsections(
+      buildingName,
+      floorId,
+      sectionId,
+    );
+    for (const sub of subsections) {
+      await this.deleteNestedSubsection(buildingName, floorId, sectionId, sub.id);
+    }
+
+    const sectionMappingsRef = collection(
+      db,
+      buildingCollectionName(buildingName),
+      "floorMaps",
+      "floors",
+      floorId,
+      "sections",
+      sectionId,
+      "assetMappings",
+    );
+    const sectionMappingsSnap = await getDocs(sectionMappingsRef);
+    const sectionMappings = this._mappingsFromSnapshot(sectionMappingsSnap);
+    await this._clearNestedMappingsFromSourceAssets(buildingName, sectionMappings);
+    await Promise.all(sectionMappingsSnap.docs.map((d) => deleteDoc(d.ref)));
+
+    await deleteDoc(this._nestedSectionRef(buildingName, floorId, sectionId));
+
+    const floor = await this.getNestedFloor(buildingName, floorId);
+    if (floor?.sectionMarkers) {
+      const markers = floor.sectionMarkers.filter((m) => m.sectionId !== sectionId);
+      await this.updateFloorSectionMarkers(buildingName, floorId, markers);
+    }
+  }
+
+  /** Subsections within a section (step 3). */
+  static async getNestedSubsections(buildingName, floorId, sectionId) {
+    const coll = buildingCollectionName(buildingName);
+    const ref = collection(
+      db,
+      coll,
+      "floorMaps",
+      "floors",
+      floorId,
+      "sections",
+      sectionId,
+      "subsections",
+    );
+    const snap = await getDocs(ref);
+    const items = [];
+    snap.forEach((d) => items.push({ id: d.id, ...d.data() }));
+    return items;
+  }
+
+  static async getNestedSubsection(buildingName, floorId, sectionId, subsectionId) {
+    const ref = this._nestedSubsectionRef(
+      buildingName,
+      floorId,
+      sectionId,
+      subsectionId,
+    );
+    const snap = await getDoc(ref);
+    if (!snap.exists()) return null;
+    const data = { id: snap.id, ...snap.data() };
+    data.assetMappings = await this.getSubsectionAssetMappings(
+      buildingName,
+      floorId,
+      sectionId,
+      subsectionId,
+    );
+    return data;
+  }
+
+  static async saveNestedSubsection(buildingName, floorId, sectionId, subsection) {
+    const id = subsection.id || sanitizeFloorPlanId(subsection.name);
+    const ref = this._nestedSubsectionRef(buildingName, floorId, sectionId, id);
+    const now = new Date().toISOString();
+    const existing = await getDoc(ref);
+    const payload = {
+      id,
+      name: subsection.name,
+      imageUrl: subsection.imageUrl || "",
+      updatedAt: now,
+      ...(existing.exists() ? {} : { createdAt: now }),
+    };
+    await setDoc(ref, payload, { merge: true });
+
+    const section = await this.getNestedSection(buildingName, floorId, sectionId);
+    if (section) {
+      const markers = [...(section.subsectionMarkers || [])];
+      const idx = markers.findIndex((m) => m.subsectionId === id);
+      const entry = {
+        id: `subsection_${id}`,
+        subsectionId: id,
+        name: subsection.name,
+        ...(idx >= 0 ? markers[idx] : {}),
+      };
+      if (idx >= 0) markers[idx] = { ...markers[idx], name: subsection.name };
+      else markers.push(entry);
+      await updateDoc(this._nestedSectionRef(buildingName, floorId, sectionId), {
+        subsectionMarkers: markers,
+        updatedAt: now,
+      });
+    }
+
+    return payload;
+  }
+
+  static async updateSectionSubsectionMarkers(
+    buildingName,
+    floorId,
+    sectionId,
+    subsectionMarkers,
+  ) {
+    await updateDoc(this._nestedSectionRef(buildingName, floorId, sectionId), {
+      subsectionMarkers,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  static async uploadNestedSubsectionImage(
+    buildingName,
+    floorId,
+    sectionId,
+    subsectionId,
+    imageFile,
+  ) {
+    const coll = buildingCollectionName(buildingName);
+    const imageUrl = await uploadNestedPlanImage(
+      coll,
+      `floors/${floorId}/sections/${sectionId}/subsections/${subsectionId}`,
+      imageFile,
+    );
+    const ref = this._nestedSubsectionRef(
+      buildingName,
+      floorId,
+      sectionId,
+      subsectionId,
+    );
+    await updateDoc(ref, { imageUrl, updatedAt: new Date().toISOString() });
+    return imageUrl;
+  }
+
+  static async deleteNestedSubsection(
+    buildingName,
+    floorId,
+    sectionId,
+    subsectionId,
+  ) {
+    const mappingsRef = collection(
+      db,
+      buildingCollectionName(buildingName),
+      "floorMaps",
+      "floors",
+      floorId,
+      "sections",
+      sectionId,
+      "subsections",
+      subsectionId,
+      "assetMappings",
+    );
+    const mappingsSnap = await getDocs(mappingsRef);
+    const mappings = this._mappingsFromSnapshot(mappingsSnap);
+    await this._clearNestedMappingsFromSourceAssets(buildingName, mappings);
+    await Promise.all(mappingsSnap.docs.map((d) => deleteDoc(d.ref)));
+    await deleteDoc(
+      this._nestedSubsectionRef(buildingName, floorId, sectionId, subsectionId),
+    );
+
+    const section = await this.getNestedSection(buildingName, floorId, sectionId);
+    if (section?.subsectionMarkers) {
+      const markers = section.subsectionMarkers.filter(
+        (m) => m.subsectionId !== subsectionId,
+      );
+      await this.updateSectionSubsectionMarkers(
+        buildingName,
+        floorId,
+        sectionId,
+        markers,
+      );
+    }
+  }
+
+  /** Asset mappings directly on a section plan (subsections optional). */
+  static _mappingsFromSnapshot(snap) {
+    const mappings = [];
+    snap.forEach((d) => mappings.push({ id: d.id, ...d.data() }));
+    return mappings;
+  }
+
+  static async _clearNestedMappingsFromSourceAssets(buildingName, mappings) {
+    const coll = buildingCollectionName(buildingName);
+    const payload = buildClearNestedFloorMapPositionPayload();
+    const updates = [];
+
+    (mappings || []).forEach((mapping) => {
+      if (mapping.assetMode === "general" && mapping.assetsListId) {
+        updates.push(
+          updateDoc(doc(db, "AssetsList", mapping.assetsListId), payload),
+        );
+      } else if (
+        mapping.assetMode === "building" &&
+        mapping.category &&
+        mapping.buildingAssetId
+      ) {
+        updates.push(
+          updateDoc(
+            doc(db, coll, "asset", mapping.category, mapping.buildingAssetId),
+            payload,
+          ),
+        );
+      }
+    });
+
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+  }
+
+  /** Remove nested placement fields from any source asset tagged with this floor. */
+  static async _clearSourceAssetsForFloor(buildingName, floorId) {
+    if (!floorId) return;
+    const coll = buildingCollectionName(buildingName);
+    const payload = buildClearNestedFloorMapPositionPayload();
+    const updates = [];
+    const shortBuilding = buildingName.replace(/BuildingDB$/i, "");
+
+    const assetsListSnap = await getDocs(collection(db, "AssetsList"));
+    assetsListSnap.forEach((docSnap) => {
+      const data = docSnap.data();
+      if (
+        !buildingsMatch(data.building, shortBuilding) &&
+        !buildingsMatch(data.buildingName, shortBuilding)
+      ) {
+        return;
+      }
+      if (data.floorId === floorId || data.floorDetails?.id === floorId) {
+        updates.push(updateDoc(doc(db, "AssetsList", docSnap.id), payload));
+      }
+    });
+
+    const categoryKeys = [
+      "fire-life-safety",
+      "electrical",
+      "hvac",
+      "plumbing",
+      "elv",
+      "security",
+      "vertical-transport",
+      "lighting",
+      "bms",
+      "landscaping",
+      "additional",
+    ];
+
+    for (const categoryKey of categoryKeys) {
+      try {
+        const categorySnapshot = await getDocs(
+          collection(db, coll, "asset", categoryKey),
+        );
+        categorySnapshot.forEach((assetDoc) => {
+          const data = assetDoc.data();
+          if (data.floorId === floorId || data.floorDetails?.id === floorId) {
+            updates.push(
+              updateDoc(
+                doc(db, coll, "asset", categoryKey, assetDoc.id),
+                payload,
+              ),
+            );
+          }
+        });
+      } catch {
+        /* category may not exist */
+      }
+    }
+
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+  }
+
+  static async _syncNestedMappingsToSourceAssets(buildingName, mappings) {
+    const coll = buildingCollectionName(buildingName);
+    const now = new Date().toISOString();
+    const updates = [];
+
+    (mappings || []).forEach((mapping) => {
+      const payload = buildNestedFloorMapAssetsListUpdate({ mapping, now });
+
+      if (mapping.assetMode === "general" && mapping.assetsListId) {
+        updates.push(
+          updateDoc(doc(db, "AssetsList", mapping.assetsListId), payload),
+        );
+      } else if (
+        mapping.assetMode === "building" &&
+        mapping.category &&
+        mapping.buildingAssetId
+      ) {
+        updates.push(
+          updateDoc(
+            doc(db, coll, "asset", mapping.category, mapping.buildingAssetId),
+            payload,
+          ),
+        );
+      }
+    });
+
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+  }
+
+  static async getSectionAssetMappings(buildingName, floorId, sectionId) {
+    const coll = buildingCollectionName(buildingName);
+    const mappingsRef = collection(
+      db,
+      coll,
+      "floorMaps",
+      "floors",
+      floorId,
+      "sections",
+      sectionId,
+      "assetMappings",
+    );
+    const snap = await getDocs(mappingsRef);
+    const mappings = [];
+    snap.forEach((d) => mappings.push({ id: d.id, ...d.data() }));
+    return mappings;
+  }
+
+  static async updateSectionAssetMappings(
+    buildingName,
+    floorId,
+    sectionId,
+    assetMappings,
+  ) {
+    const coll = buildingCollectionName(buildingName);
+    const mappingsRef = collection(
+      db,
+      coll,
+      "floorMaps",
+      "floors",
+      floorId,
+      "sections",
+      sectionId,
+      "assetMappings",
+    );
+
+    const existing = await getDocs(mappingsRef);
+    await Promise.all(existing.docs.map((d) => deleteDoc(d.ref)));
+
+    const sanitizeDocumentId = (id) =>
+      String(id || "")
+        .replace(/[\/\\]/g, "_")
+        .replace(/[()]/g, "")
+        .replace(/\s+/g, "_")
+        .replace(/[^a-zA-Z0-9_-]/g, "")
+        .substring(0, 100);
+
+    const addPromises = assetMappings.map((mapping, index) => {
+      const docId = `${sanitizeDocumentId(mapping.assetName || mapping.id)}_${index}`;
+      const mappingRef = doc(mappingsRef, docId);
+      return setDoc(mappingRef, {
+        ...mapping,
+        createdAt: mapping.createdAt || new Date().toISOString(),
+      });
+    });
+    await Promise.all(addPromises);
+
+    await this._syncNestedMappingsToSourceAssets(buildingName, assetMappings);
+
+    await updateDoc(this._nestedSectionRef(buildingName, floorId, sectionId), {
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  /** Asset mappings on subsection plan (optional deeper level). */
+  static async getSubsectionAssetMappings(
+    buildingName,
+    floorId,
+    sectionId,
+    subsectionId,
+  ) {
+    const coll = buildingCollectionName(buildingName);
+    const mappingsRef = collection(
+      db,
+      coll,
+      "floorMaps",
+      "floors",
+      floorId,
+      "sections",
+      sectionId,
+      "subsections",
+      subsectionId,
+      "assetMappings",
+    );
+    const snap = await getDocs(mappingsRef);
+    const mappings = [];
+    snap.forEach((d) => mappings.push({ id: d.id, ...d.data() }));
+    return mappings;
+  }
+
+  static async updateSubsectionAssetMappings(
+    buildingName,
+    floorId,
+    sectionId,
+    subsectionId,
+    assetMappings,
+  ) {
+    const coll = buildingCollectionName(buildingName);
+    const mappingsRef = collection(
+      db,
+      coll,
+      "floorMaps",
+      "floors",
+      floorId,
+      "sections",
+      sectionId,
+      "subsections",
+      subsectionId,
+      "assetMappings",
+    );
+
+    const existing = await getDocs(mappingsRef);
+    await Promise.all(existing.docs.map((d) => deleteDoc(d.ref)));
+
+    const sanitizeDocumentId = (id) =>
+      String(id || "")
+        .replace(/[\/\\]/g, "_")
+        .replace(/[()]/g, "")
+        .replace(/\s+/g, "_")
+        .replace(/[^a-zA-Z0-9_-]/g, "")
+        .substring(0, 100);
+
+    const addPromises = assetMappings.map((mapping, index) => {
+      const docId = `${sanitizeDocumentId(mapping.assetName || mapping.id)}_${index}`;
+      const mappingRef = doc(mappingsRef, docId);
+      return setDoc(mappingRef, {
+        ...mapping,
+        createdAt: mapping.createdAt || new Date().toISOString(),
+      });
+    });
+    await Promise.all(addPromises);
+
+    await this._syncNestedMappingsToSourceAssets(buildingName, assetMappings);
+
+    await updateDoc(
+      this._nestedSubsectionRef(buildingName, floorId, sectionId, subsectionId),
+      { updatedAt: new Date().toISOString() },
+    );
+  }
+
+  /** Full nested tree for a building (viewer / editor bootstrap). */
+  static async getNestedFloorPlanTree(buildingName) {
+    const overview = await this.getBuildingOverview(buildingName);
+    const floors = await this.getNestedFloors(buildingName);
+    return { overview, floors };
   }
 
   // ==================== BUILDING MANAGEMENT ====================
