@@ -1,11 +1,12 @@
 "use client";
 
 import { useRef, useState, useEffect } from "react";
-import { MapPin, Loader2, ImageOff, Layers } from "lucide-react";
+import { Loader2, ImageOff, Layers } from "lucide-react";
 import { useFloorPlanImageDimensions } from "@/hooks/useFloorPlanImageDimensions";
 import { useResolvedAssetUrl } from "@/hooks/useResolvedAssetUrl";
-import { naturalToScreenCoords } from "@/lib/nestedFloorPlan";
+import { naturalToScreenCoords, getFloorButtonDimensions, getNavMarkerDimensions } from "@/lib/nestedFloorPlan";
 import { FloorMapAssetMarker } from "@/components/floor-map-asset-marker";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 /**
  * Shared floor-plan image with navigation hotspots or asset markers.
@@ -44,6 +45,12 @@ export function PlanImageCanvas({
     resolvedSrc,
   );
 
+  const navMarkerDims = getNavMarkerDimensions(dims);
+  const floorButtonDims = getFloorButtonDimensions(
+    dims,
+    resolvedNavMarkers.length,
+  );
+
   useEffect(() => {
     setImgError(false);
   }, [imageUrl, resolvedSrc]);
@@ -53,38 +60,56 @@ export function PlanImageCanvas({
     onImageClick(event, imageRef, dims);
   };
 
+  const renderFloorButton = (marker) => (
+    <button
+      key={marker.id}
+      type="button"
+      className="min-w-0 shrink-0"
+      onClick={(e) => {
+        e.stopPropagation();
+        onMarkerClick?.(marker);
+      }}
+      title={marker.name}
+    >
+      <span
+        className="flex min-w-0 flex-col items-center justify-center overflow-hidden rounded border border-primary bg-background/95 shadow-sm transition-colors hover:bg-primary/10"
+        style={{
+          width: floorButtonDims.buttonWidth,
+          height: floorButtonDims.buttonHeight,
+          padding: `${floorButtonDims.buttonHeight * 0.06}px ${floorButtonDims.buttonWidth * 0.04}px`,
+        }}
+      >
+        <Layers
+          className="mb-0.5 shrink-0 text-primary"
+          style={{
+            width: floorButtonDims.iconSize,
+            height: floorButtonDims.iconSize,
+          }}
+        />
+        <span
+          className="font-semibold uppercase leading-none tracking-wide text-primary"
+          style={{ fontSize: floorButtonDims.floorLabelSize }}
+        >
+          Floor
+        </span>
+        <span
+          className="max-w-full truncate font-medium leading-tight"
+          style={{ fontSize: floorButtonDims.nameLabelSize }}
+        >
+          {marker.name}
+        </span>
+      </span>
+    </button>
+  );
+
   const renderNavMarker = (marker) => {
     const { left, top } = naturalToScreenCoords(marker, dims);
-
-    if (navMarkerStyle === "floorButton") {
-      return (
-        <button
-          key={marker.id}
-          type="button"
-          className="absolute z-20 -translate-x-1/2 -translate-y-1/2"
-          style={{ left, top }}
-          onClick={(e) => {
-            e.stopPropagation();
-            onMarkerClick?.(marker);
-          }}
-          title={marker.name}
-        >
-          <span className="flex min-w-[7rem] flex-col items-center rounded-md border-2 border-primary bg-background/95 px-3 py-2 shadow-lg transition-colors hover:bg-primary/10">
-            <Layers className="mb-1 h-5 w-5 text-primary" />
-            <span className="text-[10px] font-semibold uppercase tracking-wide text-primary">
-              Select Floor
-            </span>
-            <span className="text-sm font-medium">{marker.name}</span>
-          </span>
-        </button>
-      );
-    }
 
     return (
       <button
         key={marker.id}
         type="button"
-        className="absolute z-20 flex flex-col items-center -translate-x-1/2 -translate-y-1/2 group"
+        className="absolute z-20 -translate-x-1/2 -translate-y-1/2"
         style={{ left, top }}
         onClick={(e) => {
           e.stopPropagation();
@@ -92,15 +117,34 @@ export function PlanImageCanvas({
         }}
         title={marker.name}
       >
-        <span className="flex h-10 w-10 items-center justify-center rounded-full border-2 border-primary bg-primary/90 text-primary-foreground shadow-md transition-transform group-hover:scale-110">
-          <MapPin className="h-4 w-4" />
-        </span>
-        <span className="mt-1 max-w-[8rem] truncate rounded bg-background/90 px-2 py-0.5 text-xs font-medium shadow">
+        <span
+          className="inline-flex w-auto max-w-none items-center justify-center whitespace-nowrap rounded border border-primary bg-background/95 font-medium leading-tight text-foreground shadow-sm transition-colors hover:bg-primary hover:text-primary-foreground"
+          style={{
+            height: navMarkerDims.buttonHeight,
+            padding: `${navMarkerDims.padY}px ${navMarkerDims.padX}px`,
+            fontSize: navMarkerDims.fontSize,
+          }}
+        >
           {marker.name}
         </span>
       </button>
     );
   };
+
+  const renderFloorButtonGrid = () => (
+    <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center p-2">
+      <div
+        className="pointer-events-auto mx-auto flex flex-wrap justify-center"
+        style={{
+          width: floorButtonDims.rowWidth,
+          maxWidth: "98%",
+          gap: floorButtonDims.gap,
+        }}
+      >
+        {resolvedNavMarkers.map(renderFloorButton)}
+      </div>
+    </div>
+  );
 
   const hasStoredUrl = Boolean(imageUrl);
   const isResolving = hasStoredUrl && !resolvedSrc && !imgError;
@@ -149,8 +193,10 @@ export function PlanImageCanvas({
             />
 
             {imageLoaded ? (
-              <>
-                {resolvedNavMarkers.map(renderNavMarker)}
+              <TooltipProvider delayDuration={200}>
+                {navMarkerStyle === "floorButton"
+                  ? renderFloorButtonGrid()
+                  : resolvedNavMarkers.map(renderNavMarker)}
                 {resolvedAssetMarkers.map((marker) => {
                   const { left, top } = naturalToScreenCoords(marker, dims);
                   const deviceData = assetDeviceData[marker.id] || {};
@@ -170,7 +216,7 @@ export function PlanImageCanvas({
                     />
                   );
                 })}
-              </>
+              </TooltipProvider>
             ) : null}
           </div>
         ) : null}

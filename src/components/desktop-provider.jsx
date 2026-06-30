@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
+import { Vision365Logo } from "@/components/vision365-logo";
 import { Progress } from "@/components/ui/progress";
 import { setDesktopApiPort } from "@/lib/platform";
 import {
@@ -138,6 +139,7 @@ export function DesktopProvider({ children }) {
   if (status === "checking") {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-6 bg-background px-6">
+        <Vision365Logo className="h-20 w-20" />
         <Loader2 className="h-10 w-10 animate-spin text-primary" />
         <div className="w-full max-w-md space-y-3 text-center">
           <p className="text-lg font-semibold">Starting Vision365</p>

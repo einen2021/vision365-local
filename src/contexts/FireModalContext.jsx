@@ -158,6 +158,10 @@ export function FireAlertProvider({ children }) {
     setIsSirenMuted(true);
   }, []);
 
+  const unmuteSiren = useCallback(() => {
+    setIsSirenMuted(false);
+  }, []);
+
   // Navigate to the nested floor plan for the last resolved fire device, then close modal
   useEffect(() => {
     if (!isFireAlertOpen || addressLoading || deviceList.length === 0) return;
@@ -202,6 +206,7 @@ export function FireAlertProvider({ children }) {
       setAddressLoading,
       setDeviceList,
       muteSiren,
+      unmuteSiren,
     }),
     [
       isFireAlertOpen,
@@ -214,6 +219,7 @@ export function FireAlertProvider({ children }) {
       addressLoading,
       deviceList,
       muteSiren,
+      unmuteSiren,
     ],
   );
 

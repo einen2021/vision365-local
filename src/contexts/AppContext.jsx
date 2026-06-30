@@ -11,7 +11,7 @@ import {
 import { FireAlertModal } from "@/components/fire-alert-modal";
 import { usePathname } from "next/navigation";
 import secureLocalStorage from "react-secure-storage";
-import { collection as mockCollection, getDocs as mockGetDocs, setDoc } from "@/lib/mockFirestore";
+import { collection as mockCollection, getDocs as mockGetDocs } from "@/lib/mockFirestore";
 import { collection, doc, getDoc, getDocs, updateDoc } from "firebase/firestore";
 import { getUserCommunities } from "@/utils/communityService";
 import { loadBrandRegistry } from "@/utils/brandRegistryService";
@@ -20,7 +20,8 @@ import { normalizeBuildingName } from "@/lib/buildingNames";
 import { apiFetch } from "@/lib/apiClient";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
-import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
+import { findAssetsListEntryByPanelAddress } from "@/lib/assetsListSimplexStatus";
+import { resolveAssetDeviceAddress, parseSimplexAddressToken } from "@/lib/simplexDeviceAddress";
 import { db } from "@/config/firebase";
 import {
   CVAL_COMMANDS,
@@ -28,10 +29,15 @@ import {
   PANEL_STATE_REFRESH_MS,
   LIST_COMMAND_TIMEOUT_MS,
   extractCVal,
+  extractPanelDeviceAddresses,
   isListResponseComplete,
   readSimplexStatus,
   simplexKeyForCategoryLabel,
 } from "@/lib/firePanelMonitor";
+import {
+  appendBuildingAlarmFeed,
+  resolveBuildingFromAsset,
+} from "@/lib/buildingAlarmFeedWrite";
 import {
   isFirePanelMonitoringPersisted,
   isMonitorLoopActive,
@@ -69,7 +75,9 @@ export const useFirePanelMonitor = () => {
     fetchFirePanelState,
     systemReset,
     silenceAlarm,
-    acknowledge
+    acknowledge,
+    disableDevice,
+    enableDevice,
   } = useApp();
   return {
     firePanelMonitoring,
@@ -82,7 +90,9 @@ export const useFirePanelMonitor = () => {
     fetchFirePanelState,
     systemReset,
     silenceAlarm,
-    acknowledge
+    acknowledge,
+    disableDevice,
+    enableDevice,
   };
 };
 
@@ -122,7 +132,7 @@ export const AppProvider = ({ children }) => {
   const openFireAlertModal = useCallback(() => setIsFireAlertOpen(true), []);
   const closeFireAlertModal = useCallback(() => setIsFireAlertOpen(false), []);
 
-  const { showFireAlert, setAddressLoading, setDeviceList,muteSiren } = useFireAlert();
+  const { showFireAlert, setAddressLoading, setDeviceList,muteSiren, unmuteSiren } = useFireAlert();
 
   // Global fire-panel CVAL monitor (persists across routes and reloads)
   const [firePanelMonitoring, setFirePanelMonitoring] = useState(
@@ -158,14 +168,32 @@ export const AppProvider = ({ children }) => {
 
 
   const sendFirePanelCommand = useCallback(async (cmd, timeoutMs = 3000) => {
-    const res = await apiFetch("/api/telnet/fire-panel/command", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command: cmd, timeoutMs }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Command failed");
-    return data.response || "";
+    const runOnce = async () => {
+      const res = await apiFetch("/api/telnet/fire-panel/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: cmd, timeoutMs }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const message = data.error || "Command failed";
+        if (/not connected/i.test(message)) {
+          useFirePanelStore.getState().markDisconnected(message);
+        }
+        throw new Error(message);
+      }
+      return data.response || "";
+    };
+
+    try {
+      return await runOnce();
+    } catch (error) {
+      if (/not connected/i.test(error.message || "")) {
+        const connected = await useFirePanelStore.getState().ensureConnected();
+        if (connected) return await runOnce();
+      }
+      throw error;
+    }
   }, []);
 
   const acknowledge = useCallback(async (label) => {
@@ -285,6 +313,16 @@ export const AppProvider = ({ children }) => {
   }, []);
 
 
+  const disableDevice = async(deviceAddress) => {
+    const disableResponse = await sendFirePanelCommand(`disable ${deviceAddress} on`);
+    console.log({ disableResponse })
+  }
+
+  const enableDevice = async(deviceAddress) => {
+    const enableResponse = await sendFirePanelCommand(`disable ${deviceAddress} off`);
+    console.log({ enableResponse })
+  }
+
   const waitWhileMonitorPaused = useCallback(async () => {
     while (isMonitorLoopPaused() && isMonitorLoopActive()) {
       await new Promise((r) => setTimeout(r, 200));
@@ -336,6 +374,13 @@ export const AppProvider = ({ children }) => {
             `!! ${label}: ${error.message} — keeping ${counts[field]}`,
           );
           console.error(`[fire-panel monitor] ${cmd} failed:`, error);
+          if (/not connected/i.test(error.message || "")) {
+            appendFirePanelMonitorLog("!! Not connected — reconnecting...");
+            const connected = await useFirePanelStore.getState().ensureConnected();
+            if (!connected || !isMonitorLoopActive()) {
+              return;
+            }
+          }
         }
       }
 
@@ -360,6 +405,7 @@ export const AppProvider = ({ children }) => {
     incrementedValues.forEach(async (value) => {
       if(value.label === "Fire" && counts[value.field] > 0 && previous[value.field] < counts[value.field]) {
         showFireAlert();
+        unmuteSiren();
       }
     });
       
@@ -373,85 +419,139 @@ export const AppProvider = ({ children }) => {
           appendFirePanelMonitorLog(
             `DB firePanelState → fire=${saved.totalFire} supervisory=${saved.totalSupervisory} trouble=${saved.totalTrouble}`,
           );
-
-          // Pause CVAL polling while list commands + AssetsList updates run on the panel connection
-          pauseMonitorLoop();
-          appendFirePanelMonitorLog("--- paused for asset sync ---");
-          try {
-            for (const { label, listCmd } of incrementedValues) {
-              if (!isMonitorLoopActive()) break;
-              appendFirePanelMonitorLog(`>> ${label} changed — ${listCmd}`);
-              try {
-                // get alarm device addresses
-                setAddressLoading(true);
-                const listResponse = await sendFirePanelListCommandAndWait(listCmd);
-                const regex = /\b\d+:M\d+-\d+-\d+\b/g;
-                const deviceAddresses = listResponse.match(regex) ?? [];
-                const statusKey = simplexKeyForCategoryLabel(label);
-                let updatedCount = 0;
-                for (const deviceAddress of deviceAddresses) {
-                  const assetRef = doc(db, "AssetsList", deviceAddress);
-                  const docSnap = await getDoc(assetRef);
-                  if (!docSnap.exists()) continue;
-                  const data = { ...docSnap.data(), id: docSnap.id };
-                  setDeviceList((prev) => [...prev, data]);
-                  const current = readSimplexStatus(data);
-                  if (Number(current[statusKey]) === 1) continue;
-
-                  const next = { ...current, [statusKey]: 1 };
-                  await updateDoc(assetRef, {
-                    simplexStatus: next,
-                    updatedAt: new Date().toISOString(),
-                  });
-
-                  useAssetFireStatusStore.getState().patchSimplexStatus(
-                    docSnap.id,
-                    resolveAssetDeviceAddress(data) || data.deviceAddress || deviceAddress,
-                    next,
-                  );
-                  updatedCount += 1;
-                }
-                setAddressLoading(false);
-
-
-                if (updatedCount > 0) {
-                  appendFirePanelMonitorLog(
-                    `AssetsList updated ${updatedCount} asset(s) → ${statusKey}=1 (${label})`,
-                  );
-                  useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
-                }
-              } catch (error) {
-                appendFirePanelMonitorLog(`!! ${listCmd} failed: ${error.message}`);
-                console.error(`[fire-panel monitor] ${listCmd} failed:`, error);
-                setAddressLoading(false);
-              }
-            }
-          } finally {
-            resumeMonitorLoop();
-            appendFirePanelMonitorLog("--- monitoring resumed ---");
-          }
         }
       } catch (error) {
         appendFirePanelMonitorLog(`!! save failed: ${error.message}`);
-      }  
+      }
+
+      if (incrementedValues.length > 0) {
+        pauseMonitorLoop();
+        appendFirePanelMonitorLog("--- paused for asset sync ---");
+        try {
+          for (const { label, listCmd, field } of incrementedValues) {
+            if (!isMonitorLoopActive()) break;
+            appendFirePanelMonitorLog(`>> ${label} changed — ${listCmd}`);
+            try {
+              setAddressLoading(true);
+              const listResponse = await sendFirePanelListCommandAndWait(listCmd);
+              const deviceAddresses = extractPanelDeviceAddresses(listResponse);
+              const statusKey = simplexKeyForCategoryLabel(label);
+              const fallbackBuildings = allBuildings.map((b) => b.name);
+              let updatedCount = 0;
+              let alarmFeedCount = 0;
+
+              if (deviceAddresses.length === 0) {
+                appendFirePanelMonitorLog(
+                  `!! ${listCmd}: no device addresses parsed from panel list`,
+                );
+                const loneBuilding = resolveBuildingFromAsset({}, fallbackBuildings);
+                if (loneBuilding) {
+                  await appendBuildingAlarmFeed({
+                    building: loneBuilding,
+                    label,
+                    description: `${label} alarm (${counts[field]} active)`,
+                  });
+                  alarmFeedCount += 1;
+                }
+              }
+
+              for (const deviceAddress of deviceAddresses) {
+                const entry = await findAssetsListEntryByPanelAddress(deviceAddress);
+                const data = entry ? { ...entry.data, id: entry.id } : null;
+                const building = resolveBuildingFromAsset(data, fallbackBuildings);
+                const description =
+                  data?.description || data?.name || deviceAddress;
+
+                if (building) {
+                  await appendBuildingAlarmFeed({
+                    building,
+                    label,
+                    description,
+                  });
+                  alarmFeedCount += 1;
+                } else {
+                  appendFirePanelMonitorLog(
+                    `!! ${deviceAddress}: no building — skipped alarm feed`,
+                  );
+                }
+
+                if (!entry) {
+                  appendFirePanelMonitorLog(
+                    `!! ${deviceAddress}: not found in AssetsList`,
+                  );
+                  continue;
+                }
+
+                if (data) {
+                  setDeviceList((prev) => [...prev, data]);
+                }
+
+                const current = readSimplexStatus(data);
+                if (Number(current[statusKey]) === 1) continue;
+
+                const next = { ...current, [statusKey]: 1 };
+                await updateDoc(doc(db, "AssetsList", entry.id), {
+                  simplexStatus: next,
+                  updatedAt: new Date().toISOString(),
+                });
+
+                useAssetFireStatusStore.getState().patchSimplexStatus(
+                  entry.id,
+                  resolveAssetDeviceAddress(data) || data.deviceAddress || deviceAddress,
+                  next,
+                );
+                updatedCount += 1;
+              }
+              setAddressLoading(false);
+
+              if (alarmFeedCount > 0) {
+                appendFirePanelMonitorLog(
+                  `Alarm feed updated ${alarmFeedCount} row(s) (${label})`,
+                );
+              }
+
+              if (updatedCount > 0) {
+                appendFirePanelMonitorLog(
+                  `AssetsList updated ${updatedCount} asset(s) → ${statusKey}=1 (${label})`,
+                );
+                useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
+              }
+            } catch (error) {
+              appendFirePanelMonitorLog(`!! ${listCmd} failed: ${error.message}`);
+              console.error(`[fire-panel monitor] ${listCmd} failed:`, error);
+              setAddressLoading(false);
+            }
+          }
+        } finally {
+          resumeMonitorLoop();
+          appendFirePanelMonitorLog("--- monitoring resumed ---");
+        }
+      }
 
       await new Promise((r) => setTimeout(r, MONITOR_INTERVAL_MS));
     }
   }, [
+    allBuildings,
     appendFirePanelMonitorLog,
     saveFirePanelState,
     sendFirePanelCommand,
     sendFirePanelListCommandAndWait,
+    showFireAlert,
     waitWhileMonitorPaused,
   ]);
 
-  const startFirePanelMonitoring = useCallback(() => {
+  const startFirePanelMonitoring = useCallback(async () => {
+    await useFirePanelStore.getState().syncStatus();
+
+    if (!useFirePanelStore.getState().connected) {
+      setFirePanelMonitoringPersisted(false);
+      setFirePanelMonitoring(false);
+      return { ok: false, reason: "not_connected" };
+    }
+
     setFirePanelMonitoringPersisted(true);
     setFirePanelMonitoring(true);
 
-    if (!useFirePanelStore.getState().connected) {
-      return { ok: false, reason: "not_connected" };
-    }
     if (isMonitorLoopActive()) {
       return { ok: true, alreadyRunning: true };
     }
@@ -504,27 +604,13 @@ export const AppProvider = ({ children }) => {
   useEffect(() => {
     if (firePanelConnected) {
       firePanelWasConnectedRef.current = true;
-      if (isFirePanelMonitoringPersisted() && !isMonitorLoopActive()) {
-        setMonitorLoopActive(true);
-        useAssetFireStatusStore.getState().startPolling();
-        appendFirePanelMonitorLog("--- resumed ---");
-        void runFirePanelMonitorLoop();
+      if (!isMonitorLoopActive()) {
+        void startFirePanelMonitoring();
+      } else {
+        setFirePanelMonitoring(true);
       }
-      setFirePanelMonitoring(isFirePanelMonitoringPersisted());
-      return;
     }
-
-    // Only stop when connection is lost after being connected (not on initial load)
-    if (firePanelWasConnectedRef.current && isMonitorLoopActive()) {
-      firePanelWasConnectedRef.current = false;
-      stopFirePanelMonitoring();
-    }
-  }, [
-    firePanelConnected,
-    appendFirePanelMonitorLog,
-    runFirePanelMonitorLoop,
-    stopFirePanelMonitoring,
-  ]);
+  }, [firePanelConnected, startFirePanelMonitoring]);
 
   // Sync session from local storage
   useEffect(() => {
@@ -723,6 +809,10 @@ export const AppProvider = ({ children }) => {
     isFireAlertOpen,
     openFireAlertModal,
     closeFireAlertModal,
+    disableDevice,
+    enableDevice,
+    activeDevices,
+    setActiveDevices,
   };
 
   return (

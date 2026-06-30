@@ -30,7 +30,7 @@ function AuthCheckingPlaceholder() {
   );
 }
 
-/** Route guard — admin has full access, client is limited to the main page */
+/** Route guard — admin has full access; client is limited to allowed routes */
 export function RoleGuard({ children }) {
   const router = useRouter();
   const pathname = usePathname() || "/";

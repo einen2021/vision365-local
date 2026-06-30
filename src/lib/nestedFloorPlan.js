@@ -129,6 +129,53 @@ export function calculateDisplayedImageDimensions(img) {
   };
 }
 
+/** Scale overlay markers to match how large the plan image is on screen. */
+export function getPlanMarkerScale(dims, { min = 0.35, max = 1.25 } = {}) {
+  if (!dims?.naturalWidth || !dims?.width) return 1;
+  const scale = dims.width / dims.naturalWidth;
+  return Math.min(Math.max(scale, min), max);
+}
+
+/**
+ * Building floor-button sizes from displayed image width:
+ * - width  = imageWidth × (70 ÷ floorCount) ÷ 100
+ * - height = imageWidth × 7 ÷ 100
+ */
+export function getFloorButtonDimensions(dims, floorCount) {
+  const imageWidth = dims?.width || 0;
+  const count = Math.max(Number(floorCount) || 1, 1);
+  const buttonWidth =
+    imageWidth > 0 ? (imageWidth * 70) / count / 100 : 72;
+  const buttonHeight = imageWidth > 0 ? (imageWidth * 7) / 100 : 56;
+  const iconSize = Math.max(8, buttonHeight * 0.2);
+  const floorLabelSize = Math.max(6, buttonHeight * 0.11);
+  const nameLabelSize = Math.max(7, buttonHeight * 0.15);
+  const gap = Math.max(2, imageWidth * 0.004);
+  const rowWidth = imageWidth > 0 ? imageWidth * 0.7 : buttonWidth * count;
+
+  return {
+    buttonWidth,
+    buttonHeight,
+    iconSize,
+    floorLabelSize,
+    nameLabelSize,
+    gap,
+    rowWidth,
+  };
+}
+
+/** Section/subsection nav marker sizes from displayed image width. */
+export function getNavMarkerDimensions(dims) {
+  const imageWidth = dims?.width || 0;
+  const buttonWidth = imageWidth > 0 ? (imageWidth * 9) / 100 : 72;
+  const buttonHeight = imageWidth > 0 ? (imageWidth * 4) / 100 : 32;
+  const fontSize = Math.max(10, buttonHeight * 0.36);
+  const padX = Math.max(6, buttonWidth * 0.1);
+  const padY = Math.max(4, buttonHeight * 0.12);
+
+  return { buttonWidth, buttonHeight, fontSize, padX, padY };
+}
+
 /** Breadcrumb trail for nested navigation. */
 export function buildBreadcrumbs(level, { buildingName, floor, section, subsection }) {
   const crumbs = [{ level: NAV_LEVELS.BUILDING, label: buildingName || "Building" }];

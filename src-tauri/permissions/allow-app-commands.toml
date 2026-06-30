@@ -1,0 +1,13 @@
+[[permission]]
+identifier = "allow-app-commands"
+description = "Vision365 custom desktop commands"
+commands.allow = [
+  "resolve_local_asset_src",
+  "get_app_data_path",
+  "get_api_port",
+  "is_db_ready",
+  "get_server_log",
+  "show_notification",
+  "save_window_state",
+  "load_window_state",
+]

@@ -26,6 +26,23 @@ export function setDesktopApiPort(port: number): void {
 /** Default desktop API port (matches Tauri backend) */
 export const DESKTOP_API_PORT = 47821;
 
+/** Public folder asset URL — stable in web dev, static export, and Tauri desktop. */
+export function resolvePublicAssetUrl(path: string): string {
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  if (typeof window === "undefined") return normalized;
+
+  try {
+    const { origin, protocol } = window.location;
+    if (protocol === "http:" || protocol === "https:") {
+      return new URL(normalized, origin).href;
+    }
+  } catch {
+    // fall through
+  }
+
+  return normalized;
+}
+
 export function isDesktopApiReady(): boolean {
   return getDesktopApiPort() != null && getDesktopApiPort()! > 0;
 }

@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { Loader2, RefreshCcw, VolumeX } from "lucide-react";
+import { Loader2, Radio, RefreshCcw, Unplug, VolumeX, Wifi } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   AlertDialog,
@@ -18,10 +19,18 @@ import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 import { FirePanelAckButtons } from "@/components/fire-panel-ack-buttons";
 
+/** Taller header controls — connection/monitoring badges stay compact. */
+const HEADER_ACTION_BUTTON_CLASS = "h-10 px-4 text-sm";
+const STATUS_BADGE_CLASS =
+  "h-4 gap-0.5 px-1.5 py-0 text-[9px] leading-none [&>svg]:size-2.5";
+
 /** Fire panel header actions shown on every dashboard page. */
 export function FirePanelStatusBadges() {
-  const { silenceAlarm, systemReset } = useFirePanelMonitor();
+  const { silenceAlarm, systemReset, firePanelMonitoring } = useFirePanelMonitor();
   const connected = useFirePanelStore((s) => s.connected);
+  const loading = useFirePanelStore((s) => s.loading);
+  const connectedHost = useFirePanelStore((s) => s.connectedHost);
+  const connectedPort = useFirePanelStore((s) => s.connectedPort);
   const { toast } = useToast();
   const [silencing, setSilencing] = useState(false);
   const [isSystemResetting, setIsSystemResetting] = useState(false);
@@ -56,6 +65,15 @@ export function FirePanelStatusBadges() {
   };
 
   const handleSystemReset = async () => {
+    if (!connected) {
+      toast({
+        title: "Not connected",
+        description: "Connect to the fire panel before running system reset.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     setIsSystemResetting(true);
     try {
       await systemReset();
@@ -78,35 +96,90 @@ export function FirePanelStatusBadges() {
 
   return (
     <>
-      <FirePanelAckButtons />
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        disabled={!connected || silencing || isSystemResetting}
-        onClick={() => void handleSilenceAlarm()}
-      >
-        {silencing ? (
-          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-        ) : (
-          <VolumeX className="mr-2 h-4 w-4" />
-        )}
-        Silence Alarm
-      </Button>
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        onClick={() => setSystemResetDialogOpen(true)}
-        disabled={isSystemResetting || silencing}
-      >
-        {isSystemResetting ? (
-          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-        ) : (
-          <RefreshCcw className="mr-2 h-4 w-4" />
-        )}
-        System Reset
-      </Button>
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-col gap-0.5">
+          {connected ? (
+            <Badge
+              variant="outline"
+              className={`${STATUS_BADGE_CLASS} border-green-600/40 text-green-600`}
+              title={
+                connectedHost
+                  ? `Connected to ${connectedHost}:${connectedPort}`
+                  : "Fire panel connected"
+              }
+            >
+              <Wifi />
+              Connected
+            </Badge>
+          ) : loading ? (
+            <Badge
+              variant="outline"
+              className={`${STATUS_BADGE_CLASS} text-amber-600 border-amber-600/40`}
+            >
+              <Loader2 className="animate-spin" />
+              Connecting
+            </Badge>
+          ) : (
+            <Badge
+              variant="outline"
+              className={`${STATUS_BADGE_CLASS} text-muted-foreground`}
+            >
+              <Unplug />
+              Disconnected
+            </Badge>
+          )}
+
+          {connected && firePanelMonitoring ? (
+            <Badge
+              variant="outline"
+              className={`${STATUS_BADGE_CLASS} border-green-600/40 text-green-600`}
+            >
+              <Radio />
+              Monitoring
+            </Badge>
+          ) : (
+            <Badge
+              variant="outline"
+              className={`${STATUS_BADGE_CLASS} text-muted-foreground`}
+            >
+              <Radio />
+              Not Monitoring
+            </Badge>
+          )}
+        </div>
+
+        <FirePanelAckButtons />
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className={HEADER_ACTION_BUTTON_CLASS}
+          disabled={!connected || silencing || isSystemResetting}
+          onClick={() => void handleSilenceAlarm()}
+        >
+          {silencing ? (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <VolumeX className="mr-2 h-4 w-4" />
+          )}
+          Silence Alarm
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className={HEADER_ACTION_BUTTON_CLASS}
+          onClick={() => setSystemResetDialogOpen(true)}
+          disabled={!connected || isSystemResetting || silencing}
+        >
+          {isSystemResetting ? (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <RefreshCcw className="mr-2 h-4 w-4" />
+          )}
+          System Reset
+        </Button>
+      </div>
 
       <AlertDialog open={systemResetDialogOpen} onOpenChange={setSystemResetDialogOpen}>
         <AlertDialogContent>
@@ -124,7 +197,7 @@ export function FirePanelStatusBadges() {
                 e.preventDefault();
                 void handleSystemReset();
               }}
-              disabled={isSystemResetting}
+              disabled={!connected || isSystemResetting}
             >
               {isSystemResetting ? (
                 <>

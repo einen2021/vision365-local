@@ -277,6 +277,96 @@ export async function loadFloorMapAssetsFromAssetsList(db, buildingName, floorPl
   return mappings
 }
 
+function pickerAssetMatchesMapping(asset = {}, mapping = {}) {
+  const mode = asset.assetMode || "general"
+  const mappingMode = mapping.assetMode || "general"
+  const assetsListId = asset.assetsListId || asset.id
+
+  if (mode === "general") {
+    const mappingListId = getAssetsListIdFromMapping(mapping)
+    if (assetsListId && mappingListId && assetsListId === mappingListId) return true
+  }
+
+  if (mode === "building" && mappingMode === "building") {
+    if (
+      asset.id &&
+      mapping.buildingAssetId &&
+      asset.id === mapping.buildingAssetId &&
+      asset.category === mapping.category
+    ) {
+      return true
+    }
+  }
+
+  return false
+}
+
+/** Mapping on the current plan that matches a picker row, if any. */
+export function findPickerAssetMapping(asset = {}, placedMappings = []) {
+  if (!asset || placedMappings.length === 0) return null
+  return placedMappings.find((mapping) => pickerAssetMatchesMapping(asset, mapping)) || null
+}
+
+/** True when a picker row already has a marker on the current floor plan. */
+export function isPickerAssetAlreadyPlaced(asset = {}, placedMappings = []) {
+  return Boolean(findPickerAssetMapping(asset, placedMappings))
+}
+
+/** True when AssetsList (or similar) data shows the asset on a nested floor plan. */
+export function isAssetPlacedInBuilding(asset = {}) {
+  if (!hasFloorPosition(asset)) return false
+  return Boolean(
+    asset.floorId ||
+      asset.floorName ||
+      asset.sectionName ||
+      asset.subsectionName ||
+      asset.nestedPath,
+  )
+}
+
+/** Human-readable floor → section → subsection label for a placement record. */
+export function formatNestedPlacementLabel(record = {}) {
+  if (record.nestedPath) {
+    return String(record.nestedPath).replace(/ > /g, " → ")
+  }
+
+  const parts = []
+  if (record.floorName) parts.push(`Floor: ${record.floorName}`)
+  if (record.sectionName) parts.push(`Section: ${record.sectionName}`)
+  if (record.subsectionName) parts.push(`Subsection: ${record.subsectionName}`)
+
+  if (parts.length > 0) return parts.join(" · ")
+
+  const path = [record.floorName, record.sectionName, record.subsectionName].filter(Boolean)
+  return path.join(" → ") || "Unknown location"
+}
+
+/** Where a picker asset is placed — current map, saved building placement, or fallback context. */
+export function getPickerAssetPlacementLocation(
+  asset = {},
+  placedMappings = [],
+  currentPlacementContext = null,
+) {
+  const onMap = findPickerAssetMapping(asset, placedMappings)
+  if (onMap) {
+    return formatNestedPlacementLabel({
+      ...currentPlacementContext,
+      ...onMap,
+    })
+  }
+
+  if (isAssetPlacedInBuilding(asset)) {
+    return formatNestedPlacementLabel(asset)
+  }
+
+  return null
+}
+
+/** Picker row is unavailable because it is already placed on this map or elsewhere. */
+export function isPickerAssetUnavailable(asset = {}, placedMappings = []) {
+  return isPickerAssetAlreadyPlaced(asset, placedMappings) || isAssetPlacedInBuilding(asset)
+}
+
 /** True when two floor-map placements refer to the same physical asset. */
 export function isDuplicateFloorPlacement(a, b) {
   if (!a || !b) return false

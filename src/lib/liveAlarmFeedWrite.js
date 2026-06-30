@@ -6,6 +6,10 @@
 function coerceLiveFeedTime(raw) {
   if (raw == null) return Date.now()
   if (typeof raw === "number" && Number.isFinite(raw)) return raw
+  if (typeof raw === "string") {
+    const parsed = Date.parse(raw)
+    if (Number.isFinite(parsed)) return parsed
+  }
   if (typeof raw === "object" && raw !== null && typeof raw.toDate === "function") {
     const d = raw.toDate()
     return d instanceof Date && !Number.isNaN(d.getTime()) ? d.getTime() : Date.now()

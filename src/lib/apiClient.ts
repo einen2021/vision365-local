@@ -133,10 +133,14 @@ export function normalizeLocalAssetUrl(url: string): string {
   if (url.startsWith("blob:") || url.startsWith("data:")) return url;
   if (url.startsWith("http://") || url.startsWith("https://")) return url;
 
-  const path = url.startsWith("/") ? url : `/${url}`;
+  let path = url.startsWith("/") ? url : `/${url}`;
   if (path.startsWith("/local/")) return path;
+  if (path.startsWith("local/")) return `/${path}`;
   if (path.startsWith("/floor-plans/") || path.startsWith("/uploads/")) {
     return `/local${path}`;
+  }
+  if (path.startsWith("floor-plans/") || path.startsWith("uploads/")) {
+    return `/local/${path}`;
   }
   return path;
 }
@@ -165,12 +169,32 @@ export function resolveAssetUrl(url: string): string {
   return encodeURI(path);
 }
 
-/** Resolve /local/ asset URLs in Tauri via convertFileSrc (avoids HTTPS→HTTP mixed content). */
+/** Resolve /local/ asset URLs in Tauri (local API first, then convertFileSrc). */
 export async function resolveDesktopAssetUrl(url: string): Promise<string> {
   const normalized = normalizeLocalAssetUrl(url);
   if (!normalized) return normalized;
   if (!isDesktop() || !normalized.startsWith("/local/")) {
     return resolveAssetUrl(normalized);
+  }
+
+  // Serve via the desktop API — same resolver as uploads; handles spaces and legacy paths.
+  try {
+    await waitForDesktopApi();
+    const httpUrl = resolveAssetUrl(normalized);
+    const res = await fetch(httpUrl);
+    if (res.ok) {
+      const blob = await res.blob();
+      if (blob.size > 0) {
+        return URL.createObjectURL(blob);
+      }
+    }
+    console.warn(
+      "[resolveDesktopAssetUrl] HTTP fetch failed:",
+      res.status,
+      httpUrl,
+    );
+  } catch (err) {
+    console.warn("[resolveDesktopAssetUrl] HTTP fetch error", err);
   }
 
   let decodedUrl = normalized;
@@ -187,19 +211,7 @@ export async function resolveDesktopAssetUrl(url: string): Promise<string> {
     })) as string;
     return convertFileSrc(filePath);
   } catch (err) {
-    console.warn("[resolveDesktopAssetUrl] convertFileSrc failed, trying HTTP fetch", err);
-  }
-
-  try {
-    await waitForDesktopApi();
-    const httpUrl = resolveAssetUrl(normalized);
-    const res = await fetch(httpUrl);
-    if (res.ok) {
-      const blob = await res.blob();
-      return URL.createObjectURL(blob);
-    }
-  } catch {
-    // ignore
+    console.warn("[resolveDesktopAssetUrl] convertFileSrc failed", err);
   }
 
   return resolveAssetUrl(normalized);

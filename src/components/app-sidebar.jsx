@@ -2,9 +2,9 @@
 
 import { useMemo } from "react";
 import {
+  Bell,
   Building,
   Building2,
-  GalleryVerticalEnd,
   MapPlus,
   Network,
   HousePlug,
@@ -27,7 +27,7 @@ import { getAllowedRoutesForRole, isPathAllowed } from "@/lib/roleAccess";
 const teams = [
   {
     name: "Vision365",
-    logo: GalleryVerticalEnd,
+    logoUrl: "/logo.png",
     plan: "Minimal",
   },
 ];
@@ -79,6 +79,12 @@ const navMain = [
     icon: Network,
     items: [{ title: "Telnet Client", url: "/dashboard/network" }],
   },
+  {
+    title: "Alarm Messages",
+    url: "/dashboard/alarm-messages/history",
+    icon: Bell,
+    items: [{ title: "History", url: "/dashboard/alarm-messages/history" }],
+  },
 ];
 
 function buildNavItemsForRole(role) {
@@ -89,13 +95,15 @@ function buildNavItemsForRole(role) {
     return navMain;
   }
 
-  return navMain.map((section) => ({
-    ...section,
-    items: (section.items || []).map((subItem) => ({
-      ...subItem,
-      disabled: !isPathAllowed(subItem.url, allowedRoutes),
-    })),
-  }));
+  return navMain
+    .map((section) => ({
+      ...section,
+      items: (section.items || []).map((subItem) => ({
+        ...subItem,
+        disabled: !isPathAllowed(subItem.url, allowedRoutes),
+      })),
+    }))
+    .filter((section) => section.items?.some((subItem) => !subItem.disabled));
 }
 
 export function AppSidebar(props) {

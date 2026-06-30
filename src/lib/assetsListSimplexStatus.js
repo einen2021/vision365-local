@@ -2,7 +2,7 @@ import { collection, doc, getDoc, getDocs, updateDoc } from "firebase/firestore"
 import { db } from "@/config/firebase"
 import { getAssetsListIdFromMapping } from "@/lib/floorMapAssets"
 import { normalizeSimplexStatus } from "@/lib/assetFireStatus"
-import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress"
+import { resolveAssetDeviceAddress, parseSimplexAddressToken } from "@/lib/simplexDeviceAddress"
 
 /** Find the global AssetsList document for a floor-map / building asset. */
 export async function resolveAssetsListDocId(asset, deviceAddress = "") {
@@ -25,6 +25,33 @@ export async function resolveAssetsListDocId(asset, deviceAddress = "") {
   for (const docSnap of snapshot.docs) {
     const data = docSnap.data()
     if (resolveAssetDeviceAddress(data) === targetAddress) return docSnap.id
+  }
+
+  return null
+}
+
+/** Find AssetsList row by panel list address (doc id or deviceAddress field). */
+export async function findAssetsListEntryByPanelAddress(panelAddress) {
+  const token = String(panelAddress || "").trim()
+  if (!token) return null
+
+  const candidates = new Set([token])
+  const parsed = parseSimplexAddressToken(token)
+  if (parsed?.full) candidates.add(parsed.full)
+  if (parsed?.mAddress) candidates.add(parsed.mAddress)
+
+  for (const id of candidates) {
+    const snap = await getDoc(doc(db, "AssetsList", id))
+    if (snap.exists()) return { id: snap.id, data: snap.data() }
+  }
+
+  const snapshot = await getDocs(collection(db, "AssetsList"))
+  for (const docSnap of snapshot.docs) {
+    const data = docSnap.data()
+    const resolved = resolveAssetDeviceAddress(data)
+    if (candidates.has(resolved) || candidates.has(docSnap.id)) {
+      return { id: docSnap.id, data }
+    }
   }
 
   return null

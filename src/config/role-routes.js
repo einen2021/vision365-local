@@ -1,4 +1,4 @@
-/** Minimal route config — admin only */
+/** Minimal route config — admin vs client */
 
 export const publicRoutes = ["/", "/unauthorized"];
 
@@ -20,14 +20,22 @@ export const commonRoutes = [
   "/dashboard/assets/view",
   "/dashboard/assets/view/details",
   "/dashboard/network",
+  "/dashboard/alarm-messages/history",
 ];
 
 export const faqRoute = "/dashboard/faq";
 
-/** Client users can only open the main graphics view page */
+/** Default landing page for client users */
 export const clientMainRoute = "/dashboard/floor_configuration/view";
+
+/** Client users — graphics view, network, and alarm history */
+export const clientRoutes = [
+  clientMainRoute,
+  "/dashboard/network",
+  "/dashboard/alarm-messages/history",
+];
 
 export const roleRoutes = {
   admin: commonRoutes,
-  client: [clientMainRoute],
+  client: clientRoutes,
 };

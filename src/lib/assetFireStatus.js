@@ -226,7 +226,14 @@ function metaMapsEqual(a, b) {
 export function getAssetMarkerTooltip(marker, metaByAssetId = {}) {
   const id = marker?.id || marker?.assetId || marker?.buildingAssetId || "";
   const meta = (id && metaByAssetId[id]) || {};
-  const address = String(resolveAssetDeviceAddress({ ...marker, ...meta }) || "").trim();
-  if (address) return address;
-  return marker?.assetName || marker?.itemType || id || "Asset";
+  const merged = { ...marker, ...meta };
+  const address = String(resolveAssetDeviceAddress(merged) || "").trim();
+  const location = String(merged.deviceLocation || "").trim();
+
+  const lines = [];
+  if (address) lines.push(`Address: ${address}`);
+  if (location) lines.push(`Location: ${location}`);
+  if (lines.length > 0) return lines.join("\n");
+
+  return merged?.assetName || merged?.itemType || id || "Asset";
 }

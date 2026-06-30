@@ -35,7 +35,29 @@ export function localAssetCandidates(
     candidates.push(safePath(appRoot, "uploads", normalized));
   }
 
+  // Legacy desktop:dev installs used %APPDATA%/Vision365 instead of the Tauri app id folder.
+  const legacyRoot = resolveLegacyAppDataRoot();
+  if (legacyRoot && legacyRoot !== appRoot) {
+    candidates.push(safePath(legacyRoot, normalized));
+    if (normalized.startsWith("floor-plans/")) {
+      candidates.push(safePath(legacyRoot, "uploads", normalized));
+    }
+  }
+
   return candidates;
+}
+
+function resolveLegacyAppDataRoot(): string | null {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  if (!home) return null;
+  if (process.platform === "win32") {
+    const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+    return path.join(appData, "Vision365");
+  }
+  if (process.platform === "darwin") {
+    return path.join(home, "Library", "Application Support", "Vision365");
+  }
+  return path.join(home, ".config", "Vision365");
 }
 
 export function findLocalAssetFile(

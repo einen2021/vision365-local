@@ -1,19 +1,9 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useSearchParams } from "next/navigation";
 import { AppSidebar } from "@/components/app-sidebar";
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
-import { MonitoringLiveStatus } from "@/components/monitoring-live-status";
-import {
-  Breadcrumb,
-  BreadcrumbItem,
-  BreadcrumbLink,
-  BreadcrumbList,
-  BreadcrumbPage,
-  BreadcrumbSeparator,
-} from "@/components/ui/breadcrumb";
-import { Separator } from "@/components/ui/separator";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -31,6 +21,8 @@ import { useAppData } from "@/hooks/useAppData";
 import FirestoreService from "@/services/firestoreService";
 import { CommunityBuildingSelect } from "@/components/floor-plan/community-building-select";
 import { PlanImageCanvas } from "@/components/floor-plan/plan-image-canvas";
+import { AssetTypeIconSettings } from "@/components/floor-plan/asset-type-icon-settings";
+import { normalizeAssetTypeKey } from "@/lib/assetIcons";
 import { AssetControlModal } from "@/components/asset-control-modal";
 import { FaqHelpButton } from "@/components/faq-help-button";
 import { NAV_LEVELS, buildBreadcrumbs, buildBuildingFloorMarkers, filterPlacedNavMarkers } from "@/lib/nestedFloorPlan";
@@ -75,7 +67,6 @@ export default function ViewNestedFloorPlansPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [selectedAsset, setSelectedAsset] = useState(null);
   const [isAssetModalOpen, setIsAssetModalOpen] = useState(false);
-  const [lastUpdate, setLastUpdate] = useState(null);
 
   const assetStatusLive = useFloorMapAssetStatusLive(
     level === NAV_LEVELS.SUBSECTION || level === NAV_LEVELS.SECTION,
@@ -115,7 +106,6 @@ export default function ViewNestedFloorPlansPage() {
       const tree = await FirestoreService.getNestedFloorPlanTree(selectedBuilding);
       setOverview(tree.overview);
       setFloors(tree.floors);
-      setLastUpdate(new Date());
     } catch (e) {
       console.error(e);
       toast({ title: "Load failed", description: e.message, variant: "destructive" });
@@ -273,6 +263,14 @@ export default function ViewNestedFloorPlansPage() {
 
   const floorList = overview?.floors?.length ? overview.floors : floors;
 
+  const extraAssetTypeKeys = useMemo(
+    () =>
+      [...sectionAssetMappings, ...assetMappings]
+        .map((m) => normalizeAssetTypeKey(m.itemType || m.assetName))
+        .filter(Boolean),
+    [sectionAssetMappings, assetMappings],
+  );
+
   if (!mounted) return null;
 
   return (
@@ -282,22 +280,7 @@ export default function ViewNestedFloorPlansPage() {
         <header className="flex h-16 shrink-0 items-center gap-2 px-4 md:px-8">
           <SidebarTrigger className="-ml-1" />
           <ClientModeToggle />
-          <Separator orientation="vertical" className="mr-2 h-4" />
-          <Breadcrumb>
-            <BreadcrumbList>
-              <BreadcrumbItem className="hidden md:block">
-                <BreadcrumbLink href="/dashboard">Home</BreadcrumbLink>
-              </BreadcrumbItem>
-              <BreadcrumbSeparator className="hidden md:block" />
-              <BreadcrumbItem>
-                <BreadcrumbPage>View Floor Maps</BreadcrumbPage>
-              </BreadcrumbItem>
-            </BreadcrumbList>
-          </Breadcrumb>
           <div className="ml-auto flex items-center gap-2">
-            {level !== NAV_LEVELS.BUILDING ? (
-              <MonitoringLiveStatus lastUpdate={lastUpdate} />
-            ) : null}
             <FirePanelStatusBadges />
           </div>
         </header>
@@ -310,7 +293,7 @@ export default function ViewNestedFloorPlansPage() {
               <FaqHelpButton articleId="page-floor-view" size="md" />
             </h1>
             <p className="text-muted-foreground text-sm mt-1">
-              Building → floors → sections. Subsections are optional; assets can be placed on a section or inside a subsection.
+              Building → floors → sections.
             </p>
           </div>
 
@@ -348,9 +331,14 @@ export default function ViewNestedFloorPlansPage() {
                     </p>
                   ) : null}
                 </div>
-                {level !== NAV_LEVELS.BUILDING ? (
-                  <Badge variant="outline">Live</Badge>
-                ) : null}
+                <div className="flex items-center gap-2">
+                  {level !== NAV_LEVELS.BUILDING ? (
+                    <AssetTypeIconSettings extraTypes={extraAssetTypeKeys} />
+                  ) : null}
+                  {level !== NAV_LEVELS.BUILDING ? (
+                    <Badge variant="outline">Live</Badge>
+                  ) : null}
+                </div>
               </CardHeader>
 
               <CardContent>
@@ -438,7 +426,7 @@ export default function ViewNestedFloorPlansPage() {
           onClose={() => setIsAssetModalOpen(false)}
           asset={selectedAsset}
           userRole={effectiveRole || ""}
-          buildingName={selectedBuilding}
+          selectedBuilding={selectedBuilding}
         />
       </SidebarInset>
     </SidebarProvider>

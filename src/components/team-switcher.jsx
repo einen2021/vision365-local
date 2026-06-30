@@ -18,6 +18,18 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { Vision365Logo } from "@/components/vision365-logo"
+
+function TeamLogo({ team, className = "size-8" }) {
+  if (team.logoUrl) {
+    return <Vision365Logo className={className} rounded />
+  }
+  if (team.logo) {
+    const Icon = team.logo
+    return <Icon className="size-4" />
+  }
+  return null
+}
 
 export function TeamSwitcher({
   teams
@@ -34,8 +46,8 @@ export function TeamSwitcher({
               size="lg"
               className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground">
               <div
-                className="flex aspect-square size-8 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
-                <activeTeam.logo className="size-4" />
+                className="flex aspect-square size-8 items-center justify-center overflow-hidden rounded-lg bg-sidebar-primary">
+                <TeamLogo team={activeTeam} className="size-8" />
               </div>
               <div className="grid flex-1 text-left text-sm leading-tight">
                 <span className="truncate font-semibold">
@@ -56,8 +68,8 @@ export function TeamSwitcher({
             </DropdownMenuLabel>
             {teams.map((team, index) => (
               <DropdownMenuItem key={team.name} onClick={() => setActiveTeam(team)} className="gap-2 p-2">
-                <div className="flex size-6 items-center justify-center rounded-sm border">
-                  <team.logo className="size-4 shrink-0" />
+                <div className="flex size-6 items-center justify-center overflow-hidden rounded-sm border">
+                  <TeamLogo team={team} className="size-6" />
                 </div>
                 {team.name}
                 <DropdownMenuShortcut>⌘{index + 1}</DropdownMenuShortcut>

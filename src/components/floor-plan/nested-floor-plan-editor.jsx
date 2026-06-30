@@ -30,6 +30,8 @@ import { useToast } from "@/hooks/use-toast";
 import FirestoreService from "@/services/firestoreService";
 import { PlanImageCanvas } from "@/components/floor-plan/plan-image-canvas";
 import { AssetPickerPanel } from "@/components/floor-plan/asset-picker-panel";
+import { AssetTypeIconSettings } from "@/components/floor-plan/asset-type-icon-settings";
+import { normalizeAssetTypeKey } from "@/lib/assetIcons";
 import {
   NAV_LEVELS,
   sanitizeFloorPlanId,
@@ -422,8 +424,21 @@ export function NestedFloorPlanEditor({ buildingName }) {
           id: d.id,
           assetsListId: d.id,
           name: data.itemType || data.assetName || data.description || d.id,
+          itemType: data.itemType || data.assetName || "",
           category: data.system || data.category || "fire-life-safety",
           assetMode: "general",
+          x: data.x,
+          y: data.y,
+          relativeX: data.relativeX,
+          relativeY: data.relativeY,
+          floorId: data.floorId || "",
+          floorName: data.floorName || "",
+          sectionId: data.sectionId || "",
+          sectionName: data.sectionName || "",
+          subsectionId: data.subsectionId || "",
+          subsectionName: data.subsectionName || "",
+          nestedPath: data.nestedPath || "",
+          placementLevel: data.placementLevel || "",
           ...pickMappingDeviceFields(data),
         });
       });
@@ -450,8 +465,21 @@ export function NestedFloorPlanEditor({ buildingName }) {
           items.push({
             id: assetId,
             name: asset.assetName || asset.name || assetId,
+            itemType: asset.itemType || asset.assetName || asset.name || "",
             category: categoryKey,
             assetMode: "building",
+            x: asset.x,
+            y: asset.y,
+            relativeX: asset.relativeX,
+            relativeY: asset.relativeY,
+            floorId: asset.floorId || "",
+            floorName: asset.floorName || "",
+            sectionId: asset.sectionId || "",
+            sectionName: asset.sectionName || "",
+            subsectionId: asset.subsectionId || "",
+            subsectionName: asset.subsectionName || "",
+            nestedPath: asset.nestedPath || "",
+            placementLevel: asset.placementLevel || "",
             ...pickMappingDeviceFields(asset),
           });
         });
@@ -492,6 +520,7 @@ export function NestedFloorPlanEditor({ buildingName }) {
     const mapping = {
       id: `asset_${mappingCounter}`,
       assetName: selectedAsset.name,
+      itemType: selectedAsset.itemType || selectedAsset.name || "",
       category: selectedAsset.category,
       assetMode: selectedAsset.assetMode || assetMode,
       assetsListId:
@@ -577,6 +606,11 @@ export function NestedFloorPlanEditor({ buildingName }) {
     section,
     subsection,
   });
+
+  const placedAssetTypeKeys = (mappings) =>
+    mappings
+      .map((m) => normalizeAssetTypeKey(m.itemType || m.assetName))
+      .filter(Boolean);
 
   const handleDeleteFloor = async () => {
     if (!floorToDelete) return;
@@ -923,6 +957,15 @@ export function NestedFloorPlanEditor({ buildingName }) {
                   isSaving={isSaving}
                   saveLabel="Save Section Assets"
                   buildingName={buildingName}
+                  headerAction={
+                    <AssetTypeIconSettings extraTypes={placedAssetTypeKeys(sectionAssetMappings)} />
+                  }
+                  currentPlacementContext={{
+                    floorName: floor?.name || "",
+                    sectionName: section?.name || "",
+                    subsectionName: "",
+                    placementLevel: "section",
+                  }}
                 />
               </CardContent>
             </Card>
@@ -972,13 +1015,22 @@ export function NestedFloorPlanEditor({ buildingName }) {
                 selectedAsset={selectedAsset}
                 onSelectAsset={setSelectedAsset}
                 onClearSelection={() => setSelectedAsset(null)}
-                  placedCount={assetMappings.length}
-                  placedMappings={assetMappings}
-                  onRemovePlaced={removeSubsectionAsset}
-                  onSave={saveSubsectionAssets}
-                  isSaving={isSaving}
-                  saveLabel="Save Subsection Assets"
+                placedCount={assetMappings.length}
+                placedMappings={assetMappings}
+                onRemovePlaced={removeSubsectionAsset}
+                onSave={saveSubsectionAssets}
+                isSaving={isSaving}
+                saveLabel="Save Subsection Assets"
                 buildingName={buildingName}
+                headerAction={
+                  <AssetTypeIconSettings extraTypes={placedAssetTypeKeys(assetMappings)} />
+                }
+                currentPlacementContext={{
+                  floorName: floor?.name || "",
+                  sectionName: section?.name || "",
+                  subsectionName: subsection?.name || "",
+                  placementLevel: "subsection",
+                }}
               />
             </CardContent>
           </Card>

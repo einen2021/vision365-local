@@ -2,6 +2,58 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use crate::ApiServerState;
 
+fn decode_local_path_segment(segment: &str) -> String {
+    let replaced = segment.replace('\\', "/");
+    match urlencoding::decode(&replaced) {
+        Ok(decoded) => decoded.into_owned(),
+        Err(_) => replaced,
+    }
+}
+
+fn local_asset_candidates(app_data: &std::path::Path, relative: &str) -> Vec<std::path::PathBuf> {
+    let normalized = relative.replace('\\', "/");
+    let mut candidates = vec![app_data.join(normalized.replace('/', std::path::MAIN_SEPARATOR_STR))];
+
+    if !normalized.starts_with("uploads/") {
+        candidates.push(
+            app_data
+                .join("uploads")
+                .join(normalized.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        );
+    }
+    if normalized.starts_with("uploads/floor-plans/") {
+        candidates.push(
+            app_data.join(
+                normalized["uploads/".len()..].replace('/', std::path::MAIN_SEPARATOR_STR),
+            ),
+        );
+    }
+    if normalized.starts_with("floor-plans/") {
+        candidates.push(
+            app_data
+                .join("uploads")
+                .join(normalized.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        );
+    }
+
+    // Legacy desktop:dev data lived under %APPDATA%/Vision365 (not Tauri app id folder).
+    if let Some(roaming) = dirs::data_dir() {
+        let legacy_root = roaming.join("Vision365");
+        if legacy_root != app_data {
+            candidates.push(legacy_root.join(normalized.replace('/', std::path::MAIN_SEPARATOR_STR)));
+            if normalized.starts_with("floor-plans/") {
+                candidates.push(
+                    legacy_root
+                        .join("uploads")
+                        .join(normalized.replace('/', std::path::MAIN_SEPARATOR_STR)),
+                );
+            }
+        }
+    }
+
+    candidates
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct WindowState {
     pub width: f64,
@@ -17,31 +69,14 @@ pub fn resolve_local_asset_src(app: AppHandle, url: String) -> Result<String, St
         return Err("Not a local asset URL".into());
     }
 
-    let relative = url
-        .trim_start_matches("/local/")
-        .trim_start_matches('/')
-        .replace('\\', "/");
+    let relative = decode_local_path_segment(
+        url.trim_start_matches("/local/")
+            .trim_start_matches('/'),
+    );
 
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
 
-    let mut candidates = vec![app_data.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))];
-    if !relative.starts_with("uploads/") {
-        candidates.push(
-            app_data.join("uploads").join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)),
-        );
-    }
-    if relative.starts_with("uploads/floor-plans/") {
-        candidates.push(
-            app_data.join(relative["uploads/".len()..].replace('/', std::path::MAIN_SEPARATOR_STR)),
-        );
-    }
-    if relative.starts_with("floor-plans/") {
-        candidates.push(
-            app_data.join("uploads").join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)),
-        );
-    }
-
-    for path in candidates {
+    for path in local_asset_candidates(&app_data, &relative) {
         if path.is_file() {
             return Ok(path.to_string_lossy().to_string());
         }

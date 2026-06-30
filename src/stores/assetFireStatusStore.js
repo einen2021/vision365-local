@@ -33,7 +33,7 @@ function buildCacheFromSnapshot(snapshot) {
     if (!key) return;
     const resolvedAddress = resolveAssetDeviceAddress(data);
     metaByAssetId[key] = {
-      deviceLocation: String(data.deviceLocation || data.description || "").trim(),
+      deviceLocation: String(data.deviceLocation || "").trim(),
       deviceAddress: resolvedAddress,
     };
   };

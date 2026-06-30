@@ -16,6 +16,9 @@ set "CARGO_TARGET_DIR=%~dp0..\src-tauri\target"
 
 cd /d "%~dp0.."
 
+call npm run desktop:icons
+if errorlevel 1 exit /b 1
+
 call npm run desktop:server:pkg
 if errorlevel 1 exit /b 1
 

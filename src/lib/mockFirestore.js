@@ -25,10 +25,14 @@ class DocumentReference {
 }
 
 class DocumentSnapshot {
-  constructor(id, data, exists) {
+  constructor(id, data, exists, path) {
     this.id = id;
     this._data = data;
     this._exists = exists;
+    this._refPath = path;
+  }
+  get ref() {
+    return this._refPath ? new DocumentReference(this._refPath) : undefined;
   }
   exists() {
     return this._exists;
@@ -157,14 +161,19 @@ export async function getDocs(refOrQuery) {
 
   const result = await apiCall({ op: "list", path, constraints });
   const docs = (result.docs || []).map(
-    (d) => new DocumentSnapshot(d.id, d.data, true),
+    (d) => new DocumentSnapshot(d.id, d.data, true, [...path, d.id]),
   );
   return new QuerySnapshot(docs);
 }
 
 export async function getDoc(docRef) {
   const result = await apiCall({ op: "get", path: docRef._path });
-  return new DocumentSnapshot(docRef.id, result.data, result.exists);
+  return new DocumentSnapshot(
+    docRef.id,
+    result.data,
+    result.exists,
+    docRef._path,
+  );
 }
 
 export async function setDoc(docRef, data, options = {}) {

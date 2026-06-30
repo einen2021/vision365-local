@@ -5,8 +5,19 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Database, Layers, Loader2, Package, Save, Trash2, X } from "lucide-react";
-import { getIconForCategory } from "@/lib/assetIcons";
-import { getAssetPlacementLabel, matchesAssetAddressSearch } from "@/lib/floorMapAssets";
+import { useAssetTypeIcons } from "@/contexts/AssetTypeIconsContext";
+import {
+  getIconForAssetType,
+  handleImageError,
+  resolveAssetTypeFromMapping,
+} from "@/lib/assetIcons";
+import {
+  formatNestedPlacementLabel,
+  getAssetPlacementLabel,
+  getPickerAssetPlacementLocation,
+  isPickerAssetUnavailable,
+  matchesAssetAddressSearch,
+} from "@/lib/floorMapAssets";
 
 /**
  * Pick general (AssetsList) or building assets and place them on a floor plan.
@@ -33,17 +44,26 @@ export function AssetPickerPanel({
   isSaving,
   saveLabel = "Save Assets",
   buildingName,
+  headerAction = null,
+  currentPlacementContext = null,
 }) {
-  const list =
-    assetMode === "general"
-      ? generalAssets.filter((a) => matchesAssetAddressSearch(a, assetSearch))
-      : buildingAssets.filter((a) => matchesAssetAddressSearch(a, assetSearch));
+  const { overrides } = useAssetTypeIcons();
+  const UNAVAILABLE_DISPLAY_LIMIT = 100;
+  const sourceList = assetMode === "general" ? generalAssets : buildingAssets;
+  const searchedAssets = sourceList.filter((a) => matchesAssetAddressSearch(a, assetSearch));
+  const list = searchedAssets.filter((a) => !isPickerAssetUnavailable(a, placedMappings));
+  const unavailableAssets = searchedAssets.filter((a) =>
+    isPickerAssetUnavailable(a, placedMappings),
+  );
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-2 font-semibold">
-        <Package className="h-5 w-5" />
-        {title}
+      <div className="flex items-center justify-between gap-2 font-semibold">
+        <div className="flex items-center gap-2">
+          <Package className="h-5 w-5" />
+          {title}
+        </div>
+        {headerAction}
       </div>
 
       <Tabs value={assetMode} onValueChange={onAssetModeChange}>
@@ -107,11 +127,47 @@ export function AssetPickerPanel({
 
       <div className="max-h-40 overflow-y-auto space-y-1">
         {list.length === 0 ? (
-          <p className="text-sm text-muted-foreground py-2">
-            {assetMode === "general"
-              ? "Click Load General Assets to list devices."
-              : "Click Load Building Assets to list devices."}
-          </p>
+          unavailableAssets.length > 0 ? (
+            <div className="space-y-2 py-1">
+              <p className="text-xs font-medium text-muted-foreground">
+                Already placed ({unavailableAssets.length})
+              </p>
+              {unavailableAssets.slice(0, UNAVAILABLE_DISPLAY_LIMIT).map((a) => {
+                const location = getPickerAssetPlacementLocation(
+                  a,
+                  placedMappings,
+                  currentPlacementContext,
+                );
+                return (
+                  <div
+                    key={`placed-${assetMode}-${a.id}`}
+                    className="rounded border bg-muted/20 px-2 py-1.5"
+                  >
+                    <p className="truncate text-xs font-medium">
+                      {getAssetPlacementLabel(a)}
+                    </p>
+                    <p className="text-[11px] leading-snug text-muted-foreground">
+                      {location || "Placement location unknown"}
+                    </p>
+                  </div>
+                );
+              })}
+              {unavailableAssets.length > UNAVAILABLE_DISPLAY_LIMIT ? (
+                <p className="text-[11px] text-muted-foreground">
+                  + {unavailableAssets.length - UNAVAILABLE_DISPLAY_LIMIT} more — use search to
+                  narrow the list
+                </p>
+              ) : null}
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground py-2">
+              {sourceList.length > 0
+                ? "No assets match your search."
+                : assetMode === "general"
+                  ? "Click Load General Assets to list devices."
+                  : "Click Load Building Assets to list devices."}
+            </p>
+          )
         ) : (
           list.map((a) => (
             <Button
@@ -122,9 +178,10 @@ export function AssetPickerPanel({
               onClick={() => onSelectAsset(a)}
             >
               <img
-                src={getIconForCategory(a.category)}
+                src={getIconForAssetType(resolveAssetTypeFromMapping(a), null, overrides)}
                 alt=""
                 className="mr-2 h-4 w-4 shrink-0"
+                onError={handleImageError}
               />
               <span className="truncate">{getAssetPlacementLabel(a)}</span>
             </Button>
@@ -153,13 +210,22 @@ export function AssetPickerPanel({
                 className="flex items-center gap-2 rounded border bg-muted/30 px-2 py-1.5"
               >
                 <img
-                  src={getIconForCategory(mapping.category)}
+                  src={getIconForAssetType(resolveAssetTypeFromMapping(mapping), null, overrides)}
                   alt=""
                   className="h-4 w-4 shrink-0"
+                  onError={handleImageError}
                 />
-                <span className="flex-1 truncate text-xs">
-                  {getAssetPlacementLabel(mapping)}
-                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-xs font-medium">
+                    {getAssetPlacementLabel(mapping)}
+                  </p>
+                  <p className="truncate text-[11px] text-muted-foreground">
+                    {formatNestedPlacementLabel({
+                      ...currentPlacementContext,
+                      ...mapping,
+                    })}
+                  </p>
+                </div>
                 <Button
                   type="button"
                   variant="ghost"

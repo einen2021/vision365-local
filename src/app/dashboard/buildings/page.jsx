@@ -8,14 +8,6 @@ import { getStoredSessionUser, parseStoredUser } from "@/lib/sessionUser";
 import { AppSidebar } from "@/components/app-sidebar";
 import { ModeToggle } from "@/components/theme-toggle";
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
-import {
-  Breadcrumb,
-  BreadcrumbItem,
-  BreadcrumbLink,
-  BreadcrumbList,
-  BreadcrumbPage,
-  BreadcrumbSeparator,
-} from "@/components/ui/breadcrumb";
 import { Separator } from "@/components/ui/separator";
 import {
   SidebarInset,
@@ -1050,21 +1042,9 @@ export default function ManageBuildings() {
     <SidebarProvider>
       <AppSidebar />
       <SidebarInset>
-        <header className="flex h-16 items-center gap-2 px-4">
+        <header className="flex min-h-16 items-center gap-3 py-2 px-4">
           <SidebarTrigger className="-ml-1" />
           <ModeToggle />
-          <Separator orientation="vertical" className="mr-2 h-4" />
-          <Breadcrumb>
-            <BreadcrumbList>
-              <BreadcrumbItem>
-                <BreadcrumbLink href="#">Buildings</BreadcrumbLink>
-              </BreadcrumbItem>
-              <BreadcrumbSeparator />
-              <BreadcrumbItem>
-                <BreadcrumbPage>Manage Buildings</BreadcrumbPage>
-              </BreadcrumbItem>
-            </BreadcrumbList>
-          </Breadcrumb>
           <div className="ml-auto flex items-center gap-2">
             <FirePanelStatusBadges />
           </div>

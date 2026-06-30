@@ -3,9 +3,13 @@
 import { useState } from "react";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
+
+/** Taller header controls — status badges keep default compact height. */
+const HEADER_ACTION_BUTTON_CLASS = "h-10 px-4 text-sm";
 
 const ACK_BUTTONS = [
   {
@@ -78,7 +82,10 @@ export function FirePanelAckButtons() {
             type="button"
             variant={variant}
             size="sm"
-            className={active && variant === "outline" ? activeClassName : undefined}
+            className={cn(
+              HEADER_ACTION_BUTTON_CLASS,
+              active && variant === "outline" ? activeClassName : undefined,
+            )}
             disabled={!connected || loadingLabel !== null}
             onClick={() => handleAck(label, title)}
           >

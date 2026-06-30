@@ -43,6 +43,13 @@ export function simplexKeyForCategoryLabel(label) {
   return "F";
 }
 
+/** Parse panel list command output into unique device addresses. */
+export function extractPanelDeviceAddresses(response) {
+  const regex = /\b\d+:M\d+-\d+(?:-\d+)?\b/gi;
+  const matches = String(response || "").match(regex) ?? [];
+  return [...new Set(matches.map((value) => value.trim()))];
+}
+
 export function readSimplexStatus(asset) {
   const raw = asset?.simplexStatus;
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {

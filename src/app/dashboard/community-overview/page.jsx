@@ -5,7 +5,6 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import dynamic from 'next/dynamic';
 import { Card, CardContent } from '@/components/ui/card';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
-import { Breadcrumb, BreadcrumbList, BreadcrumbItem, BreadcrumbLink, BreadcrumbSeparator, BreadcrumbPage } from '@/components/ui/breadcrumb';
 import { AppSidebar } from '@/components/app-sidebar';
 import { SidebarProvider, SidebarInset, SidebarTrigger } from '@/components/ui/sidebar';
 import { ModeToggle } from '@/components/theme-toggle';
@@ -42,6 +41,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { rowsForLiveAlarmLikeDisplay, rowsForLiveTroubleDisplay } from '@/lib/liveAlarmFeedWrite';
 import { PageHelpBanner } from "@/components/page-help-banner"
+import { Vision365Logo } from "@/components/vision365-logo"
 import { CommunityOverviewFloorMarker } from "@/components/community-overview-floor-marker"
 import { handleImageError } from "@/lib/assetIcons"
 import { useResolvedAssetUrl } from "@/hooks/useResolvedAssetUrl"
@@ -1035,16 +1035,6 @@ function CommunityOverviewContent() {
       return;
     }
 
-    // Verify the building has construction status before allowing access
-    if (!buildingStatus || buildingStatus.toLowerCase() !== 'construction') {
-      toast({
-        title: 'Feature Unavailable',
-        description: `Asset controls are only available for buildings with 'Construction' status. ${targetBuilding} status: ${buildingStatus || 'Unknown'}`,
-        variant: 'destructive',
-      });
-      return;
-    }
-
     // Add the targetBuilding to the asset mapping so modal knows which building to use
     setSelectedAsset({ ...mapping, targetBuilding });
     setIsAssetModalOpen(true);
@@ -1180,18 +1170,6 @@ function CommunityOverviewContent() {
           <div className="flex items-center gap-2 px-4">
             <SidebarTrigger className="-ml-1" />
             <ModeToggle />
-            <Separator orientation="vertical" className="mr-2 h-4" />
-            <Breadcrumb>
-              <BreadcrumbList>
-                <BreadcrumbItem className="hidden md:block">
-                  <BreadcrumbLink href="/dashboard">Dashboard</BreadcrumbLink>
-                </BreadcrumbItem>
-                <BreadcrumbSeparator className="hidden md:block" />
-                <BreadcrumbItem>
-                  <BreadcrumbPage>Community Overview</BreadcrumbPage>
-                </BreadcrumbItem>
-              </BreadcrumbList>
-            </Breadcrumb>
           </div>
           <div className="ml-auto flex items-center gap-2 px-4">
             <FirePanelStatusBadges />
@@ -1859,7 +1837,7 @@ function CommunityOverviewContent() {
                   <div>{userRole || 'User'}</div>
                   <div className="flex items-center gap-3">
                     <div>{new Date().toLocaleString()}</div>
-                    <img src="/logo.png" alt="Logo" className="h-6 w-auto" />
+                    <Vision365Logo className="h-6 w-6" />
                   </div>
                 </div>
               </div>
@@ -1878,7 +1856,6 @@ function CommunityOverviewContent() {
         onClose={() => setIsAssetModalOpen(false)}
         asset={selectedAsset}
         selectedBuilding={selectedAsset?.targetBuilding || selectedBuildingForFloor || selectedBuilding}
-        buildingStatus={buildingStatus}
         userRole={userRole}
       />
 

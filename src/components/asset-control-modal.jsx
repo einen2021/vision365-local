@@ -2,8 +2,9 @@
 
 import { useState, useEffect } from "react"
 import { db } from "@/config/firebase"
-import { doc, getDoc, updateDoc, arrayUnion } from "firebase/firestore"
+import { doc, getDoc, updateDoc } from "firebase/firestore"
 import { useToast } from "@/hooks/use-toast"
+import { useFirePanelMonitor } from "@/contexts/AppContext"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -16,122 +17,77 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Loader2, Edit, MapPin, Power, PowerOff, CheckCircle, XCircle, Flame, AlertTriangle } from "lucide-react"
-import {
-  getFireStatusDisplay,
-  normalizeSimplexStatus,
-  simplexStatusToActive,
-} from "@/lib/assetFireStatus"
-import { resolveAssetsListDocId, resetSimplexFlag } from "@/lib/assetsListSimplexStatus"
-import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
+import { Loader2, Edit, MapPin, CheckCircle, XCircle } from "lucide-react"
+import { resolveAssetsListDocId } from "@/lib/assetsListSimplexStatus"
 
-/**
- * Helper function to map display category names to Firestore collection keys
- */
 const getCategoryKey = (categoryName) => {
   if (!categoryName) return "general"
-  
+
   const categoryMap = {
     "fire-life-safety": "fire-life-safety",
     "fire fighting": "fire-life-safety",
-    "electrical": "electrical",
-    "hvac": "hvac",
-    "plumbing": "plumbing",
-    "elv": "elv",
-    "security": "security",
+    electrical: "electrical",
+    hvac: "hvac",
+    plumbing: "plumbing",
+    elv: "elv",
+    security: "security",
     "vertical-transport": "vertical-transport",
-    "lighting": "lighting",
-    "bms": "bms",
-    "landscaping": "landscaping",
-    "additional": "additional",
+    lighting: "lighting",
+    bms: "bms",
+    landscaping: "landscaping",
+    additional: "additional",
   }
-  
-  // Try exact match first, then normalize for case-insensitive search
+
   const normalized = categoryName.toLowerCase().trim()
   return categoryMap[normalized] || "fire-life-safety"
 }
 
-/**
- * Global Asset Control Modal Component
- * 
- * This modal allows administrators to control asset details including:
- * - Installation status
- * - Activity status (on/off)
- * - Enable/disable state
- * - Device location and address
- * 
- * @param {Object} props
- * @param {boolean} props.isOpen - Controls modal visibility
- * @param {Function} props.onClose - Callback when modal closes
- * @param {Object} props.asset - The asset mapping object to control
- * @param {string} props.selectedBuilding - Current building name
- * @param {string} props.buildingStatus - Building status (construction/operational)
- * @param {string} props.userRole - Current user role (admin/viewer/etc)
- */
 export function AssetControlModal({
   isOpen,
   onClose,
   asset,
   selectedBuilding,
-  buildingStatus = "",
   userRole = "",
 }) {
   const { toast } = useToast()
+  const { enableDevice, disableDevice } = useFirePanelMonitor()
   const [isUpdatingAsset, setIsUpdatingAsset] = useState(false)
   const [deviceLocation, setDeviceLocation] = useState("")
   const [deviceAddress, setDeviceAddress] = useState("")
-  const [installed, setInstalled] = useState(false)
+  const [deviceDescription, setDeviceDescription] = useState("")
+  const [enabled, setEnabled] = useState(true)
   const [selectedAsset, setSelectedAsset] = useState(null)
-  const [simplexStatus, setSimplexStatus] = useState({ F: 0, T: 0 })
 
-  // Load asset data when modal opens or asset changes
   useEffect(() => {
     if (isOpen && asset && selectedBuilding) {
       loadAssetData()
     }
   }, [isOpen, asset, selectedBuilding])
 
-  // Reset fields when modal closes
   useEffect(() => {
     if (!isOpen) {
       setDeviceLocation("")
       setDeviceAddress("")
-      setInstalled(false)
+      setDeviceDescription("")
+      setEnabled(true)
       setSelectedAsset(null)
-      setSimplexStatus({ F: 0, T: 0 })
     }
   }, [isOpen])
 
-  const loadSimplexStatus = async (assetRecord, location, address) => {
-    const assetsListId = await resolveAssetsListDocId(assetRecord, address)
-    if (assetsListId) {
-      const listSnap = await getDoc(doc(db, "AssetsList", assetsListId))
-      if (listSnap.exists()) {
-        return normalizeSimplexStatus(listSnap.data()?.simplexStatus)
-      }
-    }
-
-    const storeStatus = useAssetFireStatusStore
-      .getState()
-      .getSimplexStatus(assetRecord.buildingAssetId || assetRecord.id, address)
-    if (storeStatus) return normalizeSimplexStatus(storeStatus)
-
-    return { F: 0, T: 0 }
-  }
-
   const loadAssetData = async () => {
-    try {      // Use the building name from selectedBuilding prop
+    try {
       if (!selectedBuilding) {
-        console.warn("No building selected for asset control");
-        return;
+        console.warn("No building selected for asset control")
+        return
       }
+
       const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      
-      // Build the asset document path
-      // Map category display name to actual Firestore collection key
-      const categoryKey = getCategoryKey(asset.categoryKey || asset.assetCategory || asset.category || "general")
-      const assetId = asset.id || asset.buildingAssetId
-      
+      const categoryKey = getCategoryKey(
+        asset.categoryKey || asset.assetCategory || asset.category || "general",
+      )
+      // Prefer buildingAssetId — mapping `id` is the floor-plan doc id, not the asset doc id.
+      const assetId = asset.buildingAssetId || asset.id
+
       if (!assetId) {
         console.warn("Asset ID not found, cannot load asset data")
         return
@@ -139,34 +95,52 @@ export function AssetControlModal({
 
       const assetDocRef = doc(db, buildingNameWithSuffix, "asset", categoryKey, assetId)
       const assetDoc = await getDoc(assetDocRef)
+      const assetData = assetDoc.exists() ? assetDoc.data() : {}
 
-      let assetData = {}
-      if (assetDoc.exists()) {
-        assetData = assetDoc.data()
+      const address = assetData.deviceAddress || asset.deviceAddress || ""
+      let description =
+        assetData.deviceDescription ||
+        assetData.description ||
+        asset.deviceDescription ||
+        asset.description ||
+        ""
+
+      let location = String(assetData.deviceLocation || "").trim()
+
+      const assetsListId = await resolveAssetsListDocId(
+        { ...asset, buildingAssetId: assetId },
+        address,
+      )
+      if (assetsListId) {
+        const listSnap = await getDoc(doc(db, "AssetsList", assetsListId))
+        if (listSnap.exists()) {
+          const listData = listSnap.data()
+          if (!description) {
+            description = listData.deviceDescription || listData.description || ""
+          }
+          // Only use explicit deviceLocation from AssetsList — never description.
+          if (!location) {
+            location = String(listData.deviceLocation || "").trim()
+          }
+        }
       }
 
-      const installedStatus = assetData.installed !== undefined ? assetData.installed : false
+      const enabledStatus = assetData.enabled !== undefined ? assetData.enabled : true
+
+      const descTrimmed = description.trim()
+      if (location && descTrimmed && location.toLowerCase() === descTrimmed.toLowerCase()) {
+        location = ""
+      }
 
       setSelectedAsset({
         ...asset,
         buildingAssetId: assetId,
         assetCategory: categoryKey,
-        activityStatus: assetData.activityStatus !== undefined ? assetData.activityStatus : asset.active || 0,
-        enabled: assetData.enabled !== undefined ? assetData.enabled : true,
-        deviceLocation: assetData.deviceLocation || "",
-        deviceAddress: assetData.deviceAddress || "",
-        installed: installedStatus,
       })
-      setDeviceLocation(assetData.deviceLocation || "")
-      setDeviceAddress(assetData.deviceAddress || "")
-      setInstalled(installedStatus)
-
-      const panelStatus = await loadSimplexStatus(
-        { ...asset, buildingAssetId: assetId },
-        assetData.deviceLocation || "",
-        assetData.deviceAddress || "",
-      )
-      setSimplexStatus(panelStatus)
+      setDeviceLocation(location)
+      setDeviceAddress(address)
+      setDeviceDescription(description)
+      setEnabled(enabledStatus)
     } catch (error) {
       console.error("Error loading asset data:", error)
       toast({
@@ -177,21 +151,37 @@ export function AssetControlModal({
     }
   }
 
-  // Update installed status
-  const handleUpdateInstalled = async (installedValue) => {
+  const updateAssetEnabled = async (nextEnabled) => {
+    const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
+    const assetDocRef = doc(
+      db,
+      buildingNameWithSuffix,
+      "asset",
+      selectedAsset.assetCategory,
+      selectedAsset.buildingAssetId,
+    )
+
+    await updateDoc(assetDocRef, {
+      enabled: nextEnabled,
+      updatedAt: new Date().toISOString(),
+    })
+  }
+
+  const handleEnable = async () => {
     if (!selectedAsset || !selectedBuilding || userRole !== "admin") {
       toast({
         title: "Unauthorized",
-        description: "Only admins can update installation status",
+        description: "Only admins can enable devices",
         variant: "destructive",
       })
       return
     }
 
-    if (buildingStatus?.toLowerCase() !== "construction") {
+    const address = deviceAddress.trim()
+    if (!address) {
       toast({
-        title: "Feature Unavailable",
-        description: "Asset controls are only available for buildings with 'Construction' status",
+        title: "Missing Address",
+        description: "This asset has no device address to enable",
         variant: "destructive",
       })
       return
@@ -199,30 +189,18 @@ export function AssetControlModal({
 
     setIsUpdatingAsset(true)
     try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const assetDocRef = doc(
-        db,
-        buildingNameWithSuffix,
-        "asset",
-        selectedAsset.assetCategory,
-        selectedAsset.buildingAssetId
-      )
-
-      await updateDoc(assetDocRef, {
-        installed: installedValue,
-      })
-
-      setSelectedAsset({ ...selectedAsset, installed: installedValue })
-      setInstalled(installedValue)
+      await enableDevice(address)
+      await updateAssetEnabled(true)
+      setEnabled(true)
       toast({
         title: "Success",
-        description: `Asset ${installedValue ? "marked as installed" : "marked as not installed"} successfully`,
+        description: "Device enabled successfully",
       })
     } catch (error) {
-      console.error("Error updating installed status:", error)
+      console.error("Error enabling device:", error)
       toast({
         title: "Error",
-        description: "Failed to update installation status",
+        description: error.message || "Failed to enable device",
         variant: "destructive",
       })
     } finally {
@@ -230,30 +208,21 @@ export function AssetControlModal({
     }
   }
 
-  // Update asset activity status (on/off)
-  const handleUpdateActivityStatus = async (status) => {
+  const handleDisable = async () => {
     if (!selectedAsset || !selectedBuilding || userRole !== "admin") {
       toast({
         title: "Unauthorized",
-        description: "Only admins can update asset status",
+        description: "Only admins can disable devices",
         variant: "destructive",
       })
       return
     }
 
-    if (buildingStatus?.toLowerCase() !== "construction") {
+    const address = deviceAddress.trim()
+    if (!address) {
       toast({
-        title: "Feature Unavailable",
-        description: "Asset controls are only available for buildings with 'Construction' status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (!selectedAsset.installed) {
-      toast({
-        title: "Action Restricted",
-        description: "Asset must be installed before you can change its activity status",
+        title: "Missing Address",
+        description: "This asset has no device address to disable",
         variant: "destructive",
       })
       return
@@ -261,29 +230,18 @@ export function AssetControlModal({
 
     setIsUpdatingAsset(true)
     try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const assetDocRef = doc(
-        db,
-        buildingNameWithSuffix,
-        "asset",
-        selectedAsset.assetCategory,
-        selectedAsset.buildingAssetId
-      )
-
-      await updateDoc(assetDocRef, {
-        activityStatus: status,
-      })
-
-      setSelectedAsset({ ...selectedAsset, activityStatus: status })
+      await disableDevice(address)
+      await updateAssetEnabled(false)
+      setEnabled(false)
       toast({
         title: "Success",
-        description: `Asset ${status === 0 ? "turned off" : "turned on"} successfully`,
+        description: "Device disabled successfully",
       })
     } catch (error) {
-      console.error("Error updating activity status:", error)
+      console.error("Error disabling device:", error)
       toast({
         title: "Error",
-        description: "Failed to update asset status",
+        description: error.message || "Failed to disable device",
         variant: "destructive",
       })
     } finally {
@@ -291,127 +249,6 @@ export function AssetControlModal({
     }
   }
 
-  // Update asset enabled status
-  const handleUpdateEnabled = async (enabled) => {
-    if (!selectedAsset || !selectedBuilding || userRole !== "admin") {
-      toast({
-        title: "Unauthorized",
-        description: "Only admins can update asset status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (buildingStatus?.toLowerCase() !== "construction") {
-      toast({
-        title: "Feature Unavailable",
-        description: "Asset controls are only available for buildings with 'Construction' status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (!selectedAsset.installed) {
-      toast({
-        title: "Action Restricted",
-        description: "Asset must be installed before you can enable/disable it",
-        variant: "destructive",
-      })
-      return
-    }
-
-    setIsUpdatingAsset(true)
-    try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const assetDocRef = doc(
-        db,
-        buildingNameWithSuffix,
-        "asset",
-        selectedAsset.assetCategory,
-        selectedAsset.buildingAssetId
-      )
-
-      await updateDoc(assetDocRef, {
-        enabled: enabled,
-      })
-
-      // If disabling the asset and deviceAddress exists, add it to the disabled array in actions
-      if (!enabled && selectedAsset.enabled && selectedAsset.deviceAddress && selectedAsset.deviceAddress.trim() !== "") {
-        try {
-          const actionsDocRef = doc(db, buildingNameWithSuffix, "actions")
-          await updateDoc(actionsDocRef, {
-            disabled: arrayUnion(selectedAsset.deviceAddress.trim()),
-          })
-          console.log("Device address added to disabled array:", selectedAsset.deviceAddress)
-        } catch (actionsError) {
-          console.error("Error updating disabled array:", actionsError)
-          // Don't fail the main operation if actions update fails
-        }
-      }
-
-      setSelectedAsset({ ...selectedAsset, enabled })
-      toast({
-        title: "Success",
-        description: `Asset ${enabled ? "enabled" : "disabled"} successfully`,
-      })
-    } catch (error) {
-      console.error("Error updating enabled status:", error)
-      toast({
-        title: "Error",
-        description: "Failed to update asset status",
-        variant: "destructive",
-      })
-    } finally {
-      setIsUpdatingAsset(false)
-    }
-  }
-
-  const handleResetSimplexFlag = async (flag) => {
-    if (!selectedAsset || !selectedBuilding || userRole !== "admin") {
-      toast({
-        title: "Unauthorized",
-        description: "Only admins can reset panel alarm status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (buildingStatus?.toLowerCase() !== "construction") {
-      toast({
-        title: "Feature Unavailable",
-        description: "Asset controls are only available for buildings with 'Construction' status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    setIsUpdatingAsset(true)
-    try {
-      const next = await resetSimplexFlag(selectedAsset, deviceAddress, flag)
-      setSimplexStatus(next)
-      useAssetFireStatusStore.getState().patchSimplexStatus(
-        selectedAsset.buildingAssetId || selectedAsset.id,
-        deviceAddress,
-        next,
-      )
-      useAssetFireStatusStore.getState().syncFromAssetsList()
-      toast({
-        title: "Success",
-        description: flag === "F" ? "Fire status (F) reset to 0" : "Trouble status (T) reset to 0",
-      })
-    } catch (error) {
-      console.error(`Error resetting simplex ${flag}:`, error)
-      toast({
-        title: "Error",
-        description: error.message || `Failed to reset ${flag === "F" ? "fire" : "trouble"} status`,
-        variant: "destructive",
-      })
-    } finally {
-      setIsUpdatingAsset(false)
-    }
-  }
-
-  // Update device location and address
   const handleUpdateLocation = async () => {
     if (!selectedAsset || !selectedBuilding || userRole !== "admin") {
       toast({
@@ -422,24 +259,6 @@ export function AssetControlModal({
       return
     }
 
-    if (buildingStatus?.toLowerCase() !== "construction") {
-      toast({
-        title: "Feature Unavailable",
-        description: "Asset controls are only available for buildings with 'Construction' status",
-        variant: "destructive",
-      })
-      return
-    }
-
-    if (!selectedAsset.installed) {
-      toast({
-        title: "Action Restricted",
-        description: "Asset must be installed before you can update its location",
-        variant: "destructive",
-      })
-      return
-    }
-
     setIsUpdatingAsset(true)
     try {
       const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
@@ -448,22 +267,17 @@ export function AssetControlModal({
         buildingNameWithSuffix,
         "asset",
         selectedAsset.assetCategory,
-        selectedAsset.buildingAssetId
+        selectedAsset.buildingAssetId,
       )
 
       await updateDoc(assetDocRef, {
         deviceLocation: deviceLocation.trim(),
-        deviceAddress: deviceAddress.trim(),
+        updatedAt: new Date().toISOString(),
       })
 
-      setSelectedAsset({
-        ...selectedAsset,
-        deviceLocation: deviceLocation.trim(),
-        deviceAddress: deviceAddress.trim(),
-      })
       toast({
         title: "Success",
-        description: "Device location and address updated successfully",
+        description: "Device location updated successfully",
       })
     } catch (error) {
       console.error("Error updating device location:", error)
@@ -478,9 +292,6 @@ export function AssetControlModal({
   }
 
   if (!asset) return null
-
-  const panelActive = simplexStatusToActive(simplexStatus.F, simplexStatus.T)
-  const panelDisplay = getFireStatusDisplay(panelActive)
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -498,152 +309,57 @@ export function AssetControlModal({
         </DialogHeader>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
-        {userRole === "admin" && buildingStatus?.toLowerCase() === "construction" ? (
-          <div className="space-y-6">
-            {/* Installation Status */}
-            <div className="space-y-2">
-              <Label className="text-base font-semibold flex items-center gap-2">
-                <CheckCircle className="h-4 w-4" />
-                Installation Status
-              </Label>
-              <div className="flex items-center gap-3 p-3 border rounded-lg">
-                <input
-                  type="checkbox"
-                  id="installed"
-                  checked={installed}
-                  onChange={(e) => handleUpdateInstalled(e.target.checked)}
-                  disabled={isUpdatingAsset}
-                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                />
-                <Label htmlFor="installed" className="text-sm font-medium cursor-pointer flex-1">
-                  Asset is installed
-                </Label>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Current Status: {installed ? "Installed" : "Not Installed"}
-              </p>
-              {!installed && (
-                <Alert className="mt-2">
-                  <AlertDescription className="text-xs">
-                    Other controls are disabled until the asset is marked as installed.
-                  </AlertDescription>
-                </Alert>
-              )}
-            </div>
-
-            {/* Panel fire / trouble status (AssetsList simplexStatus) */}
-            <div className="space-y-2">
-              <Label className="text-base font-semibold flex items-center gap-2">
-                <Flame className="h-4 w-4" />
-                Panel Alarm Status
-              </Label>
-              <div className="rounded-lg border p-3 space-y-1">
-                <p className="text-sm">
-                  F (Fire): <span className="font-mono font-semibold">{simplexStatus.F}</span>
-                  {" · "}
-                  T (Trouble): <span className="font-mono font-semibold">{simplexStatus.T}</span>
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Marker status:{" "}
-                  <span style={{ color: panelDisplay.color }}>{panelDisplay.label}</span>
+          {userRole === "admin" ? (
+            <div className="space-y-5">
+              <div className="space-y-1.5">
+                <Label className="text-sm font-semibold">Device Address</Label>
+                <p className="rounded-lg border bg-muted/40 px-3 py-2 text-sm font-mono">
+                  {deviceAddress || "Not set"}
                 </p>
               </div>
-              <div className="flex gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => handleResetSimplexFlag("F")}
-                  disabled={isUpdatingAsset || Number(simplexStatus.F) === 0}
-                  className="flex-1 border-red-300 text-red-700 hover:bg-red-50 dark:hover:bg-red-950/30"
-                >
-                  <Flame className="mr-2 h-4 w-4" />
-                  Reset Fire (F→0)
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => handleResetSimplexFlag("T")}
-                  disabled={isUpdatingAsset || Number(simplexStatus.T) === 0}
-                  className="flex-1 border-amber-300 text-amber-700 hover:bg-amber-50 dark:hover:bg-amber-950/30"
-                >
-                  <AlertTriangle className="mr-2 h-4 w-4" />
-                  Reset Trouble (T→0)
-                </Button>
-              </div>
-            </div>
 
-            {/* Activity Status (On/Off) */}
-            <div className="space-y-2">
-              <Label className="text-base font-semibold">Activity Status</Label>
-              <div className="flex gap-2">
-                <Button
-                  onClick={() => handleUpdateActivityStatus(1)}
-                  disabled={isUpdatingAsset || selectedAsset?.activityStatus === 1 || !installed}
-                  className={`flex-1 ${
-                    selectedAsset?.activityStatus === 1
-                      ? "bg-green-600 hover:bg-green-700"
-                      : "bg-gray-200 hover:bg-gray-300 text-gray-700"
-                  } ${!installed ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  <Power className="mr-2 h-4 w-4" />
-                  On
-                </Button>
-                <Button
-                  onClick={() => handleUpdateActivityStatus(0)}
-                  disabled={isUpdatingAsset || selectedAsset?.activityStatus === 0 || !installed}
-                  className={`flex-1 ${
-                    selectedAsset?.activityStatus === 0
-                      ? "bg-red-600 hover:bg-red-700"
-                      : "bg-gray-200 hover:bg-gray-300 text-gray-700"
-                  } ${!installed ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  <PowerOff className="mr-2 h-4 w-4" />
-                  Off
-                </Button>
+              <div className="space-y-1.5">
+                <Label className="text-sm font-semibold">Device Description</Label>
+                <p className="rounded-lg border bg-muted/40 px-3 py-2 text-sm">
+                  {deviceDescription || "No description available"}
+                </p>
               </div>
-              <p className="text-xs text-muted-foreground">
-                Current Status: {selectedAsset?.activityStatus === 1 ? "On" : "Off"}
-              </p>
-            </div>
 
-            {/* Enable/Disable */}
-            <div className="space-y-2">
-              <Label className="text-base font-semibold">Enable/Disable Asset</Label>
-              <div className="flex gap-2">
-                <Button
-                  onClick={() => handleUpdateEnabled(true)}
-                  disabled={isUpdatingAsset || selectedAsset?.enabled === true || !installed}
-                  className={`flex-1 ${
-                    selectedAsset?.enabled === true
-                      ? "bg-green-600 hover:bg-green-700"
-                      : "bg-gray-200 hover:bg-gray-300 text-gray-700"
-                  } ${!installed ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  <CheckCircle className="mr-2 h-4 w-4" />
-                  Enable
-                </Button>
-                <Button
-                  onClick={() => handleUpdateEnabled(false)}
-                  disabled={isUpdatingAsset || selectedAsset?.enabled === false || !installed}
-                  className={`flex-1 ${
-                    selectedAsset?.enabled === false
-                      ? "bg-red-600 hover:bg-red-700"
-                      : "bg-gray-200 hover:bg-gray-300 text-gray-700"
-                  } ${!installed ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  <XCircle className="mr-2 h-4 w-4" />
-                  Disable
-                </Button>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Current State: {selectedAsset?.enabled ? "Enabled" : "Disabled"}
-              </p>
-            </div>
-
-            {/* Device Location and Address */}
-            <div className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="deviceLocation" className="text-base font-semibold flex items-center gap-2">
+                <Label className="text-sm font-semibold">Enable / Disable</Label>
+                <div className="flex gap-2">
+                  <Button
+                    onClick={handleEnable}
+                    disabled={isUpdatingAsset || enabled || !deviceAddress.trim()}
+                    className={`flex-1 ${
+                      enabled
+                        ? "bg-green-600 hover:bg-green-700"
+                        : "bg-gray-200 hover:bg-gray-300 text-gray-700"
+                    }`}
+                  >
+                    <CheckCircle className="mr-2 h-4 w-4" />
+                    Enable
+                  </Button>
+                  <Button
+                    onClick={handleDisable}
+                    disabled={isUpdatingAsset || !enabled || !deviceAddress.trim()}
+                    className={`flex-1 ${
+                      !enabled
+                        ? "bg-red-600 hover:bg-red-700"
+                        : "bg-gray-200 hover:bg-gray-300 text-gray-700"
+                    }`}
+                  >
+                    <XCircle className="mr-2 h-4 w-4" />
+                    Disable
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Current state: {enabled ? "Enabled" : "Disabled"}
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="deviceLocation" className="text-sm font-semibold flex items-center gap-2">
                   <MapPin className="h-4 w-4" />
                   Device Location
                 </Label>
@@ -652,59 +368,35 @@ export function AssetControlModal({
                   value={deviceLocation}
                   onChange={(e) => setDeviceLocation(e.target.value)}
                   placeholder="Enter device location"
-                  disabled={isUpdatingAsset || !installed}
-                  className={!installed ? "opacity-50 cursor-not-allowed" : ""}
+                  disabled={isUpdatingAsset}
                 />
+                <Button
+                  onClick={handleUpdateLocation}
+                  disabled={isUpdatingAsset}
+                  className="w-full"
+                >
+                  {isUpdatingAsset ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Updating...
+                    </>
+                  ) : (
+                    <>
+                      <MapPin className="mr-2 h-4 w-4" />
+                      Update Location
+                    </>
+                  )}
+                </Button>
               </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="deviceAddress" className="text-base font-semibold flex items-center gap-2">
-                  <MapPin className="h-4 w-4" />
-                  Device Address
-                </Label>
-                <Input
-                  id="deviceAddress"
-                  value={deviceAddress}
-                  onChange={(e) => setDeviceAddress(e.target.value)}
-                  placeholder="Enter device address"
-                  disabled={isUpdatingAsset || !installed}
-                  className={!installed ? "opacity-50 cursor-not-allowed" : ""}
-                />
-              </div>
-
-              <Button
-                onClick={handleUpdateLocation}
-                disabled={isUpdatingAsset || !installed}
-                className={`w-full ${!installed ? "opacity-50 cursor-not-allowed" : ""}`}
-              >
-                {isUpdatingAsset ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Updating...
-                  </>
-                ) : (
-                  <>
-                    <MapPin className="mr-2 h-4 w-4" />
-                    Update Location & Address
-                  </>
-                )}
-              </Button>
             </div>
-          </div>
-        ) : (
-          <div>
+          ) : (
             <Alert>
-              <AlertTitle>
-                {userRole !== "admin" ? "Access Restricted" : "Feature Unavailable"}
-              </AlertTitle>
+              <AlertTitle>Access Restricted</AlertTitle>
               <AlertDescription>
-                {userRole !== "admin"
-                  ? "Only administrators can control assets. Please contact an admin for assistance."
-                  : `Asset controls are only available for buildings with 'Construction' status. Current building status: ${buildingStatus || "Unknown"}`}
+                Only administrators can control assets. Please contact an admin for assistance.
               </AlertDescription>
             </Alert>
-          </div>
-        )}
+          )}
         </div>
 
         <DialogFooter className="shrink-0 border-t px-6 py-4">

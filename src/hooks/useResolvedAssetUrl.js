@@ -20,7 +20,7 @@ function canResolveSynchronously(source) {
     return true;
   }
   // /local/ paths need the desktop API or Tauri convertFileSrc
-  if (source.startsWith("/local/") || isDesktop()) return false;
+  if (source.startsWith("/local/")) return false;
   return true;
 }
 

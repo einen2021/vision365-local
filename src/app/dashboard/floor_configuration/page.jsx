@@ -3,14 +3,6 @@
 import { useState, useEffect } from "react";
 import { AppSidebar } from "@/components/app-sidebar";
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
-import {
-  Breadcrumb,
-  BreadcrumbItem,
-  BreadcrumbLink,
-  BreadcrumbList,
-  BreadcrumbPage,
-  BreadcrumbSeparator,
-} from "@/components/ui/breadcrumb";
 import { Separator } from "@/components/ui/separator";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -220,21 +212,9 @@ export default function BuildingOverviewSetupPage() {
     <SidebarProvider>
       <AppSidebar />
       <SidebarInset>
-        <header className="flex h-16 shrink-0 items-center gap-2 px-4 md:px-8">
+        <header className="flex min-h-16 shrink-0 items-center gap-3 py-2 px-4 md:px-8">
           <SidebarTrigger className="-ml-1" />
           <ClientModeToggle />
-          <Separator orientation="vertical" className="mr-2 h-4" />
-          <Breadcrumb>
-            <BreadcrumbList>
-              <BreadcrumbItem className="hidden md:block">
-                <BreadcrumbLink href="/dashboard">Home</BreadcrumbLink>
-              </BreadcrumbItem>
-              <BreadcrumbSeparator className="hidden md:block" />
-              <BreadcrumbItem>
-                <BreadcrumbPage>Building Overview Setup</BreadcrumbPage>
-              </BreadcrumbItem>
-            </BreadcrumbList>
-          </Breadcrumb>
           <div className="ml-auto">
             <FirePanelStatusBadges />
           </div>

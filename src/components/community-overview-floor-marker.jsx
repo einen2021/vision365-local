@@ -2,6 +2,7 @@
 
 import { memo } from "react";
 import { getMarkerImageSrc, handleImageError } from "@/lib/assetIcons";
+import { useAssetTypeIcons } from "@/contexts/AssetTypeIconsContext";
 import {
   getAssetMarkerTooltip,
   getFireBorderColor,
@@ -20,6 +21,7 @@ function CommunityOverviewFloorMarkerInner({
   live = true,
   onClick,
 }) {
+  const { overrides } = useAssetTypeIcons();
   const deviceAddr = resolveAssetDeviceAddress(mapping) || mapping.deviceAddress || "";
   const assetId = mapping.assetsListId || mapping.id || mapping.buildingAssetId;
   const active = useAssetFireActive(assetId, deviceAddr, fallbackActive, live);
@@ -68,7 +70,7 @@ function CommunityOverviewFloorMarkerInner({
         />
       ) : null}
       <img
-        src={getMarkerImageSrc(mapping)}
+        src={getMarkerImageSrc(mapping, overrides)}
         alt={mapping.assetName || "asset"}
         title={markerTooltip}
         className="w-6 h-6 rounded-full border-2 border-white shadow-lg object-cover"

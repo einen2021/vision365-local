@@ -26,14 +26,48 @@ export const useFirePanelStore = create((set, get) => ({
   lastError: "",
   loading: false,
   rawResponse: "",
+  /** When true, the app keeps retrying telnet until connected (disabled on manual disconnect). */
+  autoReconnect: true,
 
   setHost: (host) => set({ host }),
   setPort: (port) => set({ port }),
 
+  /** Force UI in sync when the server socket is gone. */
+  markDisconnected: (errorMessage = "") =>
+    set((state) => ({
+      connected: false,
+      loading: false,
+      lastError: errorMessage || state.lastError,
+    })),
+
+  /** Retry connect immediately (no delay) until connected or autoReconnect is off. */
+  ensureConnected: async () => {
+    if (get().connected) return true;
+    if (!get().autoReconnect) return false;
+
+    while (!get().connected && get().autoReconnect) {
+      await get().syncStatus();
+      if (get().connected) return true;
+
+      if (!get().loading) {
+        await get().connect();
+        if (get().connected) return true;
+      }
+
+      // Yield to the event loop without an intentional retry delay
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    return get().connected;
+  },
+
   syncStatus: async () => {
     try {
       const res = await apiFetch("/api/telnet/fire-panel/status");
-      if (!res.ok) return;
+      if (!res.ok) {
+        get().markDisconnected();
+        return;
+      }
 
       const status = await parseJsonResponse(res);
       if (status.connected) {
@@ -45,8 +79,12 @@ export const useFirePanelStore = create((set, get) => ({
           port: status.port ? String(status.port) : get().port,
           lastError: "",
         });
-      } else if (!get().loading) {
-        set({ connected: false });
+      } else {
+        // Always trust server — do not keep stale "connected" during reconnect attempts
+        set({
+          connected: false,
+          loading: get().loading,
+        });
       }
     } catch {
       // API not available yet — no error banner on startup
@@ -61,6 +99,7 @@ export const useFirePanelStore = create((set, get) => ({
       loading: true,
       lastError: "",
       rawResponse: "",
+      autoReconnect: true,
     });
 
     try {
@@ -83,13 +122,17 @@ export const useFirePanelStore = create((set, get) => ({
       });
       return { ok: true };
     } catch (error) {
-      set({ loading: false, lastError: error.message || "Failed to connect" });
+      set({
+        connected: false,
+        loading: false,
+        lastError: error.message || "Failed to connect",
+      });
       return { ok: false, error: error.message };
     }
   },
 
   disconnect: async () => {
-    set({ loading: true });
+    set({ loading: true, autoReconnect: false });
 
     try {
       await apiFetch("/api/telnet/fire-panel/disconnect", { method: "POST" });
@@ -98,6 +141,7 @@ export const useFirePanelStore = create((set, get) => ({
         rawResponse: "",
         lastError: "",
         loading: false,
+        autoReconnect: false,
       });
       return { ok: true };
     } catch (error) {
@@ -129,11 +173,25 @@ export const useFirePanelStore = create((set, get) => ({
         body: JSON.stringify({ command: trimmed, timeoutMs }),
       });
       const data = await parseJsonResponse(res);
-      if (!res.ok) throw new Error(data.error || "Command failed");
+      if (!res.ok) {
+        const message = data.error || "Command failed";
+        if (/not connected/i.test(message)) {
+          get().markDisconnected(message);
+          throw new Error(message);
+        }
+        throw new Error(message);
+      }
 
       set({ rawResponse: data.response || "", loading: false });
       return { ok: true };
     } catch (error) {
+      if (/not connected/i.test(error.message || "")) {
+        const connected = await get().ensureConnected();
+        if (connected) {
+          return get().sendCommand(command);
+        }
+        get().markDisconnected(error.message);
+      }
       set({ loading: false, lastError: error.message || "Failed to send command" });
       return { ok: false };
     }
