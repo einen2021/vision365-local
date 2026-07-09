@@ -19,20 +19,22 @@ export function isListResponseComplete(response) {
   return /_DNE/i.test(String(response));
 }
 
-export function extractCVal(response) {
-  const regex =
-    /^-?\s*(cshow a([012]) cval)\r?\n+\r?~A\2\s*\r?\n+CVAL=(\d+)\r?\n+-?\s*$/i;
+/**
+ * Parse CVAL from panel response. Accepts partial/garbled telnet output as long as
+ * CVAL=<number> is present (strict full-line regex was failing on desktop).
+ */
+export function extractCVal(response, expectedCmd = "") {
+  const text = String(response || "");
+  const cvalMatch = text.match(/CVAL\s*=\s*(\d+)/i);
+  if (!cvalMatch) return null;
 
-  const match = response.trim().match(regex);
-
-  if (!match) {
-    return null;
-  }
+  const panelMatch = text.match(/~A\s*([012])/i);
+  const cmdMatch = String(expectedCmd).match(/a([012])/i);
 
   return {
-    command: match[1].toLowerCase(),
-    panel: Number(match[2]),
-    cval: Number(match[3]),
+    command: String(expectedCmd || cvalMatch.input || "").toLowerCase(),
+    panel: panelMatch ? Number(panelMatch[1]) : cmdMatch ? Number(cmdMatch[1]) : 0,
+    cval: Number(cvalMatch[1]),
   };
 }
 

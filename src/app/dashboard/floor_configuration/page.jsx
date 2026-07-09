@@ -27,6 +27,7 @@ import { CommunityBuildingSelect } from "@/components/floor-plan/community-build
 import { FaqHelpButton } from "@/components/faq-help-button";
 import { sanitizeFloorPlanId, clickToNaturalCoords, buildBuildingFloorMarkers } from "@/lib/nestedFloorPlan";
 import { PlanImageCanvas } from "@/components/floor-plan/plan-image-canvas";
+import { FloorPlanPlacementCsvActions } from "@/components/floor-plan/floor-plan-placement-csv-actions";
 
 const ClientModeToggle = dynamic(
   () => import("@/components/theme-toggle").then((m) => ({ default: m.ModeToggle })),
@@ -246,11 +247,15 @@ export default function BuildingOverviewSetupPage() {
             <>
               <div className="grid gap-6 lg:grid-cols-2">
                 <Card className="lg:col-span-2">
-                  <CardHeader>
+                  <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between space-y-0">
                     <CardTitle className="flex items-center gap-2 text-lg">
                       <ImageIcon className="h-5 w-5" />
                       Building Image & Floor Buttons
                     </CardTitle>
+                    <FloorPlanPlacementCsvActions
+                      buildingName={selectedBuilding}
+                      onRestored={loadOverview}
+                    />
                   </CardHeader>
                   <CardContent className="space-y-4">
                     <Input type="file" accept="image/*" onChange={handleImageUpload} />

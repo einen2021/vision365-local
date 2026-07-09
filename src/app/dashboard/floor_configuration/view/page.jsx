@@ -25,6 +25,7 @@ import { AssetTypeIconSettings } from "@/components/floor-plan/asset-type-icon-s
 import { normalizeAssetTypeKey } from "@/lib/assetIcons";
 import { AssetControlModal } from "@/components/asset-control-modal";
 import { FaqHelpButton } from "@/components/faq-help-button";
+import { FloorPlanPlacementCsvActions } from "@/components/floor-plan/floor-plan-placement-csv-actions";
 import { NAV_LEVELS, buildBreadcrumbs, buildBuildingFloorMarkers, filterPlacedNavMarkers } from "@/lib/nestedFloorPlan";
 import { normalizeBuildingName } from "@/lib/buildingNames";
 import {
@@ -331,7 +332,13 @@ export default function ViewNestedFloorPlansPage() {
                     </p>
                   ) : null}
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  {level === NAV_LEVELS.BUILDING ? (
+                    <FloorPlanPlacementCsvActions
+                      buildingName={selectedBuilding}
+                      onRestored={loadBuildingData}
+                    />
+                  ) : null}
                   {level !== NAV_LEVELS.BUILDING ? (
                     <AssetTypeIconSettings extraTypes={extraAssetTypeKeys} />
                   ) : null}

@@ -46,10 +46,10 @@ export function useResolvedAssetUrl(url) {
     };
 
     async function resolve() {
-      revokeBlob();
       const source = normalizeLocalAssetUrl(url || "");
 
       if (!source) {
+        revokeBlob();
         if (active) setResolved("");
         return;
       }
@@ -57,6 +57,7 @@ export function useResolvedAssetUrl(url) {
       if (isDesktop() && source.startsWith("/local/")) {
         const assetUrl = await resolveDesktopAssetUrl(source);
         if (!active) return;
+        revokeBlob();
         if (assetUrl.startsWith("blob:")) {
           blobUrlRef.current = assetUrl;
         }
@@ -70,6 +71,7 @@ export function useResolvedAssetUrl(url) {
       if (source.startsWith("/local/")) {
         const assetUrl = await resolveDesktopAssetUrl(source);
         if (!active) return;
+        revokeBlob();
         if (assetUrl.startsWith("blob:")) {
           blobUrlRef.current = assetUrl;
         }
@@ -77,6 +79,7 @@ export function useResolvedAssetUrl(url) {
         return;
       }
 
+      revokeBlob();
       setResolved(resolveAssetUrl(source));
     }
 

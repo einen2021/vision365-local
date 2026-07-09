@@ -55,13 +55,27 @@ export function findSubsectionMarker(subsectionMarkers, subsectionId) {
 
 /** Convert click position on displayed image to natural image coordinates. */
 export function clickToNaturalCoords(event, imageRef, actualImageDimensions) {
-  if (!imageRef.current || !actualImageDimensions.naturalWidth) return null;
-
-  const rect = imageRef.current.getBoundingClientRect();
   const clientX = event.clientX ?? event.changedTouches?.[0]?.clientX;
   const clientY = event.clientY ?? event.changedTouches?.[0]?.clientY;
   if (clientX == null || clientY == null) return null;
+  return clientPointToNaturalCoords(
+    clientX,
+    clientY,
+    imageRef,
+    actualImageDimensions,
+  );
+}
 
+/** Convert a screen point to natural / relative image coordinates. */
+export function clientPointToNaturalCoords(
+  clientX,
+  clientY,
+  imageRef,
+  actualImageDimensions,
+) {
+  if (!imageRef?.current || !actualImageDimensions?.naturalWidth) return null;
+
+  const rect = imageRef.current.getBoundingClientRect();
   const clickX = clientX - rect.left - actualImageDimensions.offsetX;
   const clickY = clientY - rect.top - actualImageDimensions.offsetY;
 
@@ -84,6 +98,133 @@ export function clickToNaturalCoords(event, imageRef, actualImageDimensions) {
   const relativeY = clickY / actualImageDimensions.height;
 
   return { x, y, relativeX, relativeY };
+}
+
+/** Screen position (within image element) for a pointer point, clamped to the plan image. */
+export function clientPointToMarkerScreenPos(clientX, clientY, imageRef, dims) {
+  if (!imageRef?.current || !dims?.width) return null;
+
+  const rect = imageRef.current.getBoundingClientRect();
+  const clickX = clientX - rect.left - dims.offsetX;
+  const clickY = clientY - rect.top - dims.offsetY;
+  const clampedX = Math.min(dims.width, Math.max(0, clickX));
+  const clampedY = Math.min(dims.height, Math.max(0, clickY));
+
+  return {
+    left: clampedX + dims.offsetX,
+    top: clampedY + dims.offsetY,
+  };
+}
+
+/** Min/max x/y from a list of coordinate points. */
+export function computeCoordinateBounds(points = []) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  for (const point of points) {
+    const x = typeof point?.x === "number" ? point.x : Number(point?.x);
+    const y = typeof point?.y === "number" ? point.y : Number(point?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  }
+
+  if (!Number.isFinite(minX)) return null;
+  return { minX, minY, maxX, maxY };
+}
+
+/**
+ * Map CSV / DXF x,y into image-relative placement (0–1) and natural pixel coords.
+ * When CSV extents exceed the image, normalizes using the CSV bounding box.
+ * DXF uses Y-up; images use Y-down — flipY converts between them (default: true).
+ */
+export function csvCoordsToRelativePlacement(x, y, options = {}) {
+  const {
+    bounds = null,
+    imageNaturalWidth = 0,
+    imageNaturalHeight = 0,
+    flipY = true,
+  } = options;
+  const rawX = typeof x === "number" ? x : Number(x);
+  const rawY = typeof y === "number" ? y : Number(y);
+  if (!Number.isFinite(rawX) || !Number.isFinite(rawY)) return null;
+
+  const hasImage = imageNaturalWidth > 0 && imageNaturalHeight > 0;
+  const hasBounds = bounds && Number.isFinite(bounds.minX);
+  let relativeX;
+  let relativeY;
+
+  if (hasImage && hasBounds) {
+    const fitsImage =
+      bounds.minX >= 0 &&
+      bounds.minY >= 0 &&
+      bounds.maxX <= imageNaturalWidth &&
+      bounds.maxY <= imageNaturalHeight;
+
+    if (fitsImage) {
+      relativeX = rawX / imageNaturalWidth;
+      relativeY = rawY / imageNaturalHeight;
+    } else {
+      const spanX = bounds.maxX - bounds.minX || 1;
+      const spanY = bounds.maxY - bounds.minY || 1;
+      relativeX = (rawX - bounds.minX) / spanX;
+      relativeY = (rawY - bounds.minY) / spanY;
+    }
+  } else if (hasBounds) {
+    const spanX = bounds.maxX - bounds.minX || 1;
+    const spanY = bounds.maxY - bounds.minY || 1;
+    relativeX = (rawX - bounds.minX) / spanX;
+    relativeY = (rawY - bounds.minY) / spanY;
+  } else if (hasImage) {
+    relativeX = rawX / imageNaturalWidth;
+    relativeY = rawY / imageNaturalHeight;
+  } else {
+    return null;
+  }
+
+  relativeX = Math.min(1, Math.max(0, relativeX));
+  relativeY = Math.min(1, Math.max(0, relativeY));
+
+  // DXF / CAD exports: origin bottom-left, Y increases upward.
+  // HTML images: origin top-left, Y increases downward.
+  if (flipY) {
+    relativeY = 1 - relativeY;
+  }
+
+  return {
+    relativeX,
+    relativeY,
+    x: hasImage ? Math.round(relativeX * imageNaturalWidth) : Math.round(rawX),
+    y: hasImage ? Math.round(relativeY * imageNaturalHeight) : Math.round(rawY),
+  };
+}
+
+/** Load natural pixel size of a floor-plan image (browser / desktop). */
+export async function loadImageNaturalDimensions(imageUrl) {
+  if (!imageUrl) return null;
+
+  const { normalizeLocalAssetUrl, resolveDesktopAssetUrl } = await import("@/lib/apiClient");
+  const src = await resolveDesktopAssetUrl(normalizeLocalAssetUrl(imageUrl));
+
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      if (!img.naturalWidth || !img.naturalHeight) {
+        reject(new Error("Plan image has no readable dimensions"));
+        return;
+      }
+      resolve({
+        naturalWidth: img.naturalWidth,
+        naturalHeight: img.naturalHeight,
+      });
+    };
+    img.onerror = () => reject(new Error("Could not load plan image to read dimensions"));
+    img.src = src;
+  });
 }
 
 /** Convert natural image coordinates to screen position for marker overlay. */
@@ -243,7 +384,12 @@ export function buildNestedPlacementContext({
     subsectionName,
     subsectionImageUrl: subsection?.imageUrl || "",
     floorDetails: floor
-      ? { id: floor.id, name: floor.name, imageUrl: floor.imageUrl || "", order: floor.order }
+      ? {
+          id: floor.id,
+          name: floor.name,
+          imageUrl: floor.imageUrl || "",
+          order: floor.order ?? 0,
+        }
       : null,
     sectionDetails: section
       ? { id: section.id, name: section.name, imageUrl: section.imageUrl || "" }

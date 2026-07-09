@@ -90,6 +90,14 @@ export function buildClearNestedFloorMapPositionPayload(
   }
 }
 
+/** Clears nested placement plus 3D coordinates from a building / AssetsList asset. */
+export function buildClearAssetPlacementPayload(now = new Date().toISOString()) {
+  return {
+    ...buildClearNestedFloorMapPositionPayload(now),
+    coordinates: null,
+  }
+}
+
 export function getAssetsListIdFromMapping(mapping) {
   return (
     mapping?.assetsListId ||
@@ -277,7 +285,7 @@ export async function loadFloorMapAssetsFromAssetsList(db, buildingName, floorPl
   return mappings
 }
 
-function pickerAssetMatchesMapping(asset = {}, mapping = {}) {
+export function pickerAssetMatchesMapping(asset = {}, mapping = {}) {
   const mode = asset.assetMode || "general"
   const mappingMode = mapping.assetMode || "general"
   const assetsListId = asset.assetsListId || asset.id
@@ -287,12 +295,13 @@ function pickerAssetMatchesMapping(asset = {}, mapping = {}) {
     if (assetsListId && mappingListId && assetsListId === mappingListId) return true
   }
 
-  if (mode === "building" && mappingMode === "building") {
+  if (mode === "building" || mappingMode === "building" || mapping.buildingAssetId) {
+    const buildingId = mapping.buildingAssetId || mapping.id
     if (
       asset.id &&
-      mapping.buildingAssetId &&
-      asset.id === mapping.buildingAssetId &&
-      asset.category === mapping.category
+      buildingId &&
+      asset.id === buildingId &&
+      (!asset.category || !mapping.category || asset.category === mapping.category)
     ) {
       return true
     }

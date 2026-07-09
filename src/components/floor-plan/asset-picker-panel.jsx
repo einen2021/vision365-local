@@ -40,7 +40,10 @@ export function AssetPickerPanel({
   placedCount,
   placedMappings = [],
   onRemovePlaced,
+  onDeletePlacement,
+  deletingPlacementKey = null,
   onSave,
+  onClearAllAndSave,
   isSaving,
   saveLabel = "Save Assets",
   buildingName,
@@ -141,14 +144,31 @@ export function AssetPickerPanel({
                 return (
                   <div
                     key={`placed-${assetMode}-${a.id}`}
-                    className="rounded border bg-muted/20 px-2 py-1.5"
+                    className="flex items-center gap-2 rounded border bg-muted/20 px-2 py-1.5"
                   >
-                    <p className="truncate text-xs font-medium">
-                      {getAssetPlacementLabel(a)}
-                    </p>
-                    <p className="text-[11px] leading-snug text-muted-foreground">
-                      {location || "Placement location unknown"}
-                    </p>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-xs font-medium">
+                        {getAssetPlacementLabel(a)}
+                      </p>
+                      <p className="text-[11px] leading-snug text-muted-foreground">
+                        {location || "Placement location unknown"}
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 w-7 shrink-0 p-0 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                      title="Clear building placement"
+                      disabled={deletingPlacementKey === `${assetMode}-${a.id}`}
+                      onClick={() => onDeletePlacement?.(a)}
+                    >
+                      {deletingPlacementKey === `${assetMode}-${a.id}` ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-3.5 w-3.5" />
+                      )}
+                    </Button>
                   </div>
                 );
               })}
@@ -246,6 +266,19 @@ export function AssetPickerPanel({
       ) : null}
 
       <p className="text-xs text-muted-foreground">{placedCount} asset(s) placed</p>
+
+      {placedMappings.length > 0 && onClearAllAndSave ? (
+        <Button
+          type="button"
+          variant="outline"
+          className="w-full text-destructive hover:bg-destructive/10 hover:text-destructive"
+          onClick={onClearAllAndSave}
+          disabled={isSaving}
+        >
+          <Trash2 className="mr-2 h-4 w-4" />
+          Remove all and save
+        </Button>
+      ) : null}
 
       <Button className="w-full" onClick={onSave} disabled={isSaving}>
         {isSaving ? (

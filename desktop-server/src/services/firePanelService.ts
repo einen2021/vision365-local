@@ -7,6 +7,7 @@ const LIST_COMMAND_TIMEOUT_MS = 15000;
 const BULK_COMMAND_TIMEOUT_MS = 60000;
 /** Resolve when no bytes arrive for this long (panel finished sending) */
 const IDLE_COMPLETE_MS = 100;
+const CVAL_IDLE_COMPLETE_MS = 450;
 const LIST_IDLE_COMPLETE_MS = 250;
 
 let client: net.Socket | null = null;
@@ -42,6 +43,7 @@ function timeoutForCommand(command: string, overrideMs?: number) {
 
 function idleMsForCommand(command: string) {
   const trimmed = cleanCommandText(command).toLowerCase();
+  if (isCvalCommand(command)) return CVAL_IDLE_COMPLETE_MS;
   if (
     trimmed.startsWith("list") ||
     trimmed.includes("cshow *") ||
@@ -59,7 +61,7 @@ function isDefiniteComplete(response: string) {
 function isQuickComplete(command: string, response: string) {
   const trimmed = cleanCommandText(command).toLowerCase();
   if (trimmed.startsWith("cshow") && trimmed.includes("cval")) {
-    return /CVAL=\d+/i.test(response);
+    return /CVAL\s*=\s*\d+/i.test(response);
   }
   if (trimmed.startsWith("login")) {
     return /ACCESS GRANTED/i.test(response) || /INVALID PASSCODE/i.test(response);
@@ -78,7 +80,7 @@ function isCvalCommand(command: string) {
 
 function logCvalPresence(command: string, response: string) {
   if (!isCvalCommand(command)) return;
-  const match = response.match(/CVAL=(\d+)/i);
+  const match = response.match(/CVAL\s*=\s*(\d+)/i);
   if (match) {
     addLog(`CVAL present in response: CVAL=${match[1]}`);
   } else {
@@ -207,6 +209,11 @@ function sendCommandOnce(command: string, timeoutMs?: number) {
         if (response.length === 0) return;
         // List output ends with _DNE — keep reading until the panel marks done
         if (isListCommand(command) && !isDefiniteComplete(response)) {
+          return;
+        }
+        // CVAL responses often arrive in multiple chunks — wait until CVAL= is present
+        if (isCvalCommand(command) && !/CVAL\s*=\s*\d+/i.test(response)) {
+          scheduleIdleComplete();
           return;
         }
         finish("(idle)");

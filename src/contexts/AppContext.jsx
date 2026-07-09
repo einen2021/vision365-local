@@ -146,6 +146,27 @@ export const AppProvider = ({ children }) => {
   const pendingMonitorLogsRef = useRef([]);
   const monitorLogFlushTimerRef = useRef(null);
 
+  /** Push polled CVAL totals into React state immediately (header badges). */
+  const syncFirePanelCountsToUi = useCallback((counts) => {
+    const next = {
+      totalFire: Number(counts.totalFire) || 0,
+      totalSupervisory: Number(counts.totalSupervisory) || 0,
+      totalTrouble: Number(counts.totalTrouble) || 0,
+      lastPanelSync: firePanelStateRef.current?.lastPanelSync ?? null,
+    };
+    const prev = firePanelStateRef.current;
+    if (
+      prev &&
+      prev.totalFire === next.totalFire &&
+      prev.totalSupervisory === next.totalSupervisory &&
+      prev.totalTrouble === next.totalTrouble
+    ) {
+      return;
+    }
+    firePanelStateRef.current = next;
+    setFirePanelState(next);
+  }, []);
+
   const firePanelConnected = useFirePanelStore((s) => s.connected);
 
   const flushFirePanelMonitorLogs = useCallback(() => {
@@ -252,11 +273,19 @@ export const AppProvider = ({ children }) => {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Failed to save panel state");
-    if (!data.unchanged) {
-      setFirePanelState(data);
-      firePanelStateRef.current = data;
-    }
-    return data;
+
+    const nextState = {
+      totalFire: Number(data.totalFire ?? payload.totalFire) || 0,
+      totalSupervisory: Number(data.totalSupervisory ?? payload.totalSupervisory) || 0,
+      totalTrouble: Number(data.totalTrouble ?? payload.totalTrouble) || 0,
+      lastPanelSync:
+        typeof data.lastPanelSync === "string"
+          ? data.lastPanelSync
+          : firePanelStateRef.current?.lastPanelSync ?? null,
+    };
+    firePanelStateRef.current = nextState;
+    setFirePanelState(nextState);
+    return { ...data, ...nextState };
   }, []);
 
   const stopFirePanelMonitoring = useCallback(() => {
@@ -351,8 +380,16 @@ export const AppProvider = ({ children }) => {
           totalTrouble: 0,
         };
         try {
-          const response = await sendFirePanelCommand(cmd);
-          const parsed = extractCVal(response);
+          let response = await sendFirePanelCommand(cmd);
+          let parsed = extractCVal(response, cmd);
+
+          // One quick retry when the panel returns a partial/garbled chunk
+          if (!parsed || !Number.isFinite(parsed.cval)) {
+            await new Promise((r) => setTimeout(r, 250));
+            response = await sendFirePanelCommand(cmd);
+            parsed = extractCVal(response, cmd);
+          }
+
           const cval = parsed?.cval;
 
           if (!Number.isFinite(cval)) {
@@ -363,9 +400,9 @@ export const AppProvider = ({ children }) => {
             );
           } else {
             counts[field] = cval;
-          appendFirePanelMonitorLog(
-            `<< ${response.trim() || "(empty)"} (CVAL=${counts[field]})`,
-          );
+            appendFirePanelMonitorLog(
+              `<< ${response.trim() || "(empty)"} (CVAL=${counts[field]})`,
+            );
           }
         } catch (error) {
           allCvalsParsed = false;
@@ -387,9 +424,9 @@ export const AppProvider = ({ children }) => {
       if (!isMonitorLoopActive()) break;
 
       if (!allCvalsParsed) {
-        appendFirePanelMonitorLog("CVAL incomplete — skip save this cycle");
-        await new Promise((r) => setTimeout(r, MONITOR_INTERVAL_MS));
-        continue;
+        appendFirePanelMonitorLog(
+          "CVAL partially parsed — updating UI and saving best-known totals",
+        );
       }
 
       const previous = firePanelStateRef.current ?? {
@@ -397,6 +434,10 @@ export const AppProvider = ({ children }) => {
         totalSupervisory: 0,
         totalTrouble: 0,
       };
+
+      // Header badges read firePanelState — sync immediately after each poll cycle
+      syncFirePanelCountsToUi(counts);
+
       const incrementedValues = CVAL_COMMANDS.filter(
         ({ field }) => counts[field] > previous[field],
       );
@@ -538,6 +579,7 @@ export const AppProvider = ({ children }) => {
     sendFirePanelListCommandAndWait,
     showFireAlert,
     waitWhileMonitorPaused,
+    syncFirePanelCountsToUi,
   ]);
 
   const startFirePanelMonitoring = useCallback(async () => {
@@ -575,6 +617,8 @@ export const AppProvider = ({ children }) => {
       const res = await apiFetch("/api/telnet/fire-panel/panel-state");
       if (!res.ok) return;
       const data = await res.json();
+      // Live monitor loop owns CVAL display — avoid stale DB reads overwriting polled values
+      if (isMonitorLoopActive()) return;
       setFirePanelState(data);
       firePanelStateRef.current = data;
     } catch {
@@ -589,6 +633,13 @@ export const AppProvider = ({ children }) => {
     const timer = setInterval(fetchFirePanelState, PANEL_STATE_REFRESH_MS);
     return () => clearInterval(timer);
   }, [fetchFirePanelState]);
+
+  // Keep monitoring badge in sync after reload when session still expects monitoring
+  useEffect(() => {
+    if (isMonitorLoopActive() || isFirePanelMonitoringPersisted()) {
+      setFirePanelMonitoring(true);
+    }
+  }, []);
 
   // Resume monitoring after reload/navigation when panel is still connected
   useEffect(() => {

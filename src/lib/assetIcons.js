@@ -13,6 +13,7 @@ export const CATEGORY_ICONS = {
 
 /** Common fire / life-safety item types mapped to bundled icons. */
 export const ITEM_TYPE_ICONS = {
+  "ALARM RELAY": "/asset/icons/control-unit.svg",
   "AUXILIARY RELAY": "/asset/icons/control-unit.svg",
   "CONTROL MODULE": "/asset/icons/control-unit.svg",
   "MONITOR MODULE": "/asset/icons/control-unit.svg",
@@ -60,18 +61,23 @@ export function resolveAssetTypeFromMapping(mapping = {}) {
     mapping.itemType,
     mapping.assetType,
     mapping.type,
+    mapping.system,
     mapping.assetName,
+    mapping.name,
     mapping.category,
     mapping.categoryKey,
-    mapping.system,
+    mapping.description,
   ];
 
   for (const candidate of candidates) {
     const key = normalizeAssetTypeKey(candidate);
-    if (key) return key;
+    if (!key) continue;
+    // Skip values that look like device addresses, not equipment types.
+    if (/^\d+:/.test(key) || /^M\d+-\d+/i.test(key)) continue;
+    return key;
   }
 
-  return "";
+  return normalizeAssetTypeKey(mapping.assetName || mapping.name || "");
 }
 
 function lookupBuiltinIcon(typeKey) {
@@ -134,7 +140,8 @@ export function getIconForCategory(category, customImageUrl = null, overrides = 
 
 /** Resolve floor-map marker image from mapping fields. */
 export function getMarkerImageSrc(mapping, overrides = assetTypeIconOverrides) {
-  if (mapping?.customImageUrl) return mapping.customImageUrl;
+  const custom = String(mapping?.customImageUrl || "").trim();
+  if (custom) return custom;
   return getIconForAssetType(resolveAssetTypeFromMapping(mapping), null, overrides);
 }
 

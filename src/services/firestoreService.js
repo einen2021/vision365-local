@@ -27,7 +27,9 @@ import {
   buildingsMatch,
   buildClearFloorMapPositionPayload,
   buildClearNestedFloorMapPositionPayload,
+  buildClearAssetPlacementPayload,
   buildNestedFloorMapAssetsListUpdate,
+  pickerAssetMatchesMapping,
   getFloorMapName,
   hasFloorPosition,
   loadFloorMapAssetsFromAssetsList,
@@ -1276,33 +1278,206 @@ class FirestoreService {
   }
 
   static async _syncNestedMappingsToSourceAssets(buildingName, mappings) {
+    const operations = this._buildNestedMappingSyncOperations(buildingName, mappings);
+    await this._commitWriteBatches(operations);
+  }
+
+  static _stripUndefinedDeep(value) {
+    if (value === undefined) return undefined;
+    if (value === null || typeof value !== "object") return value;
+    if (Array.isArray(value)) {
+      return value
+        .map((item) => this._stripUndefinedDeep(item))
+        .filter((item) => item !== undefined);
+    }
+
+    const cleaned = {};
+    Object.entries(value).forEach(([key, nestedValue]) => {
+      if (nestedValue === undefined) return;
+      const nextValue = this._stripUndefinedDeep(nestedValue);
+      if (nextValue !== undefined) cleaned[key] = nextValue;
+    });
+    return cleaned;
+  }
+
+  static _dedupeAssetMappingsForSave(mappings = []) {
+    const byKey = new Map();
+
+    mappings.forEach((mapping, index) => {
+      let key = "";
+      if (mapping.assetMode === "general") {
+        key = `general::${mapping.assetsListId || mapping.id || ""}`;
+      } else if (mapping.assetMode === "building") {
+        key = `building::${mapping.category || ""}::${mapping.buildingAssetId || ""}`;
+      }
+
+      if (!key || key.endsWith("::") || key === "general::") {
+        key = `row::${mapping.id || index}`;
+      }
+
+      byKey.set(key, mapping);
+    });
+
+    return Array.from(byKey.values());
+  }
+
+  static _dedupeSyncOperations(operations = []) {
+    const byRef = new Map();
+    operations.forEach((operation) => {
+      byRef.set(operation.ref.path, operation);
+    });
+    return Array.from(byRef.values());
+  }
+
+  static _mappingFirestoreDocumentId(mapping, index) {
+    const stableKey =
+      mapping.assetsListId ||
+      mapping.buildingAssetId ||
+      mapping.id ||
+      `idx${index}`;
+    const sanitized = this._sanitizeMappingDocumentId(stableKey) || `idx${index}`;
+    return `m_${index}_${sanitized}`.substring(0, 150);
+  }
+
+  static _sanitizeMappingDocumentId(id) {
+    return String(id || "")
+      .replace(/[\/\\]/g, "_")
+      .replace(/[()]/g, "")
+      .replace(/\s+/g, "_")
+      .replace(/[^a-zA-Z0-9_-]/g, "")
+      .substring(0, 100);
+  }
+
+  static _buildNestedMappingSyncOperations(
+    buildingName,
+    mappings,
+    now = new Date().toISOString(),
+  ) {
     const coll = buildingCollectionName(buildingName);
-    const now = new Date().toISOString();
-    const updates = [];
+    const operations = [];
 
     (mappings || []).forEach((mapping) => {
-      const payload = buildNestedFloorMapAssetsListUpdate({ mapping, now });
+      const payload = this._stripUndefinedDeep(
+        buildNestedFloorMapAssetsListUpdate({ mapping, now }),
+      );
 
       if (mapping.assetMode === "general" && mapping.assetsListId) {
-        updates.push(
-          updateDoc(doc(db, "AssetsList", mapping.assetsListId), payload),
-        );
+        operations.push({
+          type: "set",
+          ref: doc(db, "AssetsList", mapping.assetsListId),
+          data: payload,
+          merge: true,
+        });
       } else if (
         mapping.assetMode === "building" &&
         mapping.category &&
         mapping.buildingAssetId
       ) {
-        updates.push(
-          updateDoc(
-            doc(db, coll, "asset", mapping.category, mapping.buildingAssetId),
-            payload,
-          ),
-        );
+        operations.push({
+          type: "set",
+          ref: doc(db, coll, "asset", mapping.category, mapping.buildingAssetId),
+          data: payload,
+          merge: true,
+        });
       }
     });
 
-    if (updates.length > 0) {
-      await Promise.all(updates);
+    return this._dedupeSyncOperations(operations);
+  }
+
+  static _buildNestedMappingClearOperations(
+    buildingName,
+    mappings,
+    now = new Date().toISOString(),
+  ) {
+    const coll = buildingCollectionName(buildingName);
+    const clearPayload = {
+      ...buildClearAssetPlacementPayload(now),
+      coordinates: deleteField(),
+    };
+    const operations = [];
+
+    (mappings || []).forEach((mapping) => {
+      if (mapping.assetMode === "general" && mapping.assetsListId) {
+        operations.push({
+          type: "update",
+          ref: doc(db, "AssetsList", mapping.assetsListId),
+          data: clearPayload,
+        });
+      } else if (
+        mapping.assetMode === "building" &&
+        mapping.category &&
+        mapping.buildingAssetId
+      ) {
+        operations.push({
+          type: "update",
+          ref: doc(db, coll, "asset", mapping.category, mapping.buildingAssetId),
+          data: clearPayload,
+        });
+      }
+    });
+
+    return this._dedupeSyncOperations(operations);
+  }
+
+  static _findRemovedAssetMappings(existingMappings = [], nextMappings = []) {
+    return existingMappings.filter(
+      (existingMapping) =>
+        !nextMappings.some((newMapping) =>
+          pickerAssetMatchesMapping(
+            {
+              assetMode: newMapping.assetMode || "general",
+              assetsListId: newMapping.assetsListId,
+              id: newMapping.buildingAssetId || newMapping.assetsListId,
+              category: newMapping.category,
+            },
+            existingMapping,
+          ),
+        ),
+    );
+  }
+
+  static async _replaceNestedAssetMappings(mappingsRef, existingDocs, assetMappings) {
+    const dedupedMappings = this._dedupeAssetMappingsForSave(assetMappings);
+    const now = new Date().toISOString();
+    const operations = existingDocs.map((existingDoc) => ({
+      type: "delete",
+      ref: existingDoc.ref,
+    }));
+
+    dedupedMappings.forEach((mapping, index) => {
+      const docId = this._mappingFirestoreDocumentId(mapping, index);
+      operations.push({
+        type: "set",
+        ref: doc(mappingsRef, docId),
+        data: this._stripUndefinedDeep({
+          ...mapping,
+          createdAt: mapping.createdAt || now,
+        }),
+      });
+    });
+
+    await this._commitWriteBatches(operations);
+    return dedupedMappings;
+  }
+
+  static async _commitWriteBatches(operations) {
+    if (!operations?.length) return;
+
+    const chunkSize = 450;
+    for (let i = 0; i < operations.length; i += chunkSize) {
+      const chunk = operations.slice(i, i + chunkSize);
+      const batch = writeBatch(db);
+      chunk.forEach(({ type, ref, data, merge = false }) => {
+        if (type === "set") {
+          batch.set(ref, data, merge ? { merge: true } : {});
+        } else if (type === "update") {
+          batch.update(ref, data);
+        } else if (type === "delete") {
+          batch.delete(ref);
+        }
+      });
+      await batch.commit();
     }
   }
 
@@ -1343,31 +1518,39 @@ class FirestoreService {
     );
 
     const existing = await getDocs(mappingsRef);
-    await Promise.all(existing.docs.map((d) => deleteDoc(d.ref)));
+    const existingMappings = existing.docs.map((docSnap) => ({
+      id: docSnap.id,
+      ...docSnap.data(),
+    }));
+    const now = new Date().toISOString();
+    const dedupedMappings = this._dedupeAssetMappingsForSave(assetMappings);
+    const removedMappings = this._findRemovedAssetMappings(
+      existingMappings,
+      dedupedMappings,
+    );
+    const syncOperations = this._buildNestedMappingSyncOperations(
+      buildingName,
+      dedupedMappings,
+      now,
+    );
+    const clearOperations = this._buildNestedMappingClearOperations(
+      buildingName,
+      removedMappings,
+      now,
+    );
 
-    const sanitizeDocumentId = (id) =>
-      String(id || "")
-        .replace(/[\/\\]/g, "_")
-        .replace(/[()]/g, "")
-        .replace(/\s+/g, "_")
-        .replace(/[^a-zA-Z0-9_-]/g, "")
-        .substring(0, 100);
-
-    const addPromises = assetMappings.map((mapping, index) => {
-      const docId = `${sanitizeDocumentId(mapping.assetName || mapping.id)}_${index}`;
-      const mappingRef = doc(mappingsRef, docId);
-      return setDoc(mappingRef, {
-        ...mapping,
-        createdAt: mapping.createdAt || new Date().toISOString(),
-      });
-    });
-    await Promise.all(addPromises);
-
-    await this._syncNestedMappingsToSourceAssets(buildingName, assetMappings);
+    const savedMappings = await this._replaceNestedAssetMappings(
+      mappingsRef,
+      existing.docs,
+      dedupedMappings,
+    );
+    await this._commitWriteBatches([...syncOperations, ...clearOperations]);
 
     await updateDoc(this._nestedSectionRef(buildingName, floorId, sectionId), {
-      updatedAt: new Date().toISOString(),
+      updatedAt: now,
     });
+
+    return savedMappings;
   }
 
   /** Asset mappings on subsection plan (optional deeper level). */
@@ -1396,6 +1579,118 @@ class FirestoreService {
     return mappings;
   }
 
+  static async _deleteMatchingNestedMappingDocs(mappingsRef, asset) {
+    const snap = await getDocs(mappingsRef);
+    const deleteOps = [];
+
+    snap.forEach((docSnap) => {
+      const mapping = { ...docSnap.data(), id: docSnap.data().id || docSnap.id };
+      if (pickerAssetMatchesMapping(asset, mapping)) {
+        deleteOps.push(deleteDoc(docSnap.ref));
+      }
+    });
+
+    if (deleteOps.length > 0) {
+      await Promise.all(deleteOps);
+    }
+
+    return deleteOps.length;
+  }
+
+  /**
+   * Remove an asset from nested floor-plan mappings and clear placement fields
+   * on the source AssetsList / building asset document (including coordinates).
+   *
+   * When `options.localMappings` is provided (current editor view), that full list
+   * is persisted so other placed assets on the same plan are not wiped.
+   */
+  static async removeAssetNestedPlacement(buildingName, asset = {}, options = {}) {
+    const coll = buildingCollectionName(buildingName);
+    const now = new Date().toISOString();
+    const clearPayload = {
+      ...buildClearAssetPlacementPayload(now),
+      coordinates: deleteField(),
+    };
+
+    const hasLocalMappings = Array.isArray(options.localMappings);
+    const localFloorId = options.floorId || "";
+    const localSectionId = options.sectionId || "";
+    const localSubsectionId = options.subsectionId || "";
+    const localPlacementLevel = options.placementLevel || "section";
+
+    if (
+      hasLocalMappings &&
+      localFloorId &&
+      localSectionId &&
+      (localPlacementLevel !== "subsection" || localSubsectionId)
+    ) {
+      if (localPlacementLevel === "subsection" && localSubsectionId) {
+        await this.updateSubsectionAssetMappings(
+          buildingName,
+          localFloorId,
+          localSectionId,
+          localSubsectionId,
+          options.localMappings,
+        );
+      } else {
+        await this.updateSectionAssetMappings(
+          buildingName,
+          localFloorId,
+          localSectionId,
+          options.localMappings,
+        );
+      }
+    } else {
+      const floorId = asset.floorId || asset.floorDetails?.id || "";
+      const sectionId = asset.sectionId || asset.sectionDetails?.id || "";
+      const subsectionId = asset.subsectionId || asset.subsectionDetails?.id || "";
+      const placementLevel =
+        asset.placementLevel || (subsectionId ? "subsection" : "section");
+
+      if (floorId && sectionId) {
+        if (placementLevel === "subsection" && subsectionId) {
+          const mappingsRef = collection(
+            db,
+            coll,
+            "floorMaps",
+            "floors",
+            floorId,
+            "sections",
+            sectionId,
+            "subsections",
+            subsectionId,
+            "assetMappings",
+          );
+          await this._deleteMatchingNestedMappingDocs(mappingsRef, asset);
+        } else {
+          const mappingsRef = collection(
+            db,
+            coll,
+            "floorMaps",
+            "floors",
+            floorId,
+            "sections",
+            sectionId,
+            "assetMappings",
+          );
+          await this._deleteMatchingNestedMappingDocs(mappingsRef, asset);
+        }
+      }
+    }
+
+    if (asset.assetMode === "general" || asset.assetsListId) {
+      const listId = asset.assetsListId || asset.id;
+      if (listId) {
+        await updateDoc(doc(db, "AssetsList", listId), clearPayload);
+      }
+      return;
+    }
+
+    if (asset.category && asset.id) {
+      await updateDoc(doc(db, coll, "asset", asset.category, asset.id), clearPayload);
+    }
+  }
+
   static async updateSubsectionAssetMappings(
     buildingName,
     floorId,
@@ -1418,32 +1713,40 @@ class FirestoreService {
     );
 
     const existing = await getDocs(mappingsRef);
-    await Promise.all(existing.docs.map((d) => deleteDoc(d.ref)));
+    const existingMappings = existing.docs.map((docSnap) => ({
+      id: docSnap.id,
+      ...docSnap.data(),
+    }));
+    const now = new Date().toISOString();
+    const dedupedMappings = this._dedupeAssetMappingsForSave(assetMappings);
+    const removedMappings = this._findRemovedAssetMappings(
+      existingMappings,
+      dedupedMappings,
+    );
+    const syncOperations = this._buildNestedMappingSyncOperations(
+      buildingName,
+      dedupedMappings,
+      now,
+    );
+    const clearOperations = this._buildNestedMappingClearOperations(
+      buildingName,
+      removedMappings,
+      now,
+    );
 
-    const sanitizeDocumentId = (id) =>
-      String(id || "")
-        .replace(/[\/\\]/g, "_")
-        .replace(/[()]/g, "")
-        .replace(/\s+/g, "_")
-        .replace(/[^a-zA-Z0-9_-]/g, "")
-        .substring(0, 100);
-
-    const addPromises = assetMappings.map((mapping, index) => {
-      const docId = `${sanitizeDocumentId(mapping.assetName || mapping.id)}_${index}`;
-      const mappingRef = doc(mappingsRef, docId);
-      return setDoc(mappingRef, {
-        ...mapping,
-        createdAt: mapping.createdAt || new Date().toISOString(),
-      });
-    });
-    await Promise.all(addPromises);
-
-    await this._syncNestedMappingsToSourceAssets(buildingName, assetMappings);
+    const savedMappings = await this._replaceNestedAssetMappings(
+      mappingsRef,
+      existing.docs,
+      dedupedMappings,
+    );
+    await this._commitWriteBatches([...syncOperations, ...clearOperations]);
 
     await updateDoc(
       this._nestedSubsectionRef(buildingName, floorId, sectionId, subsectionId),
-      { updatedAt: new Date().toISOString() },
+      { updatedAt: now },
     );
+
+    return savedMappings;
   }
 
   /** Full nested tree for a building (viewer / editor bootstrap). */

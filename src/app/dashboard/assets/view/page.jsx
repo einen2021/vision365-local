@@ -156,6 +156,7 @@ export default function ViewAssetsPage() {
   const [isLoadingAssets, setIsLoadingAssets] = useState(false)
   const [isLoadingBoq, setIsLoadingBoq] = useState(false)
   const [searchTerm, setSearchTerm] = useState("")
+  const [boqDeviceAddressSearch, setBoqDeviceAddressSearch] = useState("")
   const [selectedCategory, setSelectedCategory] = useState("all")
   const [selectedSubCategory, setSelectedSubCategory] = useState("all")
   const [isUploadingCoordinates, setIsUploadingCoordinates] = useState(false)
@@ -256,6 +257,7 @@ export default function ViewAssetsPage() {
 
   useEffect(() => {
     setSelectedRowKeys([])
+    setBoqDeviceAddressSearch("")
   }, [selectedBuilding])
 
   // Fetch building summary totalAssetsCount when building is selected
@@ -435,12 +437,22 @@ export default function ViewAssetsPage() {
     })
   }
 
+  const getFilteredBoqAssets = () => {
+    const query = boqDeviceAddressSearch.trim().toLowerCase()
+    if (!query) return boqAssets
+    return boqAssets.filter((asset) =>
+      String(asset.deviceAddress || "").toLowerCase().includes(query),
+    )
+  }
+
   const toggleSelectAllBoq = (checked) => {
+    const visibleAssets = getFilteredBoqAssets()
+    const visibleKeys = visibleAssets.map((a) => assetRowKey(a))
     if (!checked) {
-      setSelectedRowKeys([])
+      setSelectedRowKeys((prev) => prev.filter((k) => !visibleKeys.includes(k)))
       return
     }
-    setSelectedRowKeys(boqAssets.map((a) => assetRowKey(a)))
+    setSelectedRowKeys((prev) => [...new Set([...prev, ...visibleKeys])])
   }
 
   const fetchAssets = async () => {
@@ -742,6 +754,7 @@ export default function ViewAssetsPage() {
   }
 
   const filteredAssets = getFilteredAssets()
+  const filteredBoqAssets = getFilteredBoqAssets()
   const subCategories = getSubCategories()
   const selectedCommunityData = communities.find((c) => c.id === selectedCommunity)
   const selectedBuildingDbName = selectedBuilding
@@ -1104,10 +1117,23 @@ export default function ViewAssetsPage() {
               {/* Assets Table - BOQ Details */}
               <Card>
                 <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between space-y-0">
-                  <CardTitle className="flex items-center gap-2 text-lg">
-                    <Package className="h-5 w-5" />
-                    Assets Table (BOQ Details)
-                  </CardTitle>
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
+                    <CardTitle className="flex items-center gap-2 text-lg">
+                      <Package className="h-5 w-5" />
+                      Assets Table (BOQ Details)
+                    </CardTitle>
+                    {boqAssets.length > 0 && (
+                      <div className="relative w-full sm:w-64">
+                        <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+                        <Input
+                          placeholder="Search by device address..."
+                          value={boqDeviceAddressSearch}
+                          onChange={(e) => setBoqDeviceAddressSearch(e.target.value)}
+                          className="pl-8 h-9"
+                        />
+                      </div>
+                    )}
+                  </div>
                   {boqAssets.length > 0 && (
                     <div className="flex flex-wrap items-center gap-2">
                       {selectedRowKeys.length > 0 && (
@@ -1143,6 +1169,11 @@ export default function ViewAssetsPage() {
                   )}
                 </CardHeader>
                 <CardContent>
+                  {boqAssets.length > 0 && boqDeviceAddressSearch.trim() && (
+                    <p className="text-sm text-muted-foreground mb-3">
+                      Showing {filteredBoqAssets.length} of {boqAssets.length} assets
+                    </p>
+                  )}
                   {isLoadingBoq ? (
                     <div className="flex items-center justify-center py-8">
                       <Loader2 className="h-6 w-6 animate-spin mr-2" />
@@ -1160,10 +1191,13 @@ export default function ViewAssetsPage() {
                               <Checkbox
                                 id="boq-select-all"
                                 checked={
-                                  boqAssets.length > 0 && selectedRowKeys.length === boqAssets.length
+                                  filteredBoqAssets.length > 0 &&
+                                  filteredBoqAssets.every((a) =>
+                                    selectedRowKeys.includes(assetRowKey(a)),
+                                  )
                                 }
                                 onCheckedChange={(c) => toggleSelectAllBoq(!!c)}
-                                disabled={boqAssets.length === 0 || isBulkDeleting}
+                                disabled={filteredBoqAssets.length === 0 || isBulkDeleting}
                               />
                             </TableHead>
                             <TableHead className="sticky top-0 z-20 border-b bg-background px-2 py-2 text-sm font-medium whitespace-nowrap">
@@ -1214,8 +1248,14 @@ export default function ViewAssetsPage() {
                                 No BOQ assets found
                               </TableCell>
                             </TableRow>
+                          ) : filteredBoqAssets.length === 0 ? (
+                            <TableRow>
+                              <TableCell colSpan={13} className="text-center py-8 text-muted-foreground">
+                                No assets match device address &quot;{boqDeviceAddressSearch.trim()}&quot;
+                              </TableCell>
+                            </TableRow>
                           ) : (
-                            boqAssets.map((asset) => (
+                            filteredBoqAssets.map((asset) => (
                               <TableRow
                                 key={assetRowKey(asset)}
                                 className="cursor-pointer hover:bg-muted/60"

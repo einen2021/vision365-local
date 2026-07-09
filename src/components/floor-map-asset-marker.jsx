@@ -1,8 +1,8 @@
 "use client";
 
-import { memo } from "react";
-import { getMarkerImageSrc, handleImageError } from "@/lib/assetIcons";
-import { useAssetTypeIcons } from "@/contexts/AssetTypeIconsContext";
+import { memo, useState } from "react";
+import { resolveAssetTypeFromMapping } from "@/lib/assetIcons";
+import { AssetTypeMarkerImage } from "@/components/floor-plan/asset-type-marker-image";
 import {
   getFireBorderColor,
   getFireDimColor,
@@ -15,6 +15,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+  clientPointToMarkerScreenPos,
+  clientPointToNaturalCoords,
+} from "@/lib/nestedFloorPlan";
 
 const MARKER_HALO_SIZE = 30;
 const MARKER_ICON_SIZE = 20;
@@ -28,35 +32,111 @@ function FloorMapAssetMarkerInner({
   fallbackActive,
   deviceAddr,
   deviceLocation,
-  customImageUrl,
+  typeIconUrl = "",
   onAssetClick,
+  onReposition,
+  onContextMenu,
+  editable = false,
+  imageRef,
+  imageDims,
   live = true,
+  suppressFireEffects = false,
 }) {
-  const { overrides } = useAssetTypeIcons();
+  const [dragPos, setDragPos] = useState(null);
+  const isDragging = dragPos !== null;
+  const displayLeft = dragPos?.left ?? left;
+  const displayTop = dragPos?.top ?? top;
+
   const assetId = mapping.id || mapping.sanitizedId || mapping.assetsListId;
-  const currentActive = useAssetFireActive(assetId, deviceAddr, fallbackActive, live);
+  const currentActive = useAssetFireActive(
+    assetId,
+    deviceAddr,
+    fallbackActive,
+    live && !suppressFireEffects,
+  );
   const address = String(deviceAddr || "").trim();
   const location = String(deviceLocation || "").trim();
-  const radarColor = getFireRadarColor(currentActive);
-  const borderColor = getFireBorderColor(currentActive);
-  const dimColor = getFireDimColor(currentActive);
-  const isOnFire = shouldFireRipple(currentActive);
+  const radarColor = suppressFireEffects ? "transparent" : getFireRadarColor(currentActive);
+  const borderColor = suppressFireEffects
+    ? "hsl(var(--primary))"
+    : getFireBorderColor(currentActive);
+  const dimColor = suppressFireEffects ? "transparent" : getFireDimColor(currentActive);
+  const isOnFire = !suppressFireEffects && shouldFireRipple(currentActive);
+
+  const handlePointerDown = (event) => {
+    if (!editable || event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const pos = clientPointToMarkerScreenPos(
+      event.clientX,
+      event.clientY,
+      imageRef,
+      imageDims,
+    );
+    if (pos) setDragPos(pos);
+  };
+
+  const handlePointerMove = (event) => {
+    if (!editable || !isDragging) return;
+    event.preventDefault();
+    const pos = clientPointToMarkerScreenPos(
+      event.clientX,
+      event.clientY,
+      imageRef,
+      imageDims,
+    );
+    if (pos) setDragPos(pos);
+  };
+
+  const handlePointerUp = (event) => {
+    if (!editable || !isDragging) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    const coords = clientPointToNaturalCoords(
+      event.clientX,
+      event.clientY,
+      imageRef,
+      imageDims,
+    );
+    if (coords && onReposition) {
+      onReposition(mapping, coords);
+    }
+    setDragPos(null);
+  };
+
+  const handleContextMenu = (event) => {
+    if (!editable || !onContextMenu) return;
+    event.preventDefault();
+    event.stopPropagation();
+    onContextMenu(mapping, event);
+  };
 
   return (
-    <Tooltip>
+    <Tooltip open={isDragging ? false : undefined}>
       <TooltipTrigger asChild>
         <div
-          className="absolute z-20 cursor-pointer"
+          className={`absolute z-20 ${editable ? (isDragging ? "cursor-grabbing" : "cursor-grab") : "cursor-pointer"}`}
           style={{
-            left,
-            top,
+            left: displayLeft,
+            top: displayTop,
             transform: `translate(-50%, -50%) scale(${1 / browserZoom})`,
             transformOrigin: "center",
+            touchAction: editable ? "none" : "auto",
           }}
           onClick={(e) => {
+            if (editable || isDragging) return;
             e.stopPropagation();
             onAssetClick?.(mapping);
           }}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          onContextMenu={handleContextMenu}
         >
           <div
             className="relative"
@@ -109,17 +189,19 @@ function FloorMapAssetMarkerInner({
                 zIndex: 1,
               }}
             >
-              <img
-                src={getMarkerImageSrc({ ...mapping, customImageUrl }, overrides)}
+              <AssetTypeMarkerImage
+                mapping={mapping}
                 alt={mapping.assetName || mapping.itemType || "asset"}
                 className="h-full w-full object-cover"
-                onError={handleImageError}
               />
             </div>
           </div>
         </div>
       </TooltipTrigger>
       <TooltipContent side="top" className="max-w-[260px]">
+        {editable ? (
+          <p className="text-xs text-muted-foreground">Drag to move · Right-click for options</p>
+        ) : null}
         {address || location ? (
           <div className="space-y-0.5 text-left">
             {address ? (
@@ -149,13 +231,15 @@ function propsAreEqual(prev, next) {
     prev.fallbackActive === next.fallbackActive &&
     prev.deviceAddr === next.deviceAddr &&
     prev.deviceLocation === next.deviceLocation &&
-    prev.customImageUrl === next.customImageUrl &&
+    prev.typeIconUrl === next.typeIconUrl &&
     prev.mapping.id === next.mapping.id &&
     prev.mapping.locationIndex === next.mapping.locationIndex &&
     prev.mapping.assetName === next.mapping.assetName &&
     prev.mapping.itemType === next.mapping.itemType &&
     prev.mapping.category === next.mapping.category &&
-    prev.live === next.live
+    prev.live === next.live &&
+    prev.suppressFireEffects === next.suppressFireEffects &&
+    prev.editable === next.editable
   );
 }
 

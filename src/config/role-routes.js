@@ -28,10 +28,9 @@ export const faqRoute = "/dashboard/faq";
 /** Default landing page for client users */
 export const clientMainRoute = "/dashboard/floor_configuration/view";
 
-/** Client users — graphics view, network, and alarm history */
+/** Client users — graphics view and alarm history */
 export const clientRoutes = [
   clientMainRoute,
-  "/dashboard/network",
   "/dashboard/alarm-messages/history",
 ];
 

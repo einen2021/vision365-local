@@ -30,6 +30,8 @@ import { useToast } from "@/hooks/use-toast";
 import FirestoreService from "@/services/firestoreService";
 import { PlanImageCanvas } from "@/components/floor-plan/plan-image-canvas";
 import { AssetPickerPanel } from "@/components/floor-plan/asset-picker-panel";
+import { FloorPlanPlacementCsvActions } from "@/components/floor-plan/floor-plan-placement-csv-actions";
+import { FloorPlanLocationCsvImport } from "@/components/floor-plan/floor-plan-location-csv-import";
 import { AssetTypeIconSettings } from "@/components/floor-plan/asset-type-icon-settings";
 import { normalizeAssetTypeKey } from "@/lib/assetIcons";
 import {
@@ -49,7 +51,14 @@ import { collection, getDocs } from "firebase/firestore";
 import {
   pickMappingDeviceFields,
   buildingsMatch,
+  findPickerAssetMapping,
+  pickerAssetMatchesMapping,
 } from "@/lib/floorMapAssets";
+
+/** Compare asset mapping arrays to detect unsaved placements. */
+function assetMappingsEqual(a, b) {
+  return JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
+}
 
 /**
  * Multi-level editor: floor → section → subsection (with assets).
@@ -86,6 +95,12 @@ export function NestedFloorPlanEditor({ buildingName }) {
   const [mappingCounter, setMappingCounter] = useState(0);
   const [floorToDelete, setFloorToDelete] = useState(null);
   const [isDeletingFloor, setIsDeletingFloor] = useState(false);
+  const [savedSectionAssetMappings, setSavedSectionAssetMappings] = useState([]);
+  const [savedAssetMappings, setSavedAssetMappings] = useState([]);
+  const [showUnsavedBackDialog, setShowUnsavedBackDialog] = useState(false);
+  const [deletingPlacementKey, setDeletingPlacementKey] = useState(null);
+  const [showClearAllDialog, setShowClearAllDialog] = useState(false);
+  const [clearAllTarget, setClearAllTarget] = useState(null);
 
   const loadFloors = useCallback(async () => {
     if (!buildingName) return;
@@ -122,8 +137,10 @@ export function NestedFloorPlanEditor({ buildingName }) {
       floor.id,
       s.id,
     );
+    const loadedSectionAssets = full?.assetMappings || [];
     setSection(full || s);
-    setSectionAssetMappings(full?.assetMappings || []);
+    setSectionAssetMappings(loadedSectionAssets);
+    setSavedSectionAssetMappings(loadedSectionAssets);
     setLevel(NAV_LEVELS.SECTION);
     const subs = await FirestoreService.getNestedSubsections(
       buildingName,
@@ -144,14 +161,26 @@ export function NestedFloorPlanEditor({ buildingName }) {
       section.id,
       sub.id,
     );
+    const loadedSubsectionAssets = full?.assetMappings || [];
     setSubsection(full);
-    setAssetMappings(full?.assetMappings || []);
+    setAssetMappings(loadedSubsectionAssets);
+    setSavedAssetMappings(loadedSubsectionAssets);
     setLevel(NAV_LEVELS.SUBSECTION);
     setSelectedAsset(null);
     setAssetSearch("");
   };
 
-  const goBack = async () => {
+  const hasUnsavedAssetChanges = () => {
+    if (level === NAV_LEVELS.SECTION) {
+      return !assetMappingsEqual(sectionAssetMappings, savedSectionAssetMappings);
+    }
+    if (level === NAV_LEVELS.SUBSECTION) {
+      return !assetMappingsEqual(assetMappings, savedAssetMappings);
+    }
+    return false;
+  };
+
+  const performGoBack = async () => {
     if (level === NAV_LEVELS.SUBSECTION) {
       if (floor && section) {
         const refreshed = await FirestoreService.getNestedSection(
@@ -181,6 +210,24 @@ export function NestedFloorPlanEditor({ buildingName }) {
       setLevel(NAV_LEVELS.BUILDING);
       setFloor(null);
     }
+  };
+
+  const goBack = async () => {
+    if (hasUnsavedAssetChanges()) {
+      setShowUnsavedBackDialog(true);
+      return;
+    }
+    await performGoBack();
+  };
+
+  const handleSaveAndGoBack = async () => {
+    const saved =
+      level === NAV_LEVELS.SECTION
+        ? await saveSectionAssets()
+        : await saveSubsectionAssets();
+    if (!saved) return;
+    setShowUnsavedBackDialog(false);
+    await performGoBack();
   };
 
   const uploadImage = async (file, type) => {
@@ -563,40 +610,273 @@ export function NestedFloorPlanEditor({ buildingName }) {
     });
   };
 
+  const mergeImportedLocationMappings = (currentMappings, newMappings) => {
+    let next = [...currentMappings];
+    for (const mapping of newMappings) {
+      const assetRef = {
+        assetMode: "general",
+        assetsListId: mapping.assetsListId,
+        id: mapping.assetsListId,
+      };
+      next = next.filter((item) => !pickerAssetMatchesMapping(assetRef, item));
+      next.push(mapping);
+    }
+    return next;
+  };
+
+  const handleCsvLocationImport = (result, targetLevel) => {
+    if (targetLevel === "section") {
+      setSectionAssetMappings((prev) => mergeImportedLocationMappings(prev, result.mappings));
+    } else {
+      setAssetMappings((prev) => mergeImportedLocationMappings(prev, result.mappings));
+    }
+    setMappingCounter((count) => count + result.mappings.length);
+  };
+
+  const handleAssetReposition = (mapping, coords, targetLevel) => {
+    const updateMapping = (item) =>
+      item.id === mapping.id
+        ? {
+            ...item,
+            x: coords.x,
+            y: coords.y,
+            relativeX: coords.relativeX,
+            relativeY: coords.relativeY,
+          }
+        : item;
+
+    if (targetLevel === "section") {
+      setSectionAssetMappings((prev) => prev.map(updateMapping));
+    } else {
+      setAssetMappings((prev) => prev.map(updateMapping));
+    }
+  };
+
+  const clearAssetInLoadedLists = (asset) => {
+    const clearedFields = {
+      x: undefined,
+      y: undefined,
+      relativeX: undefined,
+      relativeY: undefined,
+      floorId: "",
+      floorName: "",
+      sectionId: "",
+      sectionName: "",
+      subsectionId: "",
+      subsectionName: "",
+      nestedPath: "",
+      placementLevel: "",
+      floorPlanName: "",
+      floorMapName: "",
+      building: "",
+      buildingName: "",
+    };
+    const matchesLoadedAsset = (item) =>
+      item.id === asset.id && (item.assetMode || "general") === (asset.assetMode || "general");
+
+    setBuildingAssets((prev) =>
+      prev.map((item) => (matchesLoadedAsset(item) ? { ...item, ...clearedFields } : item)),
+    );
+    setGeneralAssets((prev) =>
+      prev.map((item) => (matchesLoadedAsset(item) ? { ...item, ...clearedFields } : item)),
+    );
+  };
+
+  const handleDeleteAssetPlacement = async (asset) => {
+    const placementKey = `${asset.assetMode || "general"}-${asset.id}`;
+    setDeletingPlacementKey(placementKey);
+    try {
+      const isSubsectionLevel = level === NAV_LEVELS.SUBSECTION;
+      const isSectionLevel = level === NAV_LEVELS.SECTION;
+      const currentMappings = isSectionLevel
+        ? sectionAssetMappings
+        : isSubsectionLevel
+          ? assetMappings
+          : [];
+      const onCurrentMap = findPickerAssetMapping(asset, currentMappings);
+      const nextMappings = onCurrentMap
+        ? currentMappings.filter((mapping) => !pickerAssetMatchesMapping(asset, mapping))
+        : null;
+
+      if (onCurrentMap) {
+        if (isSectionLevel) {
+          setSectionAssetMappings(nextMappings);
+          setSavedSectionAssetMappings(nextMappings);
+        } else if (isSubsectionLevel) {
+          setAssetMappings(nextMappings);
+          setSavedAssetMappings(nextMappings);
+        }
+      }
+
+      const persistOptions = onCurrentMap
+        ? {
+            localMappings: nextMappings,
+            floorId: floor?.id,
+            sectionId: section?.id,
+            subsectionId: isSubsectionLevel ? subsection?.id : "",
+            placementLevel: isSubsectionLevel ? "subsection" : "section",
+          }
+        : {};
+
+      await FirestoreService.removeAssetNestedPlacement(
+        buildingName,
+        asset,
+        persistOptions,
+      );
+      clearAssetInLoadedLists(asset);
+
+      toast({
+        title: "Placement cleared",
+        description:
+          "Removed floor plan placement, building details, and coordinates for this asset.",
+      });
+    } catch (e) {
+      toast({
+        title: "Clear failed",
+        description: e.message,
+        variant: "destructive",
+      });
+    } finally {
+      setDeletingPlacementKey(null);
+    }
+  };
+
   const saveSectionAssets = async () => {
-    if (!section) return;
+    if (!section) return false;
     setIsSaving(true);
     try {
-      await FirestoreService.updateSectionAssetMappings(
+      const savedMappings = await FirestoreService.updateSectionAssetMappings(
         buildingName,
         floor.id,
         section.id,
         sectionAssetMappings,
       );
-      toast({ title: "Section assets saved" });
+      setSectionAssetMappings(savedMappings);
+      setSavedSectionAssetMappings(savedMappings);
+      toast({
+        title: "Section assets saved",
+        description: `${savedMappings.length} asset(s) saved.`,
+      });
+      return true;
     } catch (e) {
       toast({ title: "Save failed", description: e.message, variant: "destructive" });
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
   const saveSubsectionAssets = async () => {
-    if (!subsection) return;
+    if (!subsection) return false;
     setIsSaving(true);
     try {
-      await FirestoreService.updateSubsectionAssetMappings(
+      const savedMappings = await FirestoreService.updateSubsectionAssetMappings(
         buildingName,
         floor.id,
         section.id,
         subsection.id,
         assetMappings,
       );
-      toast({ title: "Assets saved" });
+      setAssetMappings(savedMappings);
+      setSavedAssetMappings(savedMappings);
+      toast({
+        title: "Assets saved",
+        description: `${savedMappings.length} asset(s) saved.`,
+      });
+      return true;
     } catch (e) {
       toast({ title: "Save failed", description: e.message, variant: "destructive" });
+      return false;
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const clearLoadedAssetsAfterRemoval = (mappings) => {
+    mappings.forEach((mapping) => {
+      clearAssetInLoadedLists({
+        assetMode: mapping.assetMode || "general",
+        id: mapping.buildingAssetId || mapping.assetsListId || mapping.id,
+        assetsListId: mapping.assetsListId,
+        category: mapping.category,
+      });
+    });
+  };
+
+  const clearAllSectionAssetsAndSave = async () => {
+    if (!section || sectionAssetMappings.length === 0) return;
+    setIsSaving(true);
+    try {
+      const removedCount = sectionAssetMappings.length;
+      const removedMappings = [...sectionAssetMappings];
+      await FirestoreService.updateSectionAssetMappings(
+        buildingName,
+        floor.id,
+        section.id,
+        [],
+      );
+      setSectionAssetMappings([]);
+      setSavedSectionAssetMappings([]);
+      clearLoadedAssetsAfterRemoval(removedMappings);
+      setSelectedAsset(null);
+      toast({
+        title: "All assets removed",
+        description: `Cleared and saved ${removedCount} asset(s) from this section.`,
+      });
+    } catch (e) {
+      toast({
+        title: "Remove all failed",
+        description: e.message,
+        variant: "destructive",
+      });
+    } finally {
+      setIsSaving(false);
+      setShowClearAllDialog(false);
+      setClearAllTarget(null);
+    }
+  };
+
+  const clearAllSubsectionAssetsAndSave = async () => {
+    if (!subsection || assetMappings.length === 0) return;
+    setIsSaving(true);
+    try {
+      const removedCount = assetMappings.length;
+      const removedMappings = [...assetMappings];
+      await FirestoreService.updateSubsectionAssetMappings(
+        buildingName,
+        floor.id,
+        section.id,
+        subsection.id,
+        [],
+      );
+      setAssetMappings([]);
+      setSavedAssetMappings([]);
+      clearLoadedAssetsAfterRemoval(removedMappings);
+      setSelectedAsset(null);
+      toast({
+        title: "All assets removed",
+        description: `Cleared and saved ${removedCount} asset(s) from this subsection.`,
+      });
+    } catch (e) {
+      toast({
+        title: "Remove all failed",
+        description: e.message,
+        variant: "destructive",
+      });
+    } finally {
+      setIsSaving(false);
+      setShowClearAllDialog(false);
+      setClearAllTarget(null);
+    }
+  };
+
+  const handleConfirmClearAll = async () => {
+    if (clearAllTarget === "section") {
+      await clearAllSectionAssetsAndSave();
+      return;
+    }
+    if (clearAllTarget === "subsection") {
+      await clearAllSubsectionAssetsAndSave();
     }
   };
 
@@ -672,11 +952,12 @@ export function NestedFloorPlanEditor({ buildingName }) {
 
       {level === NAV_LEVELS.BUILDING && (
         <Card>
-          <CardHeader>
+          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between space-y-0">
             <CardTitle className="flex items-center gap-2">
               <Layers className="h-5 w-5" />
               Select Floor to Configure
             </CardTitle>
+            <FloorPlanPlacementCsvActions buildingName={buildingName} onRestored={loadFloors} />
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex gap-2">
@@ -843,6 +1124,17 @@ export function NestedFloorPlanEditor({ buildingName }) {
               <p className="text-sm text-muted-foreground">
                 Place assets directly on this section, or add optional subsections for a deeper room-level plan.
               </p>
+              <FloorPlanLocationCsvImport
+                buildingName={buildingName}
+                planImageUrl={section.imageUrl}
+                placementContext={buildNestedPlacementContext({
+                  buildingName,
+                  floor,
+                  section,
+                  placementLevel: "section",
+                })}
+                onImported={(result) => handleCsvLocationImport(result, "section")}
+              />
               <Input
                 type="file"
                 accept="image/*"
@@ -854,6 +1146,7 @@ export function NestedFloorPlanEditor({ buildingName }) {
                 navMarkers={filterPlacedNavMarkers(section.subsectionMarkers)}
                 assetMarkers={sectionAssetMappings}
                 placingMarker={placingMarker || !!selectedAsset}
+                editableAssetMarkers={!placingMarker && !selectedAsset}
                 onImageClick={(event, imageRef, dims) => {
                   if (placingMarker) handleNavMarkerClick(event, imageRef, dims);
                   else if (selectedAsset) handleAssetPlace(event, imageRef, dims);
@@ -862,9 +1155,10 @@ export function NestedFloorPlanEditor({ buildingName }) {
                   const sub = subsections.find((s) => s.id === m.subsectionId);
                   if (sub) openSubsection(sub);
                 }}
-                onAssetClick={(m) => {
-                  if (!placingMarker && !selectedAsset) removeSectionAsset(m.id);
-                }}
+                onAssetReposition={(mapping, coords) =>
+                  handleAssetReposition(mapping, coords, "section")
+                }
+                onAssetRemove={(mapping) => removeSectionAsset(mapping.id)}
               />
             </CardContent>
           </Card>
@@ -953,7 +1247,13 @@ export function NestedFloorPlanEditor({ buildingName }) {
                   placedCount={sectionAssetMappings.length}
                   placedMappings={sectionAssetMappings}
                   onRemovePlaced={removeSectionAsset}
+                  onDeletePlacement={handleDeleteAssetPlacement}
+                  deletingPlacementKey={deletingPlacementKey}
                   onSave={saveSectionAssets}
+                  onClearAllAndSave={() => {
+                    setClearAllTarget("section");
+                    setShowClearAllDialog(true);
+                  }}
                   isSaving={isSaving}
                   saveLabel="Save Section Assets"
                   buildingName={buildingName}
@@ -980,6 +1280,18 @@ export function NestedFloorPlanEditor({ buildingName }) {
               <CardTitle>{subsection.name} — Subsection Plan (optional detail)</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
+              <FloorPlanLocationCsvImport
+                buildingName={buildingName}
+                planImageUrl={subsection.imageUrl}
+                placementContext={buildNestedPlacementContext({
+                  buildingName,
+                  floor,
+                  section,
+                  subsection,
+                  placementLevel: "subsection",
+                })}
+                onImported={(result) => handleCsvLocationImport(result, "subsection")}
+              />
               <Input
                 type="file"
                 accept="image/*"
@@ -990,10 +1302,12 @@ export function NestedFloorPlanEditor({ buildingName }) {
                 alt={subsection.name}
                 assetMarkers={assetMappings}
                 placingMarker={!!selectedAsset}
+                editableAssetMarkers={!selectedAsset}
                 onImageClick={handleAssetPlace}
-                onAssetClick={(m) => {
-                  if (!selectedAsset) removeSubsectionAsset(m.id);
-                }}
+                onAssetReposition={(mapping, coords) =>
+                  handleAssetReposition(mapping, coords, "subsection")
+                }
+                onAssetRemove={(mapping) => removeSubsectionAsset(mapping.id)}
               />
             </CardContent>
           </Card>
@@ -1018,7 +1332,13 @@ export function NestedFloorPlanEditor({ buildingName }) {
                 placedCount={assetMappings.length}
                 placedMappings={assetMappings}
                 onRemovePlaced={removeSubsectionAsset}
+                onDeletePlacement={handleDeleteAssetPlacement}
+                deletingPlacementKey={deletingPlacementKey}
                 onSave={saveSubsectionAssets}
+                onClearAllAndSave={() => {
+                  setClearAllTarget("subsection");
+                  setShowClearAllDialog(true);
+                }}
                 isSaving={isSaving}
                 saveLabel="Save Subsection Assets"
                 buildingName={buildingName}
@@ -1036,6 +1356,79 @@ export function NestedFloorPlanEditor({ buildingName }) {
           </Card>
         </div>
       )}
+
+      <AlertDialog
+        open={showClearAllDialog}
+        onOpenChange={(open) => {
+          if (!open && !isSaving) {
+            setShowClearAllDialog(false);
+            setClearAllTarget(null);
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remove all assets?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will remove every asset marker from this{" "}
+              {clearAllTarget === "subsection" ? "subsection" : "section"} plan and save the
+              empty map. Building placement details on each asset will also be cleared.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isSaving}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={isSaving}
+              onClick={(e) => {
+                e.preventDefault();
+                handleConfirmClearAll();
+              }}
+            >
+              {isSaving ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Trash2 className="mr-2 h-4 w-4" />
+              )}
+              Remove all and save
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={showUnsavedBackDialog}
+        onOpenChange={(open) => {
+          if (!open && !isSaving) setShowUnsavedBackDialog(false);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Unsaved changes</AlertDialogTitle>
+            <AlertDialogDescription>
+              You have unsaved asset placements. Do you want to save your changes before
+              leaving?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isSaving}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={isSaving}
+              onClick={(e) => {
+                e.preventDefault();
+                handleSaveAndGoBack();
+              }}
+            >
+              {isSaving ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Save className="mr-2 h-4 w-4" />
+              )}
+              Save
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog
         open={Boolean(floorToDelete)}

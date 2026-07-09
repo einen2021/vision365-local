@@ -33,10 +33,23 @@ export function useFloorPlanImageDimensions(imageRef, imageUrl) {
   }, [imageUrl]);
 
   useEffect(() => {
+    if (!imageLoaded || !imageRef.current) return;
+
     const onResize = () => recalculate();
     window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, [recalculate]);
+
+    const element = imageRef.current;
+    let observer;
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(() => recalculate());
+      observer.observe(element);
+    }
+
+    return () => {
+      window.removeEventListener("resize", onResize);
+      observer?.disconnect();
+    };
+  }, [imageLoaded, recalculate, imageRef]);
 
   return { dims, imageLoaded, handleImageLoad, recalculate };
 }

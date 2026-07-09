@@ -1,12 +1,16 @@
 "use client";
 
 import { useRef, useState, useEffect } from "react";
-import { Loader2, ImageOff, Layers } from "lucide-react";
+import { Loader2, ImageOff, Layers, Trash2 } from "lucide-react";
 import { useFloorPlanImageDimensions } from "@/hooks/useFloorPlanImageDimensions";
 import { useResolvedAssetUrl } from "@/hooks/useResolvedAssetUrl";
 import { naturalToScreenCoords, getFloorButtonDimensions, getNavMarkerDimensions } from "@/lib/nestedFloorPlan";
 import { FloorMapAssetMarker } from "@/components/floor-map-asset-marker";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { Button } from "@/components/ui/button";
+import { useAssetTypeIcons } from "@/contexts/AssetTypeIconsContext";
+import { resolveAssetTypeFromMapping } from "@/lib/assetIcons";
+import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
 
 /**
  * Shared floor-plan image with navigation hotspots or asset markers.
@@ -22,6 +26,9 @@ export function PlanImageCanvas({
   onImageClick,
   onMarkerClick,
   onAssetClick,
+  onAssetReposition,
+  onAssetRemove,
+  editableAssetMarkers = false,
   placingMarker = false,
   browserZoom = 1,
   assetStatusLive = false,
@@ -34,6 +41,9 @@ export function PlanImageCanvas({
   const imageRef = useRef(null);
   const resolvedSrc = useResolvedAssetUrl(imageUrl);
   const [imgError, setImgError] = useState(false);
+  const [assetContextMenu, setAssetContextMenu] = useState(null);
+
+  const markersEditable = editableAssetMarkers && !placingMarker;
 
   const resolvedNavMarkers =
     navMarkers ?? (mode === "nav" || mode === "mixed" ? markers : []);
@@ -50,10 +60,23 @@ export function PlanImageCanvas({
     dims,
     resolvedNavMarkers.length,
   );
+  const { overrides } = useAssetTypeIcons();
 
   useEffect(() => {
     setImgError(false);
+    setAssetContextMenu(null);
   }, [imageUrl, resolvedSrc]);
+
+  useEffect(() => {
+    if (!assetContextMenu) return;
+    const close = () => setAssetContextMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [assetContextMenu]);
 
   const handleClick = (event) => {
     if (!onImageClick || !imageLoaded) return;
@@ -153,22 +176,24 @@ export function PlanImageCanvas({
   return (
     <div className={`relative w-full ${className}`}>
       <div
-        className="relative w-full flex items-center justify-center bg-muted/30 rounded-lg overflow-hidden"
-        style={{ minHeight: 280, maxHeight }}
+        className="relative w-full bg-muted/30 rounded-lg overflow-hidden"
+        style={{ height: maxHeight, minHeight: 280 }}
       >
         {isResolving ? (
-          <div className="flex flex-col items-center gap-2 p-8 text-muted-foreground">
+          <div className="flex h-full flex-col items-center justify-center gap-2 p-8 text-muted-foreground">
             <Loader2 className="h-8 w-8 animate-spin" />
             <p className="text-sm">Loading plan image...</p>
           </div>
         ) : null}
 
         {!hasStoredUrl && !isResolving ? (
-          <p className="text-sm text-muted-foreground p-8">No plan image uploaded</p>
+          <div className="flex h-full items-center justify-center p-8">
+            <p className="text-sm text-muted-foreground">No plan image uploaded</p>
+          </div>
         ) : null}
 
         {hasStoredUrl && imgError ? (
-          <div className="flex flex-col items-center gap-2 p-8 text-muted-foreground">
+          <div className="flex h-full flex-col items-center justify-center gap-2 p-8 text-muted-foreground">
             <ImageOff className="h-8 w-8" />
             <p className="text-sm">Could not load plan image</p>
             <p className="text-xs max-w-xs truncate opacity-70">{imageUrl}</p>
@@ -176,20 +201,17 @@ export function PlanImageCanvas({
         ) : null}
 
         {canRenderImage ? (
-          <div
-            className="relative inline-block max-w-full max-h-full"
-            style={{ maxHeight }}
-          >
+          <div className="relative h-full w-full">
             <img
               key={resolvedSrc}
               ref={imageRef}
               src={resolvedSrc}
               alt={alt}
-              className="block max-w-full max-h-full object-contain"
+              className="block h-full w-full object-contain"
               onLoad={handleImageLoad}
               onError={() => setImgError(true)}
               onClick={handleClick}
-              style={{ cursor: placingMarker ? "crosshair" : "default", maxHeight }}
+              style={{ cursor: placingMarker ? "crosshair" : "default" }}
             />
 
             {imageLoaded ? (
@@ -200,6 +222,7 @@ export function PlanImageCanvas({
                 {resolvedAssetMarkers.map((marker) => {
                   const { left, top } = naturalToScreenCoords(marker, dims);
                   const deviceData = assetDeviceData[marker.id] || {};
+                  const typeKey = resolveAssetTypeFromMapping(marker);
                   return (
                     <FloorMapAssetMarker
                       key={marker.id}
@@ -210,12 +233,62 @@ export function PlanImageCanvas({
                       fallbackActive={activeStatuses[marker.id] ?? marker.active ?? 0}
                       deviceAddr={deviceData.deviceAddress || marker.deviceAddress}
                       deviceLocation={deviceData.deviceLocation || marker.deviceLocation}
-                      customImageUrl={marker.customImageUrl}
+                      typeIconUrl={typeKey ? overrides[typeKey] || "" : ""}
                       onAssetClick={onAssetClick}
+                      editable={markersEditable}
+                      imageRef={imageRef}
+                      imageDims={dims}
+                      onReposition={onAssetReposition}
+                      onContextMenu={(mapping, event) => {
+                        setAssetContextMenu({
+                          mapping,
+                          x: event.clientX,
+                          y: event.clientY,
+                        });
+                      }}
                       live={assetStatusLive}
+                      suppressFireEffects={placingMarker}
                     />
                   );
                 })}
+                {assetContextMenu ? (
+                  <>
+                    <div
+                      className="fixed inset-0 z-40"
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setAssetContextMenu(null);
+                      }}
+                    />
+                    <div
+                      className="fixed z-50 w-52 rounded-md border bg-popover p-2 shadow-lg"
+                      style={{
+                        left: assetContextMenu.x,
+                        top: assetContextMenu.y,
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <p className="mb-2 truncate px-1 text-xs font-medium text-foreground">
+                        {resolveAssetDeviceAddress(assetContextMenu.mapping) ||
+                          assetContextMenu.mapping.assetName ||
+                          "Asset"}
+                      </p>
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        size="sm"
+                        className="w-full justify-start"
+                        onClick={() => {
+                          onAssetRemove?.(assetContextMenu.mapping);
+                          setAssetContextMenu(null);
+                        }}
+                      >
+                        <Trash2 className="mr-2 h-4 w-4" />
+                        Remove from map
+                      </Button>
+                    </div>
+                  </>
+                ) : null}
               </TooltipProvider>
             ) : null}
           </div>
