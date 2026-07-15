@@ -4,21 +4,34 @@ import { LIST_COMMAND_TIMEOUT_MS } from "@/lib/firePanelMonitor";
 /**
  * Stream a panel list command (list f/t/s) and receive partial telnet output as it arrives.
  * Falls back to the regular command endpoint when streaming is unavailable.
+ *
+ * Pass expectedCount (from totalFire / totalTrouble / totalSupervisory) so the
+ * worker keeps waiting until that many list messages arrive.
  */
 export async function streamFirePanelListCommand(
   command,
   timeoutMs = LIST_COMMAND_TIMEOUT_MS,
   onChunk,
+  options = {},
 ) {
+  const expectedCount = Number.isFinite(options.expectedCount)
+    ? Number(options.expectedCount)
+    : undefined;
+
   try {
     const res = await apiFetch("/api/telnet/fire-panel/command/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command, timeoutMs }),
+      body: JSON.stringify({ command, timeoutMs, expectedCount }),
     });
 
     if (res.status === 404) {
-      return await fetchFirePanelListCommandOnce(command, timeoutMs, onChunk);
+      return await fetchFirePanelListCommandOnce(
+        command,
+        timeoutMs,
+        onChunk,
+        expectedCount,
+      );
     }
 
     if (!res.ok) {
@@ -27,7 +40,12 @@ export async function streamFirePanelListCommand(
     }
 
     if (!res.body) {
-      return await fetchFirePanelListCommandOnce(command, timeoutMs, onChunk);
+      return await fetchFirePanelListCommandOnce(
+        command,
+        timeoutMs,
+        onChunk,
+        expectedCount,
+      );
     }
 
     const reader = res.body.getReader();
@@ -67,17 +85,27 @@ export async function streamFirePanelListCommand(
     return finalResponse;
   } catch (error) {
     if (/streaming not supported|failed to fetch|404/i.test(error?.message || "")) {
-      return await fetchFirePanelListCommandOnce(command, timeoutMs, onChunk);
+      return await fetchFirePanelListCommandOnce(
+        command,
+        timeoutMs,
+        onChunk,
+        expectedCount,
+      );
     }
     throw error;
   }
 }
 
-async function fetchFirePanelListCommandOnce(command, timeoutMs, onChunk) {
+async function fetchFirePanelListCommandOnce(
+  command,
+  timeoutMs,
+  onChunk,
+  expectedCount,
+) {
   const res = await apiFetch("/api/telnet/fire-panel/command", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ command, timeoutMs }),
+    body: JSON.stringify({ command, timeoutMs, expectedCount }),
   });
   const data = await parseApiJsonResponse(res);
   if (!res.ok) {

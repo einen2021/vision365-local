@@ -90,9 +90,12 @@ export function createFirePanelRoutes() {
     }
 
     const timeoutMs = Number(body.timeoutMs) || undefined;
+    const expectedCount = Number.isFinite(Number(body.expectedCount))
+      ? Number(body.expectedCount)
+      : undefined;
 
     try {
-      const result = await sendFirePanelCommand(command, timeoutMs);
+      const result = await sendFirePanelCommand(command, timeoutMs, expectedCount);
       return c.json(result);
     } catch (error) {
       return c.json({ error: (error as Error).message }, 500);
@@ -108,36 +111,60 @@ export function createFirePanelRoutes() {
     }
 
     const timeoutMs = Number(body.timeoutMs) || undefined;
+    const expectedCount = Number.isFinite(Number(body.expectedCount))
+      ? Number(body.expectedCount)
+      : undefined;
     const encoder = new TextEncoder();
+
+    // Shared so cancel() and late worker chunks cannot crash the process
+    // with "Controller is already closed".
+    let closed = false;
 
     const stream = new ReadableStream({
       async start(controller) {
-        let closed = false;
+        const safeEnqueue = (payload: unknown) => {
+          if (closed) return;
+          try {
+            controller.enqueue(
+              encoder.encode(`${JSON.stringify(payload)}\n`),
+            );
+          } catch {
+            closed = true;
+          }
+        };
+
         const closeStream = () => {
           if (closed) return;
           closed = true;
-          controller.close();
+          try {
+            controller.close();
+          } catch {
+            // already closed by client cancel or prior done chunk
+          }
         };
 
         try {
-          await sendFirePanelCommandStreaming(command, timeoutMs, (response, done) => {
-            controller.enqueue(
-              encoder.encode(`${JSON.stringify({ response, done })}\n`),
-            );
-            if (done) closeStream();
-          });
-          closeStream();
-        } catch (error) {
-          controller.enqueue(
-            encoder.encode(
-              `${JSON.stringify({
-                error: (error as Error).message,
-                done: true,
-              })}\n`,
-            ),
+          await sendFirePanelCommandStreaming(
+            command,
+            timeoutMs,
+            (response, done) => {
+              safeEnqueue({ response, done });
+              if (done) closeStream();
+            },
+            expectedCount,
           );
           closeStream();
+        } catch (error) {
+          safeEnqueue({
+            error: (error as Error).message,
+            done: true,
+          });
+          closeStream();
         }
+      },
+      cancel() {
+        // Client disconnected / aborted — ignore any remaining chunks.
+        closed = true;
       },
     });
 

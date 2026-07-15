@@ -6,7 +6,6 @@ import { doc, getDoc, updateDoc } from "firebase/firestore"
 import { useToast } from "@/hooks/use-toast"
 import { useFirePanelMonitor } from "@/contexts/AppContext"
 import { useFirePanelStore } from "@/stores/firePanelStore"
-import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -21,12 +20,10 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Loader2, Edit, MapPin, CheckCircle, XCircle, RefreshCcw } from "lucide-react"
 import { resolveAssetsListDocId } from "@/lib/assetsListSimplexStatus"
-import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets"
 import { useDeviceEnabledStore } from "@/stores/deviceEnabledStore"
 import {
   getPrimaryStatusTone,
   parsePanelShowResponse,
-  primaryStatusToSimplex,
 } from "@/lib/parsePanelShowResponse"
 import { withMonitorPaused, pauseMonitorLoop, resumeMonitorLoop, waitForMonitorYield } from "@/lib/firePanelMonitorSession"
 import { cn } from "@/lib/utils"
@@ -145,53 +142,10 @@ export function AssetControlModal({
         if (parsed.enabledState) {
           setEnabledState(parsed.enabledState)
         }
+        // ENABLED STATE / PRIMARY STATUS are for this modal only.
+        // Floor-map marker colors come from monitoring list F/T — never from `show`.
         if (parsed.enabled !== null) {
           setEnabled(parsed.enabled)
-          useDeviceEnabledStore.getState().setEnabled(trimmed, parsed.enabled)
-        }
-
-        if (parsed.primaryStatus) {
-          const simplex = primaryStatusToSimplex(parsed.primaryStatus)
-          const assetRefData = {
-            ...(assetRef || asset || {}),
-            deviceAddress:
-              trimmed ||
-              assetRef?.deviceAddress ||
-              asset?.deviceAddress ||
-              "",
-          }
-          const assetId =
-            assetRefData.assetsListId ||
-            assetRefData.buildingAssetId ||
-            assetRefData.id ||
-            asset?.buildingAssetId ||
-            asset?.id
-
-          // Patch store with every related id + the exact panel address from `show`.
-          useAssetFireStatusStore
-            .getState()
-            .patchSimplexStatusFromEntry(assetId, assetRefData, simplex, trimmed)
-
-          // Persist F/T/S so the 1s AssetsList poll does not wipe the marker color.
-          void (async () => {
-            try {
-              const listId = await resolveAssetsListDocId(assetRefData, trimmed)
-              if (!listId) return
-              await updateDoc(doc(db, "AssetsList", listId), {
-                simplexStatus: simplex,
-                updatedAt: new Date().toISOString(),
-              })
-              invalidateAssetsListSnapshotCache()
-              useAssetFireStatusStore
-                .getState()
-                .patchSimplexStatusFromEntry(listId, assetRefData, simplex, trimmed)
-            } catch (persistError) {
-              console.warn(
-                "[asset-control] could not persist simplexStatus:",
-                persistError,
-              )
-            }
-          })()
         }
       } catch (error) {
         if (requestId !== statusRequestIdRef.current) return

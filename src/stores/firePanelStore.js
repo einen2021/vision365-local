@@ -177,7 +177,7 @@ export const useFirePanelStore = create((set, get) => ({
       lower.includes("cshow *") || lower.includes("cshow*")
         ? 60000
         : lower.startsWith("list")
-          ? 15000
+          ? 120000
         : lower.startsWith("show")
           ? 8000
           : lower.includes("cval")

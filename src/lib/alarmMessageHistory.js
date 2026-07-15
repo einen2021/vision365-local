@@ -6,12 +6,12 @@ import {
   pickAlarmLikeAppendTarget,
   pickTroubleAppendTarget,
 } from "@/lib/liveAlarmFeedWrite";
+import { normalizeBuildingName } from "@/lib/buildingNames";
 
 export function buildingDbCollection(buildingName) {
-  if (!buildingName) return "";
-  return buildingName.endsWith("BuildingDB")
-    ? buildingName
-    : `${buildingName}BuildingDB`;
+  const base = normalizeBuildingName(buildingName);
+  if (!base) return "";
+  return base.endsWith("BuildingDB") ? base : `${base}BuildingDB`;
 }
 
 function mapRows(rows) {
@@ -19,7 +19,9 @@ function mapRows(rows) {
     .map((r) => ({
       message: r.message || "",
       time: r.time,
+      // Always derive a display clock from the numeric time field.
       formattedTime: formatLiveFeedTime(r.time),
+      rawMessage: r.rawMessage || null,
     }))
     .sort((a, b) => (b.time || 0) - (a.time || 0));
 }

@@ -1,87 +1,64 @@
-import { fetchBuildingAlarmHistory } from "@/lib/alarmMessageHistory";
-import { extractPanelDeviceAddresses } from "@/lib/firePanelMonitor";
+import {
+  extractPanelDeviceAddresses,
+  parsePanelListResponse,
+} from "@/lib/firePanelMonitor";
 import { stripPanelAddressPrefix } from "@/lib/simplexDeviceAddress";
 
-const HISTORY_FIELD_BY_LABEL = {
-  Fire: "liveFire",
-  Trouble: "liveTrouble",
-  Supervisory: "liveSupervisory",
-};
+/**
+ * Compare a new list f/t/s response with the previously saved one.
+ * Returns only panel lines that were not in the previous response.
+ * Matching is by exact raw line text (status / panel time changes count as new).
+ */
+export function findNewPanelListEntries(currentResponse = "", previousResponse = "") {
+  const previousRaw = new Set(
+    parsePanelListResponse(previousResponse)
+      .map((entry) => String(entry?.raw || entry?.rawMessage || "").trim())
+      .filter(Boolean),
+  );
 
-function normalizeAddressKey(address) {
-  return stripPanelAddressPrefix(address).toUpperCase();
-}
-
-/** Collect device addresses referenced in alarm history messages. */
-export function extractHistoryAddressKeys(messages = []) {
-  const keys = new Set();
-
-  for (const entry of messages) {
-    const text = String(entry?.message || "");
-    if (!text) continue;
-
-    for (const address of extractPanelDeviceAddresses(text)) {
-      keys.add(address.toUpperCase());
-      keys.add(normalizeAddressKey(address));
-    }
+  const newlyAppeared = [];
+  for (const entry of parsePanelListResponse(currentResponse)) {
+    const raw = String(entry?.raw || entry?.rawMessage || "").trim();
+    if (!raw) continue;
+    if (previousRaw.has(raw)) continue;
+    newlyAppeared.push(entry);
+    // Same line shouldn't be treated as new twice in one pass.
+    previousRaw.add(raw);
   }
 
-  return keys;
-}
-
-/** True when a panel row already appears in stored alarm history. */
-export function isPanelRowInHistory(row, messages = [], historyAddressKeys = null) {
-  const keys = historyAddressKeys || extractHistoryAddressKeys(messages);
-  const full = String(row?.fullAddress || "").trim().toUpperCase();
-  const stripped = normalizeAddressKey(row?.fullAddress || "");
-
-  if (full && keys.has(full)) return true;
-  if (stripped && keys.has(stripped)) return true;
-
-  const location = String(row?.location || "").trim().toLowerCase();
-  if (!location || location.length < 8) return false;
-
-  return messages.some((entry) =>
-    String(entry?.message || "").toLowerCase().includes(location),
-  );
-}
-
-/** Load live fire/trouble/supervisory history rows for all buildings. */
-export async function fetchCategoryHistoryMessages(label, buildingNames = []) {
-  const field = HISTORY_FIELD_BY_LABEL[label];
-  if (!field) return [];
-
-  const names = [...new Set(buildingNames.map((name) => String(name || "").trim()).filter(Boolean))];
-  if (!names.length) return [];
-
-  const chunks = await Promise.all(
-    names.map(async (buildingName) => {
-      try {
-        const history = await fetchBuildingAlarmHistory(buildingName);
-        return history[field] || [];
-      } catch {
-        return [];
-      }
-    }),
-  );
-
-  return chunks.flat();
+  return newlyAppeared;
 }
 
 /**
- * Pick only the newest panel row that is not already represented in history
- * or the page baseline snapshot (last unknown row in panel list order).
+ * From a full panel list (old + new), keep only addresses that were not in the
+ * previous snapshot. The last one in panel order is treated as the newest event.
  */
-export function pickNewestUnknownRow(rows, messages, baselineAddresses) {
-  const historyKeys = extractHistoryAddressKeys(messages);
-  const baseline = baselineAddresses || new Set();
-  let newest = null;
+export function pickNewestAppearedAddresses(currentAddresses = [], previousAddresses = []) {
+  const prevSet = new Set(
+    (previousAddresses || [])
+      .map((address) => String(address || "").trim().toUpperCase())
+      .filter(Boolean),
+  );
 
-  for (const row of rows) {
-    if (baseline.has(row.fullAddress)) continue;
-    if (isPanelRowInHistory(row, messages, historyKeys)) continue;
-    newest = row;
+  const newlyAppeared = [];
+  for (const address of currentAddresses || []) {
+    const key = String(address || "").trim().toUpperCase();
+    if (!key) continue;
+    if (prevSet.has(key)) continue;
+    newlyAppeared.push(String(address).trim());
   }
 
-  return newest;
+  if (newlyAppeared.length === 0) return [];
+  // Only the latest new device — not every prior alarm still present in the list.
+  return [newlyAppeared[newlyAppeared.length - 1]];
+}
+
+/** Normalize an address for Set lookups (optional panel prefix stripped). */
+export function normalizeAddressKey(address) {
+  return stripPanelAddressPrefix(address).toUpperCase();
+}
+
+/** Collect unique panel addresses from raw list text. */
+export function addressesFromListResponse(response) {
+  return extractPanelDeviceAddresses(response);
 }

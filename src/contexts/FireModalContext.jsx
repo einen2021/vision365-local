@@ -89,7 +89,10 @@ function FireAlertModalView({
     Boolean(navigationTarget?.floorName) ||
     Boolean(navigationTarget?.sectionName) ||
     Boolean(navigationTarget?.subsectionName);
-  const isLocating = addressLoading || placementResolving;
+  // Only show the big "Locating…" spinner when we still have no device yet.
+  // Placement can finish in the background without blocking Acknowledge.
+  const isWaitingForDevice = !device && addressLoading;
+  const isResolvingPlacement = Boolean(device) && placementResolving && !hasPlacement;
 
   return (
     <Dialog open={open}>
@@ -142,10 +145,10 @@ function FireAlertModalView({
             Fire condition detected on the panel.
           </p>
 
-          {isLocating ? (
+          {isWaitingForDevice ? (
             <div className="mt-5 flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-3 text-sm text-red-900 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-100">
               <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
-              Locating alarm device and floor placement…
+              Locating alarm device…
             </div>
           ) : device ? (
             <dl className="mt-5 space-y-3 text-sm">
@@ -179,7 +182,14 @@ function FireAlertModalView({
                       Floor Plan
                     </dt>
                     <dd className="text-muted-foreground">
-                      Device not placed on a nested floor map
+                      {isResolvingPlacement ? (
+                        <span className="inline-flex items-center gap-2">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          Resolving floor placement…
+                        </span>
+                      ) : (
+                        "Device not placed on a nested floor map"
+                      )}
                     </dd>
                   </div>
                 </div>
@@ -212,7 +222,7 @@ function FireAlertModalView({
             </dl>
           ) : (
             <p className="mt-5 text-sm text-muted-foreground">
-              Could not match the panel alarm to an asset in AssetsList.
+              Could not find device in AssetsList for this panel alarm.
             </p>
           )}
 
@@ -222,7 +232,7 @@ function FireAlertModalView({
               variant="destructive"
               className="min-w-[140px] font-semibold"
               onClick={onAcknowledge}
-              disabled={ackLoading || isLocating}
+              disabled={ackLoading || isWaitingForDevice}
             >
               {ackLoading ? (
                 <>
@@ -318,9 +328,10 @@ export function FireAlertProvider({ children }) {
     setIsSirenMuted(false);
   }, []);
 
-  // Resolve nested floor placement once the fire list lookup finishes.
+  // Resolve nested floor placement as soon as we have a device (don't wait for
+  // the full list f / all-address lookup to finish).
   useEffect(() => {
-    if (addressLoading || !activeDevice) return;
+    if (!activeDevice) return;
 
     let cancelled = false;
     setPlacementResolving(true);
@@ -346,7 +357,7 @@ export function FireAlertProvider({ children }) {
     return () => {
       cancelled = true;
     };
-  }, [addressLoading, activeDevice]);
+  }, [activeDevice]);
 
   const handleAcknowledge = useCallback(async () => {
     const connected = useFirePanelStore.getState().connected;

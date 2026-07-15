@@ -1,4 +1,4 @@
-/** Fresh-install database — admin login only, no communities/buildings/assets/floor plans */
+/** Default / seed helpers — runtime must never strip communities/buildings/assets. */
 
 const ADMIN_DEFAULTS = {
   email: "admin@vision365.com",
@@ -36,15 +36,60 @@ export function getDefaultDbSeed() {
   };
 }
 
-function isBuildingDbKey(key) {
-  return typeof key === "string" && key.endsWith("BuildingDB");
+function ensureLoginUsers(userDb) {
+  const next = { ...userDb };
+  if (!next.admin || typeof next.admin !== "object") {
+    next.admin = {
+      ...ADMIN_DEFAULTS,
+      communities: [],
+      buildings: {},
+    };
+  }
+  if (!next.client || typeof next.client !== "object") {
+    next.client = {
+      ...CLIENT_DEFAULTS,
+      communities: [],
+      buildings: {},
+    };
+  }
+  return next;
 }
 
 /**
- * Strip communities, buildings, assets, and floor-plan data from a seed file.
- * Only admin credentials are kept so first install starts empty.
+ * Prepare seed data for first install / import.
+ * Preserves communities, AssetsList, *BuildingDB docs, and user assignments.
+ */
+export function prepareDbSeed(raw) {
+  if (!raw || typeof raw !== "object") {
+    return getDefaultDbSeed();
+  }
+
+  const seed = { ...raw };
+  const userDb =
+    seed.UserDB && typeof seed.UserDB === "object" ? seed.UserDB : {};
+  seed.UserDB = ensureLoginUsers(userDb);
+
+  if (!seed.communities || typeof seed.communities !== "object") {
+    seed.communities = {};
+  }
+  if (!seed.AssetsList || typeof seed.AssetsList !== "object") {
+    seed.AssetsList = {};
+  }
+
+  return seed;
+}
+
+/**
+ * @deprecated Use prepareDbSeed — does not strip data anymore.
  */
 export function sanitizeDbSeed(raw) {
+  return prepareDbSeed(raw);
+}
+
+/**
+ * Package-build only helper (optional). Prefer prepareDbSeed at runtime.
+ */
+export function stripSeedToLoginOnly(raw) {
   const seed = getDefaultDbSeed();
   if (!raw || typeof raw !== "object") return seed;
 
@@ -58,32 +103,15 @@ export function sanitizeDbSeed(raw) {
         password: user.password || ADMIN_DEFAULTS.password,
         role: user.role || ADMIN_DEFAULTS.role,
         designation: user.designation || ADMIN_DEFAULTS.designation,
-        communities: [],
-        buildings: {},
+        communities: Array.isArray(user.communities) ? user.communities : [],
+        buildings:
+          user.buildings && typeof user.buildings === "object"
+            ? user.buildings
+            : {},
       };
     }
   }
 
-  if (!seed.UserDB.admin) {
-    seed.UserDB.admin = {
-      ...ADMIN_DEFAULTS,
-      communities: [],
-      buildings: {},
-    };
-  }
-  if (!seed.UserDB.client) {
-    seed.UserDB.client = {
-      ...CLIENT_DEFAULTS,
-      communities: [],
-      buildings: {},
-    };
-  }
-
-  // Drop any *BuildingDB root docs (buildings, floor maps, assets, alarms, etc.)
-  const dropped = Object.keys(raw).filter(isBuildingDbKey);
-  if (dropped.length > 0) {
-    console.log(`[seed] Ignored building data keys: ${dropped.join(", ")}`);
-  }
-
+  seed.UserDB = ensureLoginUsers(seed.UserDB);
   return seed;
 }

@@ -4,6 +4,11 @@
  */
 
 import { getCollection } from "./client";
+import {
+  countProductiveData,
+  queueDbSnapshotBackup,
+  saveDbSnapshotBackup,
+} from "../services/dbSnapshotBackup";
 
 type DbRecord = Record<string, unknown>;
 
@@ -36,12 +41,41 @@ export async function readDb(): Promise<DbRecord> {
 
 export async function writeDb(data: DbRecord): Promise<void> {
   const collection = getCollection(COLLECTION);
+  const existing = await collection.findOne({ _id: SNAPSHOT_ID });
+  const existingData =
+    existing?.data && typeof existing.data === "object"
+      ? (existing.data as DbRecord)
+      : {};
+
+  const nextScore = countProductiveData(data).score;
+  const prevScore = countProductiveData(existingData).score;
+
+  // Never replace a full database with an empty seed-shaped payload.
+  if (prevScore > 0 && nextScore === 0) {
+    console.error(
+      "[db] Refusing to overwrite productive database with empty snapshot " +
+        `(had communities/assets/building data score=${prevScore})`,
+    );
+    // Keep a backup of what we still have before abandoning the wipe.
+    try {
+      saveDbSnapshotBackup(existingData);
+    } catch (error) {
+      console.warn("[db] backup before refused wipe failed:", (error as Error).message);
+    }
+    return;
+  }
+
   const now = new Date().toISOString();
   await collection.updateOne(
     { _id: SNAPSHOT_ID },
     { $set: { data, updated_at: now } },
-    { upsert: true }
+    { upsert: true },
   );
+
+  // Auto-backup off the request path (throttled) — do not block writes.
+  if (nextScore > 0) {
+    queueDbSnapshotBackup(data);
+  }
 }
 
 function resolveCollection(db: DbRecord, segments: string[]): DbRecord | null {
@@ -131,8 +165,14 @@ export function setDocument(
   merge = false
 ): void {
   const { parent, lastKey } = getParent(db, segments);
-  if (merge && parent[lastKey] && typeof parent[lastKey] === "object") {
-    parent[lastKey] = { ...(parent[lastKey] as DbRecord), ...(data as DbRecord) };
+  if (merge) {
+    // Merge must honor deleteField() / __deleteField markers (not shallow-spread them in).
+    const existing =
+      parent[lastKey] && typeof parent[lastKey] === "object" && !Array.isArray(parent[lastKey])
+        ? { ...(parent[lastKey] as DbRecord) }
+        : {};
+    applyUpdate(existing, (data || {}) as DbRecord);
+    parent[lastKey] = existing;
   } else {
     parent[lastKey] = data;
   }

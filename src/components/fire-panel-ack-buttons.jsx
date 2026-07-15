@@ -101,6 +101,7 @@ export function FirePanelAckButtons() {
   return (
     <>
       {ACK_BUTTONS.map(({ label, title, variant, cvalField, activeClassName }) => {
+        // Show live panel CVAL totals (same as the status cards).
         const cval = firePanelState?.[cvalField] ?? 0;
         const active = cval > 0;
         const onLivePage = pathname === LIVE_PANEL_ROUTE_BY_LABEL[label];

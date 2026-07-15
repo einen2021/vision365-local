@@ -20,14 +20,21 @@ function coerceLiveFeedTime(raw) {
 
 export function normalizeLiveFeedRow(raw) {
   if (!raw || typeof raw !== "object") return { message: "", time: Date.now() }
-  const message =
+  let message =
     typeof raw.message === "string"
       ? raw.message
       : raw.message != null
         ? String(raw.message)
         : ""
-  const time = coerceLiveFeedTime(raw.time)
-  return { message, time }
+  // Older writers baked the clock into the message ("… — 7/12/2026, 9:39:12 AM").
+  // Prefer the separate time field and keep the message readable.
+  message = message.replace(/\s+[—–-]\s+\d{1,2}\/\d{1,2}\/\d{2,4}.*/u, "").trim()
+  const time = coerceLiveFeedTime(raw.time ?? raw.timestamp)
+  return {
+    message,
+    time,
+    rawMessage: raw.rawMessage || null,
+  }
 }
 
 export function pickAlarmLikeAppendTarget(docData, canonicalDocId) {
@@ -72,11 +79,25 @@ export function countLiveFeedDocRows(snap, canonicalDocId) {
 
 export function formatLiveFeedTime(ms) {
   try {
-    const n = typeof ms === "number" ? ms : Number(ms)
-    if (!Number.isFinite(n)) return "—"
-    return new Date(n).toLocaleString()
+    let n = null;
+    if (typeof ms === "number" && Number.isFinite(ms)) {
+      n = ms;
+    } else if (typeof ms === "string") {
+      // Prefer ISO / date parse — Number("2026-07-12T...") is NaN.
+      const parsed = Date.parse(ms);
+      if (Number.isFinite(parsed)) n = parsed;
+      else {
+        const asNum = Number(ms);
+        if (Number.isFinite(asNum)) n = asNum;
+      }
+    } else if (ms != null) {
+      const asNum = Number(ms);
+      if (Number.isFinite(asNum)) n = asNum;
+    }
+    if (!Number.isFinite(n)) return "—";
+    return new Date(n).toLocaleString();
   } catch {
-    return "—"
+    return "—";
   }
 }
 

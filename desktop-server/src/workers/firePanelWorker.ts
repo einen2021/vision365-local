@@ -5,7 +5,14 @@ type IncomingMessage =
   | { type: "connect"; host: string; port: number }
   | { type: "disconnect" }
   | { type: "status"; id: string }
-  | { type: "command"; id: string; command: string; timeoutMs?: number };
+  | {
+      type: "command";
+      id: string;
+      command: string;
+      timeoutMs?: number;
+      /** For list f/t/s: keep waiting until this many device rows arrive. */
+      expectedCount?: number;
+    };
 
 type OutgoingMessage =
   | { type: "connected"; connected: boolean; host: string; port: number }
@@ -16,7 +23,12 @@ type OutgoingMessage =
 
 const CONNECT_DELAY_MS = 300;
 const COMMAND_TIMEOUT_MS = 2000;
-const LIST_COMMAND_TIMEOUT_MS = 15000;
+/**
+ * Soft timeout for list commands: reset on each data chunk so slow dumps keep going.
+ * Absolute ceiling still applies so a stuck panel cannot hang forever.
+ */
+const LIST_COMMAND_TIMEOUT_MS = 120000;
+const LIST_COMMAND_ABSOLUTE_MS = 300000;
 const SHOW_COMMAND_TIMEOUT_MS = 8000;
 const BULK_COMMAND_TIMEOUT_MS = 60000;
 /** Resolve when no bytes arrive for this long (panel finished sending) */
@@ -24,6 +36,11 @@ const IDLE_COMPLETE_MS = 100;
 const SHOW_IDLE_COMPLETE_MS = 300;
 const CVAL_IDLE_COMPLETE_MS = 450;
 const LIST_IDLE_COMPLETE_MS = 250;
+/**
+ * After at least one list row arrives, finish if the panel goes quiet this long
+ * even without full CVAL / _DNE — stream what we have to the UI.
+ */
+const LIST_IDLE_AFTER_ROWS_MS = 800;
 
 let client: net.Socket | null = null;
 let currentHost = "";
@@ -35,6 +52,12 @@ let commandChain: Promise<unknown> = Promise.resolve();
 
 /** Active command fail handlers — cleared when the socket drops mid-command. */
 const activeCommandFails = new Set<(err: Error) => void>();
+
+/**
+ * When a list dump is in flight, priority commands (ack / silence / login)
+ * call this to finish early so fire ack is not stuck behind list t (200+ rows).
+ */
+let preemptActiveList: (() => void) | null = null;
 
 function failActiveCommands(reason: string) {
   const err = new Error(reason);
@@ -126,6 +149,15 @@ function timeoutForCommand(command: string, overrideMs?: number) {
   if (trimmed.startsWith("list")) return LIST_COMMAND_TIMEOUT_MS;
   if (trimmed.startsWith("show")) return SHOW_COMMAND_TIMEOUT_MS;
   if (trimmed.startsWith("cshow") && trimmed.includes("cval")) return 3000;
+  // Ack / silence / login should never sit on a long soft timeout.
+  if (
+    trimmed.startsWith("ack") ||
+    trimmed.startsWith("silence") ||
+    trimmed.startsWith("login") ||
+    /^set\s+p21[27]\s+on$/i.test(trimmed)
+  ) {
+    return 3000;
+  }
   return COMMAND_TIMEOUT_MS;
 }
 
@@ -144,7 +176,7 @@ function idleMsForCommand(command: string) {
 }
 
 function isDefiniteComplete(response: string) {
-  return /_DNE/i.test(sanitizePanelText(response));
+  return /_DNE|_END\b/i.test(sanitizePanelText(response));
 }
 
 /** NUL-padded panel columns look blank in logs but break \s-based matching. */
@@ -167,11 +199,66 @@ function isQuickComplete(command: string, response: string) {
       /ENABLED\s+STATE(?:\s*:|\s{2,})\s*\S/i.test(text)
     );
   }
+  // Ack / silence / set usually echo quickly — do not wait for a long idle.
+  if (
+    trimmed.startsWith("ack") ||
+    trimmed.startsWith("silence") ||
+    /^set\s+p21[27]\s+on$/i.test(trimmed)
+  ) {
+    return text.trim().length > 0;
+  }
   return false;
 }
 
 function isListCommand(command: string) {
   return cleanCommandText(command).toLowerCase().startsWith("list");
+}
+
+/** True when the dump already contains at least one device address row. */
+function listHasDeviceRows(response: string) {
+  return /\b\d*:?M\d+-\d+(?:-\d+)?\b/i.test(sanitizePanelText(response));
+}
+
+/** Count device rows in a list dump (approx. matches client parsePanelListResponse). */
+function countListMessages(response: string) {
+  const text = sanitizePanelText(response);
+  let count = 0;
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (/_DNE|_END\b/i.test(trimmed)) continue;
+    if (/^list\s/i.test(trimmed)) continue;
+    if (/\b\d*:?M\d+-\d+(?:-\d+)?\b/i.test(trimmed)) count += 1;
+  }
+  return count;
+}
+
+/**
+ * Complete when we have ~CVAL messages, or _DNE, or (fallback) rows + idle.
+ * expectedCount comes from totalFire / totalTrouble / totalSupervisory.
+ */
+function isListCountReady(response: string, expectedCount?: number) {
+  if (isDefiniteComplete(response)) return true;
+  if (
+    typeof expectedCount === "number" &&
+    Number.isFinite(expectedCount) &&
+    expectedCount > 0 &&
+    countListMessages(response) >= expectedCount
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Fire-critical panel commands — must not wait behind a long list dump. */
+function isPriorityCommand(command: string) {
+  const trimmed = cleanCommandText(command).toLowerCase();
+  return (
+    trimmed.startsWith("ack") ||
+    trimmed.startsWith("silence") ||
+    trimmed.startsWith("login") ||
+    /^set\s+p21[27]\s+on$/i.test(trimmed)
+  );
 }
 
 function isCvalCommand(command: string) {
@@ -225,23 +312,64 @@ function disconnect() {
   post({ type: "connected", connected: false, host: currentHost, port: currentPort });
 }
 
-function sendCommand(command: string, timeoutMs?: number, commandId?: string) {
-  return enqueueCommand(() => sendCommandOnce(command, timeoutMs, commandId));
+function sendCommand(
+  command: string,
+  timeoutMs?: number,
+  commandId?: string,
+  expectedCount?: number,
+) {
+  // Abort an in-flight list dump so ack/silence is not blocked for minutes.
+  if (isPriorityCommand(command) && preemptActiveList) {
+    console.warn(
+      `[fire-panel] preempting in-flight list for priority command: ${cleanCommandText(command)}`,
+    );
+    try {
+      preemptActiveList();
+    } catch {
+      // ignore — list may already be finishing
+    }
+  }
+
+  return enqueueCommand(async () => {
+    // Brief settle after preempt so leftover list bytes are less likely to
+    // pollute the ack response.
+    if (isPriorityCommand(command)) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+    return sendCommandOnce(command, timeoutMs, commandId, expectedCount);
+  });
 }
 
-function sendCommandOnce(command: string, timeoutMs?: number, commandId?: string) {
+function sendCommandOnce(
+  command: string,
+  timeoutMs?: number,
+  commandId?: string,
+  expectedCount?: number,
+) {
   ensureConnected();
   const socket = client as net.Socket;
   const normalized = normalizeCommand(command);
   const maxWaitMs = timeoutForCommand(command, timeoutMs);
   const idleMs = idleMsForCommand(command);
+  const isList = isListCommand(command);
+  const hasExpected =
+    isList &&
+    typeof expectedCount === "number" &&
+    Number.isFinite(expectedCount) &&
+    expectedCount > 0;
+  // List soft timeout resets on every chunk; absolute ceiling stops a hung panel.
+  const absoluteMaxMs = isList
+    ? Math.max(maxWaitMs, LIST_COMMAND_ABSOLUTE_MS)
+    : maxWaitMs;
 
   return new Promise<string>((resolve, reject) => {
     let response = "";
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let hardTimeout: ReturnType<typeof setTimeout> | null = null;
     let settled = false;
     let lastChunkPost = 0;
-    const streamingList = isListCommand(command) && Boolean(commandId);
+    const startedAt = Date.now();
+    const streamingList = isList && Boolean(commandId);
 
     const emitChunk = (done: boolean) => {
       if (!streamingList || !commandId) return;
@@ -249,41 +377,87 @@ function sendCommandOnce(command: string, timeoutMs?: number, commandId?: string
       lastChunkPost = Date.now();
     };
 
+    const clearPreemptHook = () => {
+      if (preemptActiveList === finishEarly) preemptActiveList = null;
+    };
+
     const finish = () => {
       if (settled) return;
       settled = true;
+      clearPreemptHook();
       activeCommandFails.delete(fail);
-      clearTimeout(hardTimeout);
+      if (hardTimeout) clearTimeout(hardTimeout);
+      clearTimeout(absoluteTimeout);
       if (idleTimer) clearTimeout(idleTimer);
       socket.removeListener("data", onData);
       if (streamingList) emitChunk(true);
       // Return NUL-cleaned text so Asset Control can parse PRIMARY STATUS / ENABLED STATE.
       const cleaned = cleanCommandText(command).toLowerCase().startsWith("show")
         ? sanitizePanelText(response)
-        : response;
+        : // Also clean NULs from list dumps so the UI parser sees full rows.
+          isList
+          ? sanitizePanelText(response)
+          : response;
       resolve(cleaned);
     };
+
+    // Same as finish — used as the preempt hook identity.
+    function finishEarly() {
+      console.warn(
+        `[fire-panel] list preempted after ${Date.now() - startedAt}ms (${response.length} chars) — returning best effort`,
+      );
+      finish();
+    }
 
     const fail = (err: Error) => {
       if (settled) return;
       settled = true;
+      clearPreemptHook();
       activeCommandFails.delete(fail);
-      clearTimeout(hardTimeout);
+      if (hardTimeout) clearTimeout(hardTimeout);
+      clearTimeout(absoluteTimeout);
       if (idleTimer) clearTimeout(idleTimer);
       socket.removeListener("data", onData);
       reject(err);
     };
 
     activeCommandFails.add(fail);
+    if (isList) {
+      preemptActiveList = finishEarly;
+    }
 
     const scheduleIdleComplete = () => {
       if (idleTimer) clearTimeout(idleTimer);
+      // Only settle quickly once we already have ~CVAL messages (or _DNE path).
+      // Do NOT use a short idle when still short of CVAL — large dumps pause between batches.
+      const countReady = isListCountReady(response, expectedCount);
+      const waitMs =
+        isList && countReady
+          ? 200 // got CVAL amount — brief window for trailing _DNE
+          : idleMs;
       idleTimer = setTimeout(() => {
         if (response.length === 0) return;
-        // List output ends with _DNE — keep reading until the panel marks done
-        if (isListCommand(command) && !isDefiniteComplete(response)) {
+
+        if (isList) {
+          if (isDefiniteComplete(response) || isListCountReady(response, expectedCount)) {
+            finish();
+            return;
+          }
+          // Known CVAL target and still short: keep reading (soft timeout handles stopped panels).
+          if (hasExpected) {
+            return;
+          }
+          // No CVAL target: finish on quiet after rows so UI does not hang.
+          if (listHasDeviceRows(response)) {
+            console.warn(
+              `[fire-panel] list idle after rows (${Date.now() - startedAt}ms) — have ${countListMessages(response)} messages — completing`,
+            );
+            finish();
+            return;
+          }
           return;
         }
+
         // CVAL responses often arrive in multiple chunks — wait until CVAL= is present
         if (isCvalCommand(command) && !/CVAL\s*=\s*\d+/i.test(response)) {
           scheduleIdleComplete();
@@ -300,10 +474,10 @@ function sendCommandOnce(command: string, timeoutMs?: number, commandId?: string
           return;
         }
         finish();
-      }, idleMs);
+      }, waitMs);
     };
 
-    const hardTimeout = setTimeout(() => {
+    const onHardTimeout = () => {
       // Never return a partial `show` — Asset Control needs PRIMARY STATUS + ENABLED STATE.
       if (cleanCommandText(command).toLowerCase().startsWith("show")) {
         if (isQuickComplete(command, response)) {
@@ -313,27 +487,85 @@ function sendCommandOnce(command: string, timeoutMs?: number, commandId?: string
         fail(new Error("Timeout waiting for complete show response"));
         return;
       }
+      // Soft timeout resets on every chunk. If quiet while still short of CVAL, take best effort.
+      if (isList && response.length > 0 && !isListCountReady(response, expectedCount)) {
+        console.warn(
+          `[fire-panel] list soft-timeout after idle (${Date.now() - startedAt}ms) — have ${countListMessages(response)}${hasExpected ? `/${expectedCount}` : ""} messages — completing best effort`,
+        );
+        finish();
+        return;
+      }
       if (response.length > 0) {
         finish();
         return;
       }
       fail(new Error("Timeout waiting for response"));
-    }, maxWaitMs);
+    };
+
+    const armSoftTimeout = () => {
+      if (hardTimeout) clearTimeout(hardTimeout);
+      // While short of CVAL, allow longer gaps between telnet batches (panel dumps slowly).
+      // Soft timer still resets on every chunk so continuous dumps keep going.
+      let wait = maxWaitMs;
+      if (isList && listHasDeviceRows(response)) {
+        if (hasExpected && !isListCountReady(response, expectedCount)) {
+          wait = Math.min(maxWaitMs, 90000);
+        } else {
+          wait = Math.min(maxWaitMs, 12000);
+        }
+      }
+      hardTimeout = setTimeout(onHardTimeout, wait);
+    };
+
+    // Absolute ceiling for list dumps only (CVAL/ack/show use their own soft timeout).
+    const absoluteTimeout = setTimeout(() => {
+      if (settled) return;
+      if (!isList) {
+        onHardTimeout();
+        return;
+      }
+      console.warn(
+        `[fire-panel] list absolute timeout after ${absoluteMaxMs}ms (${response.length} chars, ${countListMessages(response)} messages) — returning best effort`,
+      );
+      if (response.length > 0) {
+        finish();
+        return;
+      }
+      fail(new Error("Timeout waiting for response"));
+    }, absoluteMaxMs);
+
+    armSoftTimeout();
 
     function onData(data: Buffer) {
       response += data.toString();
+
+      // Keep waiting as long as the panel is still dumping list rows.
+      if (isList) {
+        armSoftTimeout();
+      }
 
       if (streamingList) {
         const now = Date.now();
         const text = data.toString();
         const hasNewline = text.includes("\n") || text.includes("\r");
-        if (
-          hasNewline ||
-          isDefiniteComplete(response) ||
-          now - lastChunkPost >= 120
-        ) {
-          emitChunk(isDefiniteComplete(response));
+        const ready = isListCountReady(response, expectedCount);
+        if (hasNewline || ready || now - lastChunkPost >= 120) {
+          emitChunk(ready);
         }
+      }
+
+      if (isList) {
+        if (isDefiniteComplete(response)) {
+          finish();
+          return;
+        }
+        // Hit CVAL count — settle briefly then finish (do not wait forever for _DNE).
+        if (isListCountReady(response, expectedCount)) {
+          scheduleIdleComplete();
+          return;
+        }
+        scheduleIdleComplete();
+        return;
       }
 
       if (isDefiniteComplete(response)) {
@@ -395,7 +627,7 @@ parentPort?.on("message", (msg: IncomingMessage) => {
       return;
     }
 
-    void sendCommand(msg.command, msg.timeoutMs, msg.id)
+    void sendCommand(msg.command, msg.timeoutMs, msg.id, msg.expectedCount)
       .then((response) => post({ type: "result", id: msg.id, ok: true, response }))
       .catch((err) => post({ type: "result", id: msg.id, ok: false, error: (err as Error).message }));
   }

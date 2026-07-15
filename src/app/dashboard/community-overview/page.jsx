@@ -1559,10 +1559,10 @@ function CommunityOverviewContent() {
                         <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
                         Loading messages…
                       </div>
-                    ) : alarmHistoryTab === 'liveFire' && liveAlarmData ? (
+                    ) : alarmHistoryTab === 'liveFire' ? (
                       <div className="space-y-4">
-                        {liveAlarmData.buildingData?.length === 0 ? (
-                          <div className="text-center py-4">No buildings to show.</div>
+                        {!liveAlarmData || liveAlarmData.buildingData?.length === 0 ? (
+                          <div className="text-center py-4">No live fire history yet.</div>
                         ) : (
                           liveAlarmData.buildingData?.map((buildingGroup, bidx) => (
                             <div key={bidx} className="space-y-2">
@@ -1602,10 +1602,10 @@ function CommunityOverviewContent() {
                           ))
                         )}
                       </div>
-                    ) : alarmHistoryTab === 'liveTrouble' && liveTroubleData ? (
+                    ) : alarmHistoryTab === 'liveTrouble' ? (
                       <div className="space-y-4">
-                        {liveTroubleData.buildingData?.length === 0 ? (
-                          <div className="text-center py-4">No buildings to show.</div>
+                        {!liveTroubleData || liveTroubleData.buildingData?.length === 0 ? (
+                          <div className="text-center py-4">No live trouble history yet.</div>
                         ) : (
                           liveTroubleData.buildingData?.map((buildingGroup, bidx) => (
                             <div key={bidx} className="space-y-2">
@@ -1645,10 +1645,10 @@ function CommunityOverviewContent() {
                           ))
                         )}
                       </div>
-                    ) : alarmHistoryTab === 'liveSupervisory' && liveSupervisoryData ? (
+                    ) : alarmHistoryTab === 'liveSupervisory' ? (
                       <div className="space-y-4">
-                        {liveSupervisoryData.buildingData?.length === 0 ? (
-                          <div className="text-center py-4">No buildings to show.</div>
+                        {!liveSupervisoryData || liveSupervisoryData.buildingData?.length === 0 ? (
+                          <div className="text-center py-4">No live supervisory history yet.</div>
                         ) : (
                           liveSupervisoryData.buildingData?.map((buildingGroup, bidx) => (
                             <div key={bidx} className="space-y-2">

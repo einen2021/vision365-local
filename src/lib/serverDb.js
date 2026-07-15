@@ -135,8 +135,14 @@ export function getDocument(db, segments) {
 
 export function setDocument(db, segments, data, merge = false) {
   const { parent, lastKey } = getParent(db, segments);
-  if (merge && parent[lastKey] && typeof parent[lastKey] === "object") {
-    parent[lastKey] = { ...parent[lastKey], ...data };
+  if (merge) {
+    // Honor deleteField() / __deleteField instead of storing the marker object.
+    const existing =
+      parent[lastKey] && typeof parent[lastKey] === "object" && !Array.isArray(parent[lastKey])
+        ? { ...parent[lastKey] }
+        : {};
+    applyUpdate(existing, data || {});
+    parent[lastKey] = existing;
   } else {
     parent[lastKey] = data;
   }

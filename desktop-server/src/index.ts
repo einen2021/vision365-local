@@ -11,7 +11,7 @@ import { cors } from "hono/cors";
 import { connectMongo, closeDatabase } from "./db/client";
 import { startEmbeddedMongo, stopEmbeddedMongo } from "./db/embeddedMongo";
 import { runMigrations } from "./db/migrate";
-import { seedIfEmpty } from "./db/seed";
+import { seedIfEmpty, restoreFromBackupIfEmpty } from "./db/seed";
 import { resolveAppDataPath, initAppDirectories } from "./services/storageService";
 import { loadSettings } from "./services/settingsService";
 import { initServerLog, serverLog, serverLogError } from "./log";
@@ -78,6 +78,13 @@ async function main() {
 
   await seedIfEmpty(appDataPath);
   serverLog("Seed complete");
+
+  try {
+    const restored = await restoreFromBackupIfEmpty(appDataPath);
+    if (restored) serverLog("Restored database from JSON snapshot backup");
+  } catch (error) {
+    serverLogError(`Backup restore check failed: ${(error as Error).message}`);
+  }
 
   loadSettings(paths);
 

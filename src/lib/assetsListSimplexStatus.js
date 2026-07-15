@@ -5,10 +5,14 @@ import {
   getAssetsListSnapshot,
   invalidateAssetsListSnapshotCache,
 } from "@/lib/floorMapAssets"
-import { normalizeSimplexStatus } from "@/lib/assetFireStatus"
+import {
+  collectDeviceAddressKeys,
+  normalizeSimplexStatus,
+} from "@/lib/assetFireStatus"
 import {
   resolveAssetDeviceAddress,
   parseSimplexAddressToken,
+  stripPanelAddressPrefix,
 } from "@/lib/simplexDeviceAddress"
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
 
@@ -39,48 +43,187 @@ export async function resolveAssetsListDocId(asset, deviceAddress = "") {
   return null
 }
 
+/**
+ * Build every address form we might need to match panel ↔ AssetsList.
+ * Covers: 2:M1-2-0, M1-2-0, M1-2, trailing -0, loop/device fields.
+ */
+export function expandPanelAddressMatchKeys(panelAddress) {
+  const keys = new Set()
+
+  const add = (value) => {
+    const raw = String(value || "").trim()
+    if (!raw) return
+    for (const key of collectDeviceAddressKeys(raw)) {
+      keys.add(String(key).toUpperCase())
+    }
+    const stripped = stripPanelAddressPrefix(raw).toUpperCase()
+    if (stripped) keys.add(stripped)
+    // Panel often reports M1-2-0 while AssetsList stores M1-2 (or the reverse).
+    if (/-\d+$/.test(stripped)) {
+      keys.add(stripped.replace(/-\d+$/, ""))
+    }
+    if (/^M\d+-\d+$/i.test(stripped)) {
+      keys.add(`${stripped}-0`)
+    }
+  }
+
+  add(panelAddress)
+  const parsed = parseSimplexAddressToken(panelAddress)
+  if (parsed?.full) add(parsed.full)
+  if (parsed?.mAddress) add(parsed.mAddress)
+
+  return keys
+}
+
+/** All searchable address keys for one AssetsList document. */
+export function collectAssetAddressMatchKeys(asset = {}, docId = "") {
+  const keys = new Set()
+  const add = (value) => {
+    for (const key of expandPanelAddressMatchKeys(value)) {
+      keys.add(key)
+    }
+  }
+
+  add(docId)
+  add(asset.id)
+  add(asset.deviceAddress)
+  add(asset.partNumber)
+  add(asset.address)
+  add(asset.simplexAddress)
+  add(resolveAssetDeviceAddress(asset))
+
+  // Build from loop / device / subAdd when stored as separate fields.
+  if (asset.loopNumber && asset.deviceNumber) {
+    add(
+      resolveAssetDeviceAddress({
+        loopNumber: asset.loopNumber,
+        deviceNumber: asset.deviceNumber,
+        subAdd: asset.subAdd,
+        panel: asset.panel ?? asset.Panel ?? null,
+        includeZeroSubAdd: true,
+      }),
+    )
+    add(
+      resolveAssetDeviceAddress({
+        loopNumber: asset.loopNumber,
+        deviceNumber: asset.deviceNumber,
+        subAdd: asset.subAdd,
+        panel: asset.panel ?? asset.Panel ?? null,
+        includeZeroSubAdd: false,
+      }),
+    )
+  }
+
+  return keys
+}
+
+// In-memory address → AssetsList row map, rebuilt when the snapshot changes.
+let addressIndexRef = null
+
+/** Clear the address index (call when AssetsList snapshot cache is invalidated). */
+export function clearAssetsListAddressIndex() {
+  addressIndexRef = null
+}
+
+/**
+ * Build (or reuse) a Map of every address key → AssetsList entry.
+ * One pass over AssetsList is much faster than scanning per fire address.
+ */
+async function getAssetsListAddressIndex() {
+  const snapshot = await getAssetsListSnapshot(db)
+  if (addressIndexRef?.snapshot === snapshot) {
+    return addressIndexRef.map
+  }
+
+  const map = new Map()
+  for (const docSnap of snapshot.docs) {
+    const data = docSnap.data()
+    const entry = { id: docSnap.id, data }
+    for (const key of collectAssetAddressMatchKeys(data, docSnap.id)) {
+      // Keep the first match for each key (stable / predictable).
+      if (!map.has(key)) map.set(key, entry)
+    }
+  }
+
+  addressIndexRef = { snapshot, map }
+  return map
+}
+
 /** Find AssetsList row by panel list address (doc id or deviceAddress field). */
 export async function findAssetsListEntryByPanelAddress(panelAddress) {
   const token = String(panelAddress || "").trim()
   if (!token) return null
 
-  const candidates = new Set([token])
-  const parsed = parseSimplexAddressToken(token)
-  if (parsed?.full) candidates.add(parsed.full)
-  if (parsed?.mAddress) candidates.add(parsed.mAddress)
+  const panelKeys = expandPanelAddressMatchKeys(token)
 
-  // Fast path: AssetsList doc id often matches the panel address.
-  for (const id of candidates) {
+  // If the address index is already warm, use it first (no network).
+  if (addressIndexRef?.map) {
+    for (const panelKey of panelKeys) {
+      const hit = addressIndexRef.map.get(panelKey)
+      if (hit) return hit
+    }
+  }
+
+  // Fast path: only a few likely doc ids (avoid dozens of getDoc round-trips).
+  const likelyIds = []
+  const addLikely = (value) => {
+    const id = String(value || "").trim()
+    if (!id) return
+    if (!likelyIds.some((existing) => existing.toUpperCase() === id.toUpperCase())) {
+      likelyIds.push(id)
+    }
+  }
+  addLikely(token)
+  const parsed = parseSimplexAddressToken(token)
+  if (parsed?.full) addLikely(parsed.full)
+  if (parsed?.mAddress) addLikely(parsed.mAddress)
+
+  for (const id of likelyIds) {
     const snap = await getDoc(doc(db, "AssetsList", id))
     if (snap.exists()) return { id: snap.id, data: snap.data() }
   }
 
-  // Cached full scan — much faster than getDocs() on every fire address.
-  const snapshot = await getAssetsListSnapshot(db)
-  for (const docSnap of snapshot.docs) {
-    const data = docSnap.data()
-    const resolved = resolveAssetDeviceAddress(data)
-    if (
-      candidates.has(resolved) ||
-      candidates.has(String(resolved).toUpperCase()) ||
-      candidates.has(docSnap.id)
-    ) {
-      return { id: docSnap.id, data }
-    }
-
-    // Also match stripped panel prefix (2:M1-2-0 vs M1-2-0).
-    for (const candidate of candidates) {
-      const a = String(resolved || "").toUpperCase()
-      const b = String(candidate || "").toUpperCase()
-      if (!a || !b) continue
-      if (a === b) return { id: docSnap.id, data }
-      if (a.replace(/^\d+:/, "") === b.replace(/^\d+:/, "")) {
-        return { id: docSnap.id, data }
-      }
-    }
+  // Indexed lookup from cached AssetsList snapshot (O(keys), not O(docs)).
+  const index = await getAssetsListAddressIndex()
+  for (const panelKey of panelKeys) {
+    const hit = index.get(panelKey)
+    if (hit) return hit
   }
 
   return null
+}
+
+/**
+ * Resolve AssetsList entries for every address in a panel list response.
+ * Newest / last address is preferred first (fire alert uses the latest device).
+ */
+export async function findAssetsForPanelAddresses(panelAddresses = []) {
+  const unique = []
+  const seen = new Set()
+  for (const address of panelAddresses || []) {
+    const key = String(address || "").trim().toUpperCase()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    unique.push(String(address).trim())
+  }
+
+  // Pre-build the address index once so each lookup can hit memory first.
+  if (unique.length > 0) {
+    await getAssetsListAddressIndex()
+  }
+
+  const results = []
+  // Walk newest-last first so fire alert gets the latest device ASAP.
+  for (let i = unique.length - 1; i >= 0; i -= 1) {
+    const deviceAddress = unique[i]
+    const entry = await findAssetsListEntryByPanelAddress(deviceAddress)
+    results.push({
+      deviceAddress,
+      entry,
+      found: Boolean(entry),
+    })
+  }
+  return results
 }
 
 /** Set simplexStatus.F or .T to 0 on the AssetsList record. */

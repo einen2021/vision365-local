@@ -8,13 +8,7 @@ import {
   getFireDimColor,
   shouldFireRipple,
 } from "@/lib/assetFireStatus";
-import {
-  DISABLED_MARKER_STYLES,
-  getEnabledMarkerBorderColor,
-  getEnabledMarkerDimColor,
-} from "@/lib/assetEnabledStatus";
 import { useAssetFireActive } from "@/stores/assetFireStatusStore";
-import { useIsDeviceEnabled } from "@/stores/deviceEnabledStore";
 import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
 
 function CommunityOverviewFloorMarkerInner({
@@ -29,13 +23,12 @@ function CommunityOverviewFloorMarkerInner({
 }) {
   const deviceAddr = resolveAssetDeviceAddress(mapping) || mapping.deviceAddress || "";
   const assetId = mapping.assetsListId || mapping.id || mapping.buildingAssetId;
+  // Marker colors from monitoring F/T only — not from `show` ENABLED / PRIMARY STATUS.
   const active = useAssetFireActive(assetId, deviceAddr, fallbackActive, live);
-  const mappingEnabled = mapping?.enabled !== false;
-  const isDeviceEnabled = useIsDeviceEnabled(deviceAddr, mappingEnabled);
   const markerTooltip = getAssetMarkerTooltip(mapping, {});
-  const dimColor = getEnabledMarkerDimColor(isDeviceEnabled, getFireDimColor(active));
-  const borderColor = getEnabledMarkerBorderColor(isDeviceEnabled, getFireBorderColor(active));
-  const pulse = isDeviceEnabled && shouldFireRipple(active);
+  const dimColor = getFireDimColor(active);
+  const borderColor = getFireBorderColor(active);
+  const pulse = shouldFireRipple(active);
 
   return (
     <div
@@ -82,9 +75,7 @@ function CommunityOverviewFloorMarkerInner({
         alt={mapping.assetName || "asset"}
         className="w-6 h-6 rounded-full border-2 shadow-lg object-cover"
         style={{
-          borderColor: isDeviceEnabled ? "#ffffff" : DISABLED_MARKER_STYLES.borderColor,
-          opacity: isDeviceEnabled ? 1 : DISABLED_MARKER_STYLES.iconOpacity,
-          filter: isDeviceEnabled ? undefined : DISABLED_MARKER_STYLES.iconFilter,
+          borderColor: "#ffffff",
         }}
       />
     </div>

@@ -6,7 +6,7 @@ import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { sanitizeDbSeed } from "../src/lib/defaultDbSeed.js";
+import { stripSeedToLoginOnly } from "../src/lib/defaultDbSeed.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -95,15 +95,16 @@ console.log("[bundle] Verified mongodb runtime dependencies");
 // 4. Download bundled mongod for embedded MongoDB
 execSync("node scripts/download-mongodb.mjs", { cwd: root, stdio: "inherit", shell: true });
 
-// 5. Copy sanitized seed database for first-run on installed machines
+// 5. Copy login-only seed for first-run on installed machines (package only).
+// Runtime desktop-server never strips communities/assets from an existing DB.
 
 const seedSrc = path.join(root, "data", "db.json");
 const seedDest = path.join(root, "src-tauri", "resources", "db-seed.json");
 if (fs.existsSync(seedSrc)) {
   const raw = JSON.parse(fs.readFileSync(seedSrc, "utf-8"));
-  const clean = sanitizeDbSeed(raw);
+  const clean = stripSeedToLoginOnly(raw);
   fs.writeFileSync(seedDest, `${JSON.stringify(clean, null, 2)}\n`);
-  console.log("[bundle] Wrote sanitized db-seed.json (admin only, empty data)");
+  console.log("[bundle] Wrote login-only db-seed.json for MSI first install");
 }
 
 console.log("[bundle] Desktop server runtime bundle complete");

@@ -3,13 +3,7 @@
 import { memo, useState } from "react";
 import { resolveAssetTypeFromMapping } from "@/lib/assetIcons";
 import { AssetTypeMarkerImage } from "@/components/floor-plan/asset-type-marker-image";
-import {
-  DISABLED_MARKER_STYLES,
-  getEnabledMarkerBorderColor,
-  getEnabledMarkerDimColor,
-} from "@/lib/assetEnabledStatus";
 import { useAssetMarkerVisualFromMapping } from "@/stores/assetFireStatusStore";
-import { useIsDeviceEnabled } from "@/stores/deviceEnabledStore";
 import { resolveMappingDeviceFields } from "@/lib/floorMapAssets";
 import {
   Tooltip,
@@ -63,21 +57,15 @@ function FloorMapAssetMarkerInner({
   );
   const address = resolvedAddress;
   const location = String(deviceLocation || "").trim();
-  const mappingEnabled = mapping?.enabled !== false;
-  const isDeviceEnabled = useIsDeviceEnabled(address, mappingEnabled);
-  const radarColor =
-    suppressFireEffects || !isDeviceEnabled ? "transparent" : visual.radarColor;
-  const borderColor = getEnabledMarkerBorderColor(
-    isDeviceEnabled,
-    suppressFireEffects ? "hsl(var(--primary))" : visual.borderColor,
-  );
-  const dimColor = getEnabledMarkerDimColor(
-    isDeviceEnabled,
-    suppressFireEffects ? "transparent" : visual.dimColor,
-  );
+  // Enabled/disabled from AssetsList mapping only (tooltip). Marker paint = F/T.
+  const isDeviceEnabled = mapping?.enabled !== false;
+  const radarColor = suppressFireEffects ? "transparent" : visual.radarColor;
+  const borderColor = suppressFireEffects
+    ? "hsl(var(--primary))"
+    : visual.borderColor;
+  const dimColor = suppressFireEffects ? "transparent" : visual.dimColor;
   // Ripple only when F=1 (fire), never for trouble-only yellow.
-  const showFireRipple =
-    isDeviceEnabled && !suppressFireEffects && visual.ripple;
+  const showFireRipple = !suppressFireEffects && visual.ripple;
 
   const handlePointerDown = (event) => {
     if (!editable || event.button !== 0) return;
@@ -203,13 +191,9 @@ function FloorMapAssetMarkerInner({
                 width: MARKER_ICON_SIZE,
                 height: MARKER_ICON_SIZE,
                 border: `2px solid ${borderColor}`,
-                boxShadow: isDeviceEnabled
-                  ? "0 1px 2px rgba(0,0,0,0.2)"
-                  : "0 0 0 1px rgba(156,163,175,0.5)",
+                boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
                 position: "relative",
                 zIndex: 1,
-                opacity: isDeviceEnabled ? 1 : DISABLED_MARKER_STYLES.iconOpacity,
-                filter: isDeviceEnabled ? undefined : DISABLED_MARKER_STYLES.iconFilter,
               }}
             >
               <AssetTypeMarkerImage

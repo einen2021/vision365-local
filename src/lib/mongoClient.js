@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import net from "net";
 import { MongoClient } from "mongodb";
-import { sanitizeDbSeed } from "./defaultDbSeed.js";
+import { prepareDbSeed } from "./defaultDbSeed.js";
 
 const DB_NAME = "vision365";
 const MONGO_DATA_PATH = path.join(process.cwd(), "data", "mongodb");
@@ -91,6 +91,7 @@ async function ensureIndexes() {
 async function seedIfEmpty() {
   const snapshot = db.collection("db_snapshot");
   const existing = await snapshot.findOne({ _id: 1 });
+  // Never overwrite an existing database snapshot.
   if (existing) return;
 
   const seedPath = path.join(process.cwd(), "data", "db.json");
@@ -101,11 +102,12 @@ async function seedIfEmpty() {
     console.log("[mongo] Loaded seed file from data/db.json");
   }
 
-  const seedData = sanitizeDbSeed(rawSeed);
+  // Preserve communities / assets / BuildingDB — do not strip.
+  const seedData = prepareDbSeed(rawSeed);
   if (!rawSeed) {
     console.log("[mongo] Using built-in default seed (admin only, empty data)");
   } else {
-    console.log("[mongo] Sanitized seed — communities, buildings, assets, and floor plans removed");
+    console.log("[mongo] Importing seed with communities/buildings/assets preserved");
   }
 
   await snapshot.updateOne(

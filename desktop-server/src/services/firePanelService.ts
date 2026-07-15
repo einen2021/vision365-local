@@ -6,7 +6,13 @@ type IncomingMessage =
   | { type: "connect"; host: string; port: number }
   | { type: "disconnect" }
   | { type: "status"; id: string }
-  | { type: "command"; id: string; command: string; timeoutMs?: number };
+  | {
+      type: "command";
+      id: string;
+      command: string;
+      timeoutMs?: number;
+      expectedCount?: number;
+    };
 
 type OutgoingMessage =
   | { type: "connected"; connected: boolean; host: string; port: number }
@@ -140,7 +146,12 @@ function ensureWorkers() {
     }
 
     if (msg.type === "chunk") {
-      chunkHandlers.get(msg.id)?.(msg.response, msg.done);
+      // Never let stream/UI handlers take down the whole API process.
+      try {
+        chunkHandlers.get(msg.id)?.(msg.response, msg.done);
+      } catch (error) {
+        addLog(`chunk handler error: ${(error as Error).message}`);
+      }
       return;
     }
 
@@ -268,6 +279,7 @@ async function sendCommandViaWorker(
   command: string,
   timeoutMs?: number,
   onChunk?: (response: string, done: boolean) => void,
+  expectedCount?: number,
 ) {
   ensureWorkers();
 
@@ -275,7 +287,13 @@ async function sendCommandViaWorker(
   addLog(`Command: ${trimmed}`);
 
   const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const msg: IncomingMessage = { type: "command", id, command, timeoutMs };
+  const msg: IncomingMessage = {
+    type: "command",
+    id,
+    command,
+    timeoutMs,
+    expectedCount,
+  };
 
   if (onChunk) {
     chunkHandlers.set(id, onChunk);
@@ -296,18 +314,30 @@ export async function sendFirePanelCommandStreaming(
   command: string,
   timeoutMs: number | undefined,
   onChunk: (response: string, done: boolean) => void,
+  expectedCount?: number,
 ) {
   ensureConnected();
-  const response = await sendCommandViaWorker(command, timeoutMs, onChunk);
+  const response = await sendCommandViaWorker(
+    command,
+    timeoutMs,
+    onChunk,
+    expectedCount,
+  );
   return { response };
 }
 
 export async function sendFirePanelCommand(
   command: string,
   timeoutMs?: number,
+  expectedCount?: number,
 ) {
   ensureConnected();
-  const response = await sendCommandViaWorker(command, timeoutMs);
+  const response = await sendCommandViaWorker(
+    command,
+    timeoutMs,
+    undefined,
+    expectedCount,
+  );
   return { response };
 }
 

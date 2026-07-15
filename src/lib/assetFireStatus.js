@@ -64,7 +64,8 @@ function resolveStatusFromCache(cache, deviceAddress, assetId) {
     }
   }
 
-  // Panel list F/T/S (optimistic) — OR with AssetsList so a 1s poll cannot wipe live flags.
+  // Panel-list F/T/S from monitoring — preferred over AssetsList so a stale
+  // or show-command AssetsList row cannot flip marker colors.
   let fromPanel = null;
   if (cache.panelLiveByAddress) {
     for (const addr of addressKeys) {
@@ -75,16 +76,15 @@ function resolveStatusFromCache(cache, deviceAddress, assetId) {
     }
   }
 
-  if (!fromList && !fromPanel) return null;
-  if (!fromList) return fromPanel;
-  if (!fromPanel) return fromList;
-  return orSimplexStatus(fromList, fromPanel);
+  if (fromPanel) return fromPanel;
+  return fromList;
 }
 
 /**
  * Resolve status using every id/address we might have on a floor-map marker.
  * Placement doc ids often differ from AssetsList ids, so try them all.
- * Panel-live F/T is always OR'd so a DB poll with stale F=0 cannot hide a live alarm.
+ * Panel-live F/T from monitoring is preferred over AssetsList.
+ * `show` PRIMARY STATUS must not drive marker colors.
  */
 export function resolveStatusFromCacheForMapping(
   cache,
@@ -168,10 +168,9 @@ export function resolveStatusFromCacheForMapping(
     }
   }
 
-  if (!fromList && !fromPanel) return null;
-  if (!fromList) return fromPanel;
-  if (!fromPanel) return fromList;
-  return orSimplexStatus(fromList, fromPanel);
+  // Monitoring list wins — do not OR with AssetsList (can still hold old show data).
+  if (fromPanel) return fromPanel;
+  return fromList;
 }
 
 /** All cache keys to try for a panel / Simplex device address. */

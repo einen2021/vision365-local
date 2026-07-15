@@ -2,7 +2,8 @@
 
 export const PANEL_STATE_REFRESH_MS = 5000;
 export const MONITOR_INTERVAL_MS = 500;
-export const LIST_COMMAND_TIMEOUT_MS = 15000;
+/** Large trouble lists (200+) need well over 15s before the panel sends _DNE. */
+export const LIST_COMMAND_TIMEOUT_MS = 120000;
 
 export const CVAL_COMMANDS = [
   { label: "Fire", cmd: "cshow a0 cval", field: "totalFire", listCmd: "list f" },
@@ -16,7 +17,7 @@ export const CVAL_COMMANDS = [
 ];
 
 export function isListResponseComplete(response) {
-  return /_DNE/i.test(String(response));
+  return /_DNE|_END\b/i.test(String(response || "").replace(/\0/g, " "));
 }
 
 /**
@@ -24,7 +25,7 @@ export function isListResponseComplete(response) {
  * CVAL=<number> is present (strict full-line regex was failing on desktop).
  */
 export function extractCVal(response, expectedCmd = "") {
-  const text = String(response || "");
+  const text = String(response || "").replace(/\0/g, " ");
   const cvalMatch = text.match(/CVAL\s*=\s*(\d+)/i);
   if (!cvalMatch) return null;
 
@@ -48,7 +49,7 @@ export function simplexKeyForCategoryLabel(label) {
 /** Parse panel list command output into unique device addresses. */
 export function extractPanelDeviceAddresses(response) {
   const regex = /\b\d+:M\d+-\d+(?:-\d+)?\b/gi;
-  const matches = String(response || "").match(regex) ?? [];
+  const matches = String(response || "").replace(/\0/g, " ").match(regex) ?? [];
   return [...new Set(matches.map((value) => value.trim()))];
 }
 
@@ -81,8 +82,11 @@ const PANEL_DEVICE_TYPES = [
 /** Strip echoed list command text that can appear mid-response. */
 function stripListCommandEcho(line) {
   return String(line || "")
+    // Simplex pads columns with NUL bytes — treat them as spaces so regex can match.
+    .replace(/\0/g, " ")
     .replace(/^list\s+[fts]\s*/i, "")
     .replace(/^list\s+[fts](?=\d*:?M\d)/i, "")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -90,9 +94,10 @@ function stripListCommandEcho(line) {
 function parsePanelListLine(line) {
   const trimmed = stripListCommandEcho(line);
   if (!trimmed) return null;
-  if (/_DNE/i.test(trimmed)) return null;
+  if (/_DNE|_END\b/i.test(trimmed)) return null;
   if (/^list\s/i.test(trimmed)) return null;
 
+  // Address may be followed by spaces OR leftover padding after NUL→space cleanup.
   const match = trimmed.match(/^(?:(\d+):)?(M\d+-\d+(?:-\d+)?)\s+(.+)$/i);
   if (!match) return null;
 
@@ -166,7 +171,9 @@ function parsePanelListLine(line) {
     status,
     label: status.replace(/\*$/, ""),
     panelTimeText,
+    // Exact panel line — compare against liveFire / liveTrouble / liveSupervisory history.
     raw: trimmed,
+    rawMessage: trimmed,
   };
 }
 
@@ -192,13 +199,44 @@ export function formatPanelListTime(value) {
 /** Parse panel `list f|t|s` text into display rows. */
 export function parsePanelListResponse(text) {
   const entries = [];
+  // Normalize NULs before splitting so a padded "line" stays one logical row.
+  const normalized = String(text || "").replace(/\0/g, " ");
 
-  for (const line of String(text || "").split(/\r?\n/)) {
+  for (const line of normalized.split(/\r?\n/)) {
     const parsed = parsePanelListLine(line);
     if (parsed) entries.push(parsed);
   }
 
   return entries;
+}
+
+/** How many list messages (device rows) are in a list f/t/s dump. */
+export function countListMessages(response) {
+  return parsePanelListResponse(response).length;
+}
+
+/** Read totalFire / totalTrouble / totalSupervisory for a list label. */
+export function getExpectedListCountForLabel(label, panelState) {
+  const entry = CVAL_COMMANDS.find((item) => item.label === label);
+  if (!entry || !panelState) return null;
+  const n = Number(panelState[entry.field]);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * List dump is ready when:
+ * - expectedCount is 0 (cleared), or
+ * - message count is at/near the CVAL total, or
+ * - panel sent _DNE/_END
+ */
+export function isListResponseReady(response, expectedCount) {
+  if (expectedCount === 0) return true;
+  if (isListResponseComplete(response)) return true;
+  if (expectedCount != null && Number.isFinite(expectedCount) && expectedCount > 0) {
+    // "Around" CVAL: accept when we have at least the panel total.
+    return countListMessages(response) >= expectedCount;
+  }
+  return false;
 }
 
 export function getListCmdForLabel(label) {

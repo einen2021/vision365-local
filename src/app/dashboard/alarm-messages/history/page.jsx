@@ -8,7 +8,7 @@ import { ModeToggle } from "@/components/theme-toggle";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Separator } from "@/components/ui/separator";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Table,
   TableBody,
@@ -23,6 +23,7 @@ import { usePageAuth } from "@/hooks/usePageAuth";
 import { useAppData } from "@/hooks/useAppData";
 import FirestoreService from "@/services/firestoreService";
 import { fetchBuildingAlarmHistory } from "@/lib/alarmMessageHistory";
+import { normalizeBuildingName } from "@/lib/buildingNames";
 
 const TAB_CONFIG = [
   {
@@ -32,17 +33,17 @@ const TAB_CONFIG = [
   },
   {
     value: "liveFire",
-    label: "Live fire",
+    label: "Fire History",
     messageClass: "text-red-600 font-medium",
   },
   {
     value: "liveTrouble",
-    label: "Live trouble",
+    label: "Trouble History",
     messageClass: "text-yellow-700 font-medium",
   },
   {
     value: "liveSupervisory",
-    label: "Live supervisory",
+    label: "Supervisory History",
     messageClass: "text-blue-600 font-medium",
   },
 ];
@@ -60,15 +61,17 @@ function MessageTable({ rows, messageClass, emptyLabel }) {
     <Table>
       <TableHeader>
         <TableRow>
-          <TableHead className="w-[180px]">Time</TableHead>
+          <TableHead className="w-[200px]">Time</TableHead>
           <TableHead>Message</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
         {rows.map((row, idx) => (
-          <TableRow key={`${row.time}-${idx}`}>
-            <TableCell className="align-top whitespace-nowrap">
-              {row.formattedTime}
+          <TableRow key={`${row.time ?? "t"}-${idx}`}>
+            <TableCell className="align-top whitespace-nowrap text-muted-foreground">
+              {row.formattedTime && row.formattedTime !== "—"
+                ? row.formattedTime
+                : "—"}
             </TableCell>
             <TableCell className={`break-words ${messageClass}`}>
               {row.message || "—"}
@@ -120,7 +123,8 @@ export default function AlarmMessagesHistoryPage() {
 
   const loadHistory = useCallback(async (options = {}) => {
     const { showSpinner = false } = options;
-    if (!selectedBuilding) {
+    const buildingName = normalizeBuildingName(selectedBuilding);
+    if (!buildingName) {
       setHistory(null);
       setPanelStatus(null);
       return;
@@ -129,8 +133,8 @@ export default function AlarmMessagesHistoryPage() {
     if (showSpinner) setIsLoading(true);
     try {
       const [data, details] = await Promise.all([
-        fetchBuildingAlarmHistory(selectedBuilding),
-        FirestoreService.getBuildingAlarmDetails(selectedBuilding),
+        fetchBuildingAlarmHistory(buildingName),
+        FirestoreService.getBuildingAlarmDetails(buildingName),
       ]);
       setHistory(data);
       setPanelStatus(details?.panelStatus === true);
@@ -239,15 +243,19 @@ export default function AlarmMessagesHistoryPage() {
                       Loading alarm history…
                     </div>
                   ) : (
-                    TAB_CONFIG.map((tab) => (
-                      <TabsContent key={tab.value} value={tab.value}>
-                        <MessageTable
-                          rows={history?.[tab.value] ?? []}
-                          messageClass={tab.messageClass}
-                          emptyLabel={`No ${tab.label.toLowerCase()} found.`}
-                        />
-                      </TabsContent>
-                    ))
+                    // Render the active tab panel explicitly so content cannot
+                    // collapse when TabsContent sits in an auto-height flex column.
+                    TAB_CONFIG.map((tab) =>
+                      activeTab === tab.value ? (
+                        <div key={tab.value} className="min-h-[200px]">
+                          <MessageTable
+                            rows={history?.[tab.value] ?? []}
+                            messageClass={tab.messageClass}
+                            emptyLabel={`No ${tab.label.toLowerCase()} found.`}
+                          />
+                        </div>
+                      ) : null,
+                    )
                   )}
                 </Tabs>
               )}

@@ -38,6 +38,10 @@ export function invalidateAssetsListSnapshotCache() {
   assetsListSnapshotCache = null
   assetsListSnapshotFetchedAt = 0
   assetsListSnapshotPromise = null
+  // Lazy import avoids a circular dependency with assetsListSimplexStatus.
+  void import("@/lib/assetsListSimplexStatus")
+    .then((mod) => mod.clearAssetsListAddressIndex?.())
+    .catch(() => {})
 }
 
 /** Case-insensitive building name comparison for AssetsList `building` field. */

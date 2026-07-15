@@ -1983,14 +1983,18 @@ class FirestoreService {
   /**
    * Create building skeleton documents (client helper)
    * Ensures alarmMessage document uses `alarmMessage` field (array) instead of `messages`
+   *
+   * All docs go in one writeBatch so we only rewrite the local DB once
+   * (important when AssetsList is large).
    */
   static async createBuildingSkeleton(buildingName) {
     try {
       const collectionName = `${buildingName}BuildingDB`;
+      const now = new Date();
+      const batch = writeBatch(db);
 
-      const actionsRef = doc(db, collectionName, "actions");
-      await setDoc(
-        actionsRef,
+      batch.set(
+        doc(db, collectionName, "actions"),
         {
           ack: false,
           live: false,
@@ -2003,19 +2007,19 @@ class FirestoreService {
         { merge: true },
       );
 
-      const messagesRef = doc(db, collectionName, "alarmMessage");
-      // IMPORTANT: create with `alarmMessage` field (array) to match frontend expectations
-      await setDoc(
-        messagesRef,
+      // IMPORTANT: use `alarmMessage` (array), not legacy `messages`
+      batch.set(
+        doc(db, collectionName, "alarmMessage"),
         {
           alarmMessage: [],
+          // Clear any leftover legacy field in the same write
+          messages: deleteField(),
         },
         { merge: true },
       );
 
-      const alarmDetailsRef = doc(db, collectionName, "alarmDetails");
-      await setDoc(
-        alarmDetailsRef,
+      batch.set(
+        doc(db, collectionName, "alarmDetails"),
         {
           totalFire: 0,
           totalSupervisory: 0,
@@ -2024,9 +2028,8 @@ class FirestoreService {
         { merge: true },
       );
 
-      const buildingDetailsRef = doc(db, collectionName, "buildingDetails");
-      await setDoc(
-        buildingDetailsRef,
+      batch.set(
+        doc(db, collectionName, "buildingDetails"),
         {
           buildingName: buildingName,
           floorDetails: "",
@@ -2035,16 +2038,14 @@ class FirestoreService {
           operator: "",
           communityId: null,
           communityName: "Not Assigned",
-          createdAt: new Date(),
-          updatedAt: new Date(),
+          createdAt: now,
+          updatedAt: now,
         },
         { merge: true },
       );
 
-      // other minimal docs
-      const contactRef = doc(db, collectionName, "contactDetails");
-      await setDoc(
-        contactRef,
+      batch.set(
+        doc(db, collectionName, "contactDetails"),
         {
           contactName: "",
           contactNo: [],
@@ -2054,9 +2055,8 @@ class FirestoreService {
         { merge: true },
       );
 
-      const projectRef = doc(db, collectionName, "projectDetails");
-      await setDoc(
-        projectRef,
+      batch.set(
+        doc(db, collectionName, "projectDetails"),
         {
           clientName: "",
           contractorName: "",
@@ -2065,29 +2065,19 @@ class FirestoreService {
         { merge: true },
       );
 
-      // mimic and mimicMap placeholders
-      const mimicRef = doc(db, collectionName, "mimic");
-      await setDoc(mimicRef, {}, { merge: true });
-      const mimicMapRef = doc(db, collectionName, "mimicMap");
-      await setDoc(mimicMapRef, { mimicDetails: {} }, { merge: true });
-
-      // smokeActions default
-      const smokeRef = doc(db, collectionName, "smokeActions");
-      await setDoc(
-        smokeRef,
+      batch.set(doc(db, collectionName, "mimic"), {}, { merge: true });
+      batch.set(
+        doc(db, collectionName, "mimicMap"),
+        { mimicDetails: {} },
+        { merge: true },
+      );
+      batch.set(
+        doc(db, collectionName, "smokeActions"),
         { SEF: true, SPF: true, LIFT: true, FAN: true },
         { merge: true },
       );
 
-      // remove messages field from alarmMessage if it exists (cleanup for old structure)
-      const alarmMessageSnap = await getDoc(messagesRef);
-      if (alarmMessageSnap.exists()) {
-        const alarmMessageData = alarmMessageSnap.data();
-        if (alarmMessageData.messages) {
-          await updateDoc(messagesRef, { messages: deleteField() });
-        }
-      }
-
+      await batch.commit();
       return { success: true, buildingName };
     } catch (error) {
       console.error("Error creating building skeleton:", error);
