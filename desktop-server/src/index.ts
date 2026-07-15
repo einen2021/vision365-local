@@ -23,6 +23,7 @@ import { createBackupRoutes } from "./routes/backup";
 import { createExportRoutes } from "./routes/export";
 import { createSettingsRoutes } from "./routes/settings";
 import { createFirePanelRoutes } from "./routes/firePanel";
+import { shutdownFirePanelWorkers } from "./services/firePanelService";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.VISION365_PORT || 47821);
@@ -130,6 +131,7 @@ async function main() {
 
   const shutdown = async () => {
     server.close();
+    await shutdownFirePanelWorkers();
     await closeDatabase();
     await stopEmbeddedMongo();
     process.exit(0);

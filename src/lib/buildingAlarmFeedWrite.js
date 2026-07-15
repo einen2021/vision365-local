@@ -8,8 +8,38 @@ function buildingDbId(buildingName) {
   return `${base}BuildingDB`;
 }
 
-function alarmRow(message, time) {
-  return { message, time };
+/** Human-readable local time for alarm feed rows. */
+export function formatAlarmFeedTime(ms = Date.now()) {
+  try {
+    const n = typeof ms === "number" ? ms : Date.parse(String(ms));
+    if (!Number.isFinite(n)) return "—";
+    return new Date(n).toLocaleString();
+  } catch {
+    return "—";
+  }
+}
+
+function toTimestamp(time) {
+  if (typeof time === "number" && Number.isFinite(time)) return time;
+  if (typeof time === "string") {
+    const parsed = Date.parse(time);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Date.now();
+}
+
+/**
+ * Build a feed row with numeric time (for sorting/UI) and readable time in the message.
+ * Example message: "Fire at Device X — 7/12/2026, 9:39:12 AM"
+ */
+function alarmRow(message, time = Date.now()) {
+  const ts = toTimestamp(time);
+  const formatted = formatAlarmFeedTime(ts);
+  const base = String(message || "").trim() || "Alarm";
+  return {
+    message: `${base} — ${formatted}`,
+    time: ts,
+  };
 }
 
 async function appendArrayField(buildingDb, docId, fieldKey, row) {
@@ -32,25 +62,26 @@ export async function appendBuildingAlarmFeed({
   building,
   label,
   description,
-  time = new Date().toISOString(),
+  time = Date.now(),
 }) {
   const buildingDb = buildingDbId(building);
   if (!buildingDb) return false;
 
   const detail = String(description || "Unknown device").trim() || "Unknown device";
+  const ts = toTimestamp(time);
 
   if (label === "Fire") {
     await appendArrayField(
       buildingDb,
       "alarmMessages",
       "alarmMessages",
-      alarmRow(`Fire alarm at ${detail}`, time),
+      alarmRow(`Fire alarm at ${detail}`, ts),
     );
     await appendArrayField(
       buildingDb,
       "liveFire",
       "liveFire",
-      alarmRow(`Fire at ${detail}`, time),
+      alarmRow(`Fire at ${detail}`, ts),
     );
     return true;
   }
@@ -60,7 +91,7 @@ export async function appendBuildingAlarmFeed({
       buildingDb,
       "liveTrouble",
       "liveTrouble",
-      alarmRow(`Trouble at ${detail}`, time),
+      alarmRow(`Trouble at ${detail}`, ts),
     );
     return true;
   }
@@ -70,7 +101,7 @@ export async function appendBuildingAlarmFeed({
       buildingDb,
       "liveSupervisory",
       "liveSupervisory",
-      alarmRow(`Supervisory at ${detail}`, time),
+      alarmRow(`Supervisory at ${detail}`, ts),
     );
     return true;
   }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   getIconForAssetType,
   getMarkerImageSrc,
@@ -8,95 +8,120 @@ import {
   resolveAssetTypeFromMapping,
 } from "@/lib/assetIcons";
 import { useResolvedAssetUrl } from "@/hooks/useResolvedAssetUrl";
-import { useAssetTypeIcons } from "@/contexts/AssetTypeIconsContext";
+import {
+  isAssetImageLoaded,
+  markAssetImageLoaded,
+  preloadAssetImage,
+} from "@/lib/assetUrlCache";
 
 function isUnresolvedLocalPath(src) {
   return String(src || "").startsWith("/local/");
 }
 
+function buildTypeOverrides(typeKey, typeIconUrl) {
+  if (!typeKey || !typeIconUrl) return {};
+  return { [typeKey]: typeIconUrl };
+}
+
 /**
  * Floor-plan marker icon with type overrides, URL resolution (desktop /local/), and fallbacks.
- * Shows a stable built-in placeholder immediately, then crossfades to the custom icon once loaded.
+ * Uses a single image element and preloads custom icons to avoid blinking across many markers.
  */
-export function AssetTypeMarkerImage({ mapping, className, style, alt = "asset" }) {
-  const { overrides } = useAssetTypeIcons();
+export function AssetTypeMarkerImage({
+  mapping,
+  typeIconUrl = "",
+  className,
+  style,
+  alt = "asset",
+}) {
   const [useTypeOverrideOnly, setUseTypeOverrideOnly] = useState(false);
-  const [customLoaded, setCustomLoaded] = useState(false);
+  const [displaySrc, setDisplaySrc] = useState("");
 
   const typeKey = resolveAssetTypeFromMapping(mapping);
   const placeholderSrc = getIconForAssetType(typeKey, null, {});
-  const primarySrc = useTypeOverrideOnly
-    ? getIconForAssetType(typeKey, null, overrides)
-    : getMarkerImageSrc(mapping, overrides);
-  const resolvedSrc = useResolvedAssetUrl(primarySrc);
+  const typeOverrides = useMemo(
+    () => buildTypeOverrides(typeKey, typeIconUrl),
+    [typeKey, typeIconUrl],
+  );
 
-  const customSrc =
-    resolvedSrc || (primarySrc && !isUnresolvedLocalPath(primarySrc) ? primarySrc : "");
+  const primarySrc = useTypeOverrideOnly
+    ? getIconForAssetType(typeKey, typeIconUrl || null, {})
+    : getMarkerImageSrc(mapping, typeOverrides);
+
+  const needsAsyncResolve = isUnresolvedLocalPath(primarySrc);
+  const resolvedSrc = useResolvedAssetUrl(needsAsyncResolve ? primarySrc : "");
+
+  const customSrc = useMemo(() => {
+    if (!primarySrc) return "";
+    if (needsAsyncResolve) {
+      return resolvedSrc || "";
+    }
+    return primarySrc;
+  }, [needsAsyncResolve, primarySrc, resolvedSrc]);
+
   const hasCustomIcon = Boolean(customSrc && customSrc !== placeholderSrc);
 
+  const applyDisplaySrc = useCallback(
+    (nextSrc) => {
+      setDisplaySrc((current) => (current === nextSrc ? current : nextSrc));
+    },
+    [],
+  );
+
   useEffect(() => {
-    setCustomLoaded(false);
-    if (!hasCustomIcon) return;
+    if (!hasCustomIcon || !customSrc) {
+      applyDisplaySrc(placeholderSrc);
+      return;
+    }
+
+    if (isAssetImageLoaded(customSrc)) {
+      applyDisplaySrc(customSrc);
+      return;
+    }
 
     let cancelled = false;
-    const img = new Image();
-    img.onload = () => {
-      if (!cancelled) setCustomLoaded(true);
-    };
-    img.onerror = () => {
-      if (!cancelled) setCustomLoaded(false);
-    };
-    img.src = customSrc;
+    applyDisplaySrc(placeholderSrc);
+
+    void preloadAssetImage(customSrc).then((loaded) => {
+      if (cancelled) return;
+      applyDisplaySrc(loaded ? customSrc : placeholderSrc);
+    });
 
     return () => {
       cancelled = true;
     };
-  }, [customSrc, hasCustomIcon]);
+  }, [applyDisplaySrc, customSrc, hasCustomIcon, placeholderSrc]);
 
-  const handleCustomError = (event) => {
+  const handleError = (event) => {
     if (!useTypeOverrideOnly && mapping?.customImageUrl) {
       setUseTypeOverrideOnly(true);
       return;
     }
 
-    const typeFallback = getIconForAssetType(typeKey, null, overrides);
+    const typeFallback = getIconForAssetType(typeKey, typeIconUrl || null, typeOverrides);
     if (typeFallback && event.currentTarget.src !== typeFallback) {
       event.currentTarget.src = typeFallback;
       return;
     }
 
     handleImageError(event);
-    setCustomLoaded(false);
+    applyDisplaySrc(placeholderSrc);
   };
 
-  const showCustom = hasCustomIcon && customLoaded;
+  const handleLoad = () => {
+    if (displaySrc && displaySrc !== placeholderSrc) {
+      markAssetImageLoaded(displaySrc);
+    }
+  };
 
   return (
-    <span className="relative block h-full w-full overflow-hidden">
-      <img
-        src={placeholderSrc}
-        alt={showCustom ? "" : alt}
-        aria-hidden={showCustom}
-        className={className}
-        style={{
-          ...style,
-          opacity: showCustom ? 0 : 1,
-          transition: "opacity 150ms ease",
-        }}
-      />
-      {hasCustomIcon ? (
-        <img
-          src={customSrc}
-          alt={alt}
-          className={`absolute inset-0 h-full w-full ${className || ""}`}
-          style={{
-            ...style,
-            opacity: showCustom ? 1 : 0,
-            transition: "opacity 150ms ease",
-          }}
-          onError={handleCustomError}
-        />
-      ) : null}
-    </span>
+    <img
+      src={displaySrc || placeholderSrc}
+      alt={alt}
+      className={className}
+      style={style}
+      onLoad={handleLoad}
+      onError={handleError}
+    />
   );
 }

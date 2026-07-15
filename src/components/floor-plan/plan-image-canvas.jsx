@@ -1,16 +1,17 @@
 "use client";
 
-import { useRef, useState, useEffect } from "react";
-import { Loader2, ImageOff, Layers, Trash2 } from "lucide-react";
+import { useRef, useState, useEffect, Fragment } from "react";
+import { Loader2, ImageOff, Layers, Map, Trash2 } from "lucide-react";
 import { useFloorPlanImageDimensions } from "@/hooks/useFloorPlanImageDimensions";
 import { useResolvedAssetUrl } from "@/hooks/useResolvedAssetUrl";
-import { naturalToScreenCoords, getFloorButtonDimensions, getNavMarkerDimensions } from "@/lib/nestedFloorPlan";
+import { naturalToScreenCoords, getFloorButtonDimensions, getNavMarkerDimensions, markerHasPlacedPosition } from "@/lib/nestedFloorPlan";
 import { FloorMapAssetMarker } from "@/components/floor-map-asset-marker";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { useAssetTypeIcons } from "@/contexts/AssetTypeIconsContext";
 import { resolveAssetTypeFromMapping } from "@/lib/assetIcons";
 import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
+import { mappingMatchesHighlightKeys, resolveMappingDeviceFields } from "@/lib/floorMapAssets";
 
 /**
  * Shared floor-plan image with navigation hotspots or asset markers.
@@ -25,6 +26,7 @@ export function PlanImageCanvas({
   mode = "nav",
   onImageClick,
   onMarkerClick,
+  onNavMarkerHover,
   onAssetClick,
   onAssetReposition,
   onAssetRemove,
@@ -32,11 +34,16 @@ export function PlanImageCanvas({
   placingMarker = false,
   browserZoom = 1,
   assetStatusLive = false,
+  onImageLoadedChange,
   activeStatuses = {},
   assetDeviceData = {},
   className = "",
   maxHeight = "min(70vh, 600px)",
   navMarkerStyle = "pin",
+  showDeviceGuideButton = false,
+  onDeviceGuideClick,
+  highlightedAssetId = "",
+  highlightedAssetKeys = [],
 }) {
   const imageRef = useRef(null);
   const resolvedSrc = useResolvedAssetUrl(imageUrl);
@@ -47,18 +54,23 @@ export function PlanImageCanvas({
 
   const resolvedNavMarkers =
     navMarkers ?? (mode === "nav" || mode === "mixed" ? markers : []);
-  const resolvedAssetMarkers =
-    assetMarkers ?? (mode === "assets" ? markers : []);
+  const resolvedAssetMarkers = (
+    assetMarkers ?? (mode === "assets" ? markers : [])
+  ).filter(markerHasPlacedPosition);
 
   const { dims, imageLoaded, handleImageLoad } = useFloorPlanImageDimensions(
     imageRef,
     resolvedSrc,
   );
 
+  useEffect(() => {
+    onImageLoadedChange?.(imageLoaded);
+  }, [imageLoaded, onImageLoadedChange]);
+
   const navMarkerDims = getNavMarkerDimensions(dims);
   const floorButtonDims = getFloorButtonDimensions(
     dims,
-    resolvedNavMarkers.length,
+    resolvedNavMarkers.length + (showDeviceGuideButton ? 1 : 0),
   );
   const { overrides } = useAssetTypeIcons();
 
@@ -138,6 +150,7 @@ export function PlanImageCanvas({
           e.stopPropagation();
           onMarkerClick?.(marker);
         }}
+        onMouseEnter={() => onNavMarkerHover?.(marker)}
         title={marker.name}
       >
         <span
@@ -154,6 +167,42 @@ export function PlanImageCanvas({
     );
   };
 
+  const renderDeviceGuideButton = () => (
+    <button
+      key="device-guide"
+      type="button"
+      className="min-w-0 shrink-0"
+      onClick={(e) => {
+        e.stopPropagation();
+        onDeviceGuideClick?.();
+      }}
+      title="Legend"
+    >
+      <span
+        className="flex min-w-0 flex-col items-center justify-center overflow-hidden rounded border border-primary bg-background/95 shadow-sm transition-colors hover:bg-primary/10"
+        style={{
+          width: floorButtonDims.buttonWidth,
+          height: floorButtonDims.buttonHeight,
+          padding: `${floorButtonDims.buttonHeight * 0.06}px ${floorButtonDims.buttonWidth * 0.04}px`,
+        }}
+      >
+        <Map
+          className="mb-0.5 shrink-0 text-primary"
+          style={{
+            width: floorButtonDims.iconSize,
+            height: floorButtonDims.iconSize,
+          }}
+        />
+        <span
+          className="font-semibold uppercase leading-none tracking-wide text-primary"
+          style={{ fontSize: floorButtonDims.floorLabelSize }}
+        >
+          Legend
+        </span>
+      </span>
+    </button>
+  );
+
   const renderFloorButtonGrid = () => (
     <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center p-2">
       <div
@@ -164,6 +213,7 @@ export function PlanImageCanvas({
           gap: floorButtonDims.gap,
         }}
       >
+        {showDeviceGuideButton ? renderDeviceGuideButton() : null}
         {resolvedNavMarkers.map(renderFloorButton)}
       </div>
     </div>
@@ -223,32 +273,68 @@ export function PlanImageCanvas({
                   const { left, top } = naturalToScreenCoords(marker, dims);
                   const deviceData = assetDeviceData[marker.id] || {};
                   const typeKey = resolveAssetTypeFromMapping(marker);
+                  const mappingDevice = resolveMappingDeviceFields(marker);
+                  const markerDeviceAddr =
+                    deviceData.deviceAddress ||
+                    mappingDevice.deviceAddress ||
+                    marker.deviceAddress ||
+                    "";
+                  const markerDeviceLocation =
+                    deviceData.deviceLocation ||
+                    mappingDevice.deviceLocation ||
+                    marker.deviceLocation ||
+                    "";
+                  // Support both the new multi-key highlight and the older single-id prop.
+                  const legacyId = String(highlightedAssetId || "").trim();
+                  const keys = highlightedAssetKeys?.length
+                    ? highlightedAssetKeys
+                    : legacyId
+                      ? [legacyId]
+                      : [];
+                  const isHighlighted = mappingMatchesHighlightKeys(marker, keys);
                   return (
-                    <FloorMapAssetMarker
-                      key={marker.id}
-                      mapping={marker}
-                      left={left}
-                      top={top}
-                      browserZoom={browserZoom}
-                      fallbackActive={activeStatuses[marker.id] ?? marker.active ?? 0}
-                      deviceAddr={deviceData.deviceAddress || marker.deviceAddress}
-                      deviceLocation={deviceData.deviceLocation || marker.deviceLocation}
-                      typeIconUrl={typeKey ? overrides[typeKey] || "" : ""}
-                      onAssetClick={onAssetClick}
-                      editable={markersEditable}
-                      imageRef={imageRef}
-                      imageDims={dims}
-                      onReposition={onAssetReposition}
-                      onContextMenu={(mapping, event) => {
-                        setAssetContextMenu({
-                          mapping,
-                          x: event.clientX,
-                          y: event.clientY,
-                        });
-                      }}
-                      live={assetStatusLive}
-                      suppressFireEffects={placingMarker}
-                    />
+                    <Fragment key={marker.id}>
+                      {isHighlighted ? (
+                        // Behind the marker (z-10) so fire/trouble halo + ripples stay visible.
+                        <div
+                          className="pointer-events-none absolute z-10"
+                          style={{
+                            left,
+                            top,
+                            transform: `translate(-50%, -50%) scale(${1 / browserZoom})`,
+                            transformOrigin: "center",
+                          }}
+                          aria-hidden
+                        >
+                          <div className="asset-search-spotlight" />
+                        </div>
+                      ) : null}
+                      <FloorMapAssetMarker
+                        mapping={marker}
+                        left={left}
+                        top={top}
+                        browserZoom={browserZoom}
+                        fallbackActive={activeStatuses[marker.id] ?? marker.active ?? 0}
+                        deviceAddr={markerDeviceAddr}
+                        deviceLocation={markerDeviceLocation}
+                        typeIconUrl={typeKey ? overrides[typeKey] || "" : ""}
+                        onAssetClick={onAssetClick}
+                        editable={markersEditable}
+                        imageRef={imageRef}
+                        imageDims={dims}
+                        onReposition={onAssetReposition}
+                        onContextMenu={(mapping, event) => {
+                          setAssetContextMenu({
+                            mapping,
+                            x: event.clientX,
+                            y: event.clientY,
+                          });
+                        }}
+                        live={assetStatusLive}
+                        suppressFireEffects={placingMarker}
+                        highlighted={false}
+                      />
+                    </Fragment>
                   );
                 })}
                 {assetContextMenu ? (

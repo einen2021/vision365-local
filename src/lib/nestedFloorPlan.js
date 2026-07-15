@@ -8,6 +8,7 @@ export const NAV_LEVELS = {
   FLOOR: "floor",
   SECTION: "section",
   SUBSECTION: "subsection",
+  DEVICE_GUIDE: "device_guide",
 };
 
 /** Sanitize a string for use as a Firestore document id. */
@@ -227,6 +228,17 @@ export async function loadImageNaturalDimensions(imageUrl) {
   });
 }
 
+/** True when a marker has coordinates that can be drawn on the plan image. */
+export function markerHasPlacedPosition(marker = {}) {
+  if (typeof marker.relativeX === "number" && typeof marker.relativeY === "number") {
+    return true;
+  }
+  if (typeof marker.x === "number" && typeof marker.y === "number") {
+    return true;
+  }
+  return false;
+}
+
 /** Convert natural image coordinates to screen position for marker overlay. */
 export function naturalToScreenCoords(marker, actualImageDimensions) {
   const { naturalWidth, naturalHeight, width, height, offsetX, offsetY } =
@@ -322,6 +334,11 @@ export function buildBreadcrumbs(level, { buildingName, floor, section, subsecti
   const crumbs = [{ level: NAV_LEVELS.BUILDING, label: buildingName || "Building" }];
 
   if (level === NAV_LEVELS.BUILDING) return crumbs;
+
+  if (level === NAV_LEVELS.DEVICE_GUIDE) {
+    crumbs.push({ level: NAV_LEVELS.DEVICE_GUIDE, label: "Legend" });
+    return crumbs;
+  }
 
   crumbs.push({ level: NAV_LEVELS.FLOOR, label: floor?.name || "Floor", id: floor?.id });
 

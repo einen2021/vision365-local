@@ -1,12 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { AppSidebar } from "@/components/app-sidebar";
+import { DashboardHeader } from "@/components/dashboard-header";
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
 import { CommunityBuildingSelect } from "@/components/floor-plan/community-building-select";
 import { ModeToggle } from "@/components/theme-toggle";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -162,19 +162,8 @@ export default function AlarmMessagesHistoryPage() {
   }
 
   return (
-    <SidebarProvider>
-      <AppSidebar />
-      <SidebarInset>
-        <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
-          <SidebarTrigger className="-ml-1" />
-          <Separator orientation="vertical" className="mr-2 h-4" />
-          <div className="ml-auto flex items-center gap-2">
-            <FirePanelStatusBadges />
-            <ModeToggle />
-          </div>
-        </header>
-
-        <main className="flex flex-1 flex-col gap-4 p-4 md:p-6">
+    <DashboardHeader>
+<main className="flex flex-1 flex-col gap-4 p-4 md:p-6">
           <div className="flex items-center gap-2">
             <Bell className="h-6 w-6" />
             <div>
@@ -265,7 +254,6 @@ export default function AlarmMessagesHistoryPage() {
             </CardContent>
           </Card>
         </main>
-      </SidebarInset>
-    </SidebarProvider>
+  </DashboardHeader>
   );
 }

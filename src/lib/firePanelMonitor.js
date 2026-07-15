@@ -1,7 +1,7 @@
 /** Shared constants and parsers for fire-panel CVAL monitoring. */
 
 export const PANEL_STATE_REFRESH_MS = 5000;
-export const MONITOR_INTERVAL_MS = 1000;
+export const MONITOR_INTERVAL_MS = 500;
 export const LIST_COMMAND_TIMEOUT_MS = 15000;
 
 export const CVAL_COMMANDS = [
@@ -50,6 +50,181 @@ export function extractPanelDeviceAddresses(response) {
   const regex = /\b\d+:M\d+-\d+(?:-\d+)?\b/gi;
   const matches = String(response || "").match(regex) ?? [];
   return [...new Set(matches.map((value) => value.trim()))];
+}
+
+/** Known device type suffixes in panel list output (longest first). */
+const PANEL_DEVICE_TYPES = [
+  "SMOKE DETECTOR",
+  "HEAT DETECTOR",
+  "DUCT DETECTOR",
+  "BEAM DETECTOR",
+  "PULL STATION",
+  "MANUAL STATION",
+  "WATER FLOW",
+  "FLOW SWITCH",
+  "MONITOR MODULE",
+  "CONTROL MODULE",
+  "RELAY MODULE",
+  "HORN STROBE",
+  "SPEAKER STROBE",
+  "HEAT DETECTOR",
+  "TAMPER SWITCH",
+  "GATE VALVE",
+  "HORN",
+  "STROBE",
+  "SPEAKER",
+  "MODULE",
+  "DETECTOR",
+  "STATION",
+];
+
+/** Strip echoed list command text that can appear mid-response. */
+function stripListCommandEcho(line) {
+  return String(line || "")
+    .replace(/^list\s+[fts]\s*/i, "")
+    .replace(/^list\s+[fts](?=\d*:?M\d)/i, "")
+    .trim();
+}
+
+/** Parse one panel list line into structured fields. */
+function parsePanelListLine(line) {
+  const trimmed = stripListCommandEcho(line);
+  if (!trimmed) return null;
+  if (/_DNE/i.test(trimmed)) return null;
+  if (/^list\s/i.test(trimmed)) return null;
+
+  const match = trimmed.match(/^(?:(\d+):)?(M\d+-\d+(?:-\d+)?)\s+(.+)$/i);
+  if (!match) return null;
+
+  const node = match[1] || "";
+  const deviceAddress = match[2].toUpperCase();
+  const fullAddress = node ? `${node}:${deviceAddress}` : deviceAddress;
+  let remainder = match[3].trim();
+  let panelTimeText = "";
+
+  const leadingDateTime = remainder.match(
+    /^(\d{1,2}-[A-Za-z]{3}-\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)\s+/,
+  );
+  const leadingTime = remainder.match(/^(\d{1,2}:\d{2}(?::\d{2})?)\s+/);
+
+  if (leadingDateTime) {
+    panelTimeText = leadingDateTime[1];
+    remainder = remainder.slice(leadingDateTime[0].length).trim();
+  } else if (leadingTime) {
+    panelTimeText = leadingTime[1];
+    remainder = remainder.slice(leadingTime[0].length).trim();
+  }
+
+  const statusMatch = remainder.match(/\s([A-Z]{2,6}\*?)\s*$/i);
+  const status = statusMatch ? statusMatch[1].toUpperCase() : "";
+  if (statusMatch) {
+    remainder = remainder.slice(0, statusMatch.index).trim();
+  }
+
+  if (!panelTimeText) {
+    const trailingDateTime = remainder.match(
+      /\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)\s*$/,
+    );
+    const trailingTime = remainder.match(/\s+(\d{1,2}:\d{2}(?::\d{2})?)\s*$/);
+    if (trailingDateTime) {
+      panelTimeText = trailingDateTime[1];
+      remainder = remainder.slice(0, trailingDateTime.index).trim();
+    } else if (trailingTime) {
+      panelTimeText = trailingTime[1];
+      remainder = remainder.slice(0, trailingTime.index).trim();
+    }
+  }
+
+  let deviceType = "";
+  let location = remainder;
+  const upperRemainder = remainder.toUpperCase();
+
+  for (const type of PANEL_DEVICE_TYPES) {
+    if (upperRemainder.endsWith(type)) {
+      deviceType = type;
+      location = remainder.slice(0, remainder.length - type.length).trim();
+      break;
+    }
+  }
+
+  if (!deviceType && remainder) {
+    const words = remainder.split(/\s+/);
+    if (words.length >= 2) {
+      deviceType = words.slice(-2).join(" ").toUpperCase();
+      location = words.slice(0, -2).join(" ");
+    } else {
+      deviceType = remainder.toUpperCase();
+      location = "";
+    }
+  }
+
+  return {
+    fullAddress,
+    deviceAddress,
+    location,
+    deviceType,
+    status,
+    label: status.replace(/\*$/, ""),
+    panelTimeText,
+    raw: trimmed,
+  };
+}
+
+/** Format a timestamp for live panel list rows. */
+export function formatPanelListTime(value) {
+  if (value == null || value === "") return "";
+  if (typeof value === "string" && /[A-Za-z]/.test(value) && value.includes("-")) {
+    // Keep panel date strings like 12-JUL-26 readable as-is when Date parse fails.
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return new Date(parsed).toLocaleString();
+    return value;
+  }
+  const ms =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Date.parse(value)
+        : NaN;
+  if (!Number.isFinite(ms)) return String(value);
+  return new Date(ms).toLocaleString();
+}
+
+/** Parse panel `list f|t|s` text into display rows. */
+export function parsePanelListResponse(text) {
+  const entries = [];
+
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const parsed = parsePanelListLine(line);
+    if (parsed) entries.push(parsed);
+  }
+
+  return entries;
+}
+
+export function getListCmdForLabel(label) {
+  const entry = CVAL_COMMANDS.find((item) => item.label === label);
+  return entry?.listCmd ?? null;
+}
+
+const ACK_TYPE_BY_LABEL = {
+  Fire: "f",
+  Trouble: "t",
+  Supervisory: "s",
+};
+
+/** Build panel acknowledge command for a category or a specific list row. */
+export function buildPanelAckCommand(label, deviceAddress = null) {
+  const type = ACK_TYPE_BY_LABEL[label];
+  if (!type) {
+    throw new Error(`Unknown acknowledge type: ${label}`);
+  }
+
+  const address = String(deviceAddress || "").trim();
+  if (address) {
+    return `ack ${type} ${address}`;
+  }
+
+  return `ack ${type}`;
 }
 
 export function readSimplexStatus(asset) {

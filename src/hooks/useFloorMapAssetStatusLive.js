@@ -4,8 +4,8 @@ import { useEffect, useState } from "react";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
 
 /**
- * Start AssetsList simplexStatus live sync only after the floor plan image has loaded.
- * Avoids marker subscriptions and DB polling before the map is ready.
+ * Keep AssetsList F/T/S sync live after the floor plan image has loaded.
+ * Uses both onSnapshot polling and a 1s refresh so marker colors stay in sync.
  */
 export function useFloorMapAssetStatusLive(imageLoaded) {
   const [isLive, setIsLive] = useState(false);
@@ -17,16 +17,14 @@ export function useFloorMapAssetStatusLive(imageLoaded) {
     }
 
     const store = useAssetFireStatusStore.getState();
-    store.subscribeAssetsList();
-
-    let cancelled = false;
-    void store.syncFromAssetsList().finally(() => {
-      if (!cancelled) setIsLive(true);
-    });
+    // Use the store immediately — do not wait for the first sync round-trip.
+    store.startPolling();
+    setIsLive(true);
+    void store.syncFromAssetsList();
 
     return () => {
-      cancelled = true;
       setIsLive(false);
+      store.stopPolling();
       if (!useAssetFireStatusStore.getState().isPolling) {
         store.unsubscribeAssetsList();
       }

@@ -23,6 +23,10 @@ const nextConfig = {
         async rewrites() {
           return [
             {
+              source: "/api/:path*",
+              destination: `http://127.0.0.1:${desktopApiPort}/api/:path*`,
+            },
+            {
               source: "/local/:path*",
               destination: `http://127.0.0.1:${desktopApiPort}/local/:path*`,
             },

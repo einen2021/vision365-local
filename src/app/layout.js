@@ -9,6 +9,7 @@ import { DesktopProvider } from "@/components/desktop-provider";
 import { FirePanelProvider } from "@/components/fire-panel-provider";
 import { AssetFireStatusProvider } from "@/components/asset-fire-status-provider";
 import { FireAlertProvider } from "@/contexts/FireModalContext";
+import { LivePanelAlertProvider } from "@/contexts/LivePanelAlertContext";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -38,12 +39,14 @@ export default function RootLayout({ children }) {
             <FirePanelProvider>
               <AssetFireStatusProvider>
                 <FireAlertProvider>
-                  <AppProvider>
-                    <AssetTypeIconsProvider>
-                      <RoleGuard>{children}</RoleGuard>
-                    </AssetTypeIconsProvider>
-                    <Toaster />
-                  </AppProvider>
+                  <LivePanelAlertProvider>
+                    <AppProvider>
+                      <AssetTypeIconsProvider>
+                        <RoleGuard>{children}</RoleGuard>
+                      </AssetTypeIconsProvider>
+                      <Toaster />
+                    </AppProvider>
+                  </LivePanelAlertProvider>
                 </FireAlertProvider>
               </AssetFireStatusProvider>
             </FirePanelProvider>

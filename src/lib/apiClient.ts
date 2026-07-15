@@ -8,17 +8,47 @@ import { isDesktop, getDesktopApiPort, setDesktopApiPort } from "./platform";
 export const DESKTOP_API_PORT = 47821;
 
 let cachedBaseUrl: string | null = null;
-/** undefined = not checked yet; "" = checked, unavailable */
+/** undefined = not checked yet; "" = last check failed (retry after cooldown) */
 let webDesktopApiBase: string | undefined;
+let webDesktopApiLastCheck = 0;
+const WEB_API_RECHECK_MS = 2000;
+
+/** Once the desktop API is confirmed up, skip health/db probes on every request. */
+let desktopApiReady = false;
 
 export function resetApiBaseUrl(): void {
   cachedBaseUrl = null;
   webDesktopApiBase = undefined;
+  webDesktopApiLastCheck = 0;
+  desktopApiReady = false;
+}
+
+/** Parse API JSON safely — avoids cryptic errors when HTML error pages are returned */
+export async function parseApiJsonResponse(res: Response): Promise<unknown> {
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    const text = await res.text();
+    if (text.trimStart().startsWith("<")) {
+      throw new Error(
+        "Local API unavailable. Start the desktop server with: npm run desktop:dev",
+      );
+    }
+    throw new Error(text.slice(0, 200) || `Request failed (${res.status})`);
+  }
+  return res.json();
 }
 
 /** In browser dev, use the local Hono server when desktop:dev is running. */
 async function resolveWebApiBaseUrl(): Promise<string> {
-  if (webDesktopApiBase !== undefined) return webDesktopApiBase;
+  const now = Date.now();
+  if (
+    webDesktopApiBase !== undefined &&
+    (webDesktopApiBase !== "" || now - webDesktopApiLastCheck < WEB_API_RECHECK_MS)
+  ) {
+    return webDesktopApiBase;
+  }
+
+  webDesktopApiLastCheck = now;
 
   try {
     const res = await fetch(`http://127.0.0.1:${DESKTOP_API_PORT}/health`, {
@@ -53,10 +83,10 @@ export function apiUrl(path: string): string {
 /** Wait until the desktop API server responds to /health */
 export async function waitForDesktopApi(timeoutMs = 60000): Promise<void> {
   if (!isDesktop()) return;
+  if (desktopApiReady) return;
 
   const port = getDesktopApiPort() || DESKTOP_API_PORT;
   setDesktopApiPort(port);
-  resetApiBaseUrl();
 
   const start = Date.now();
 
@@ -66,14 +96,17 @@ export async function waitForDesktopApi(timeoutMs = 60000): Promise<void> {
         signal: AbortSignal.timeout(2000),
       });
       if (health.ok) {
-        // Verify database is readable
+        // Verify database is readable (only required for the first ready check).
         const dbCheck = await fetch(`http://127.0.0.1:${port}/api/db`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ op: "list", path: ["UserDB"] }),
           signal: AbortSignal.timeout(3000),
         });
-        if (dbCheck.ok) return;
+        if (dbCheck.ok) {
+          desktopApiReady = true;
+          return;
+        }
       }
     } catch {
       // Server still starting
@@ -98,7 +131,9 @@ export async function apiFetch(
 
   const base = await resolveWebApiBaseUrl();
   const normalized = path.startsWith("/") ? path : `/${path}`;
-  return fetch(`${base}${normalized}`, options);
+  // Fall back to same-origin /api when health check fails — Next.js rewrites to Hono
+  const url = base ? `${base}${normalized}` : normalized;
+  return fetch(url, options);
 }
 
 export async function apiPost<T = unknown>(

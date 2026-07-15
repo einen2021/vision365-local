@@ -1,17 +1,13 @@
 "use client";
 import { useState, useEffect, useRef } from "react";
+import { DashboardHeader } from "@/components/dashboard-header";
 import { useRouter } from "next/navigation";
 import secureLocalStorage from "react-secure-storage";
 import { useToast } from "@/hooks/use-toast";
-import { AppSidebar } from "@/components/app-sidebar";
 import { ModeToggle } from "@/components/theme-toggle";
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
 import { Separator } from "@/components/ui/separator";
-import {
-  SidebarInset,
-  SidebarProvider,
-  SidebarTrigger,
-} from "@/components/ui/sidebar";
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -495,18 +491,8 @@ export default function EditBuildingStatus() {
   };
 
   return (
-    <SidebarProvider>
-      <AppSidebar />
-      <SidebarInset>
-        <header className="flex min-h-16 items-center gap-3 py-2 px-4">
-          <SidebarTrigger className="-ml-1" />
-          <ModeToggle />
-          <div className="ml-auto flex items-center gap-2">
-            <FirePanelStatusBadges />
-          </div>
-        </header>
-
-        <div className="flex flex-1 flex-col gap-4 p-4 pt-0">
+    <DashboardHeader>
+<div className="flex flex-1 flex-col gap-4 p-4 pt-0">
           <PageHelpBanner />
           <Card className="w-full p-4">
             <CardHeader>
@@ -894,8 +880,7 @@ export default function EditBuildingStatus() {
             </DialogFooter>
           </DialogContent>
         </Dialog>
-      </SidebarInset>
-    </SidebarProvider>
+    </DashboardHeader>
   );
 }
 

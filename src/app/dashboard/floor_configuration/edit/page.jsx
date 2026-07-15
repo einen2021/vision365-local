@@ -1,10 +1,10 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { AppSidebar } from "@/components/app-sidebar";
+import { DashboardHeader } from "@/components/dashboard-header";
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
 import { Separator } from "@/components/ui/separator";
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
@@ -49,18 +49,8 @@ export default function EditFloorPlansPage() {
   if (!mounted) return null;
 
   return (
-    <SidebarProvider>
-      <AppSidebar />
-      <SidebarInset>
-        <header className="flex min-h-16 shrink-0 items-center gap-3 py-2 px-4 md:px-8">
-          <SidebarTrigger className="-ml-1" />
-          <ClientModeToggle />
-          <div className="ml-auto">
-            <FirePanelStatusBadges />
-          </div>
-        </header>
-
-        <div className="flex flex-1 flex-col gap-6 p-4 md:p-6 pt-0">
+    <DashboardHeader>
+<div className="flex flex-1 flex-col gap-6 p-4 md:p-6 pt-0">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
               <h1 className="text-2xl font-bold flex items-center gap-2">
@@ -88,7 +78,5 @@ export default function EditFloorPlansPage() {
 
           <NestedFloorPlanEditor buildingName={selectedBuilding} />
         </div>
-      </SidebarInset>
-    </SidebarProvider>
-  );
+  </DashboardHeader>  );
 }

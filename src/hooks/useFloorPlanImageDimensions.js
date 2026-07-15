@@ -32,6 +32,22 @@ export function useFloorPlanImageDimensions(imageRef, imageUrl) {
     setDims(EMPTY_DIMS);
   }, [imageUrl]);
 
+  // Cached images may finish loading before React attaches onLoad.
+  useEffect(() => {
+    const img = imageRef.current;
+    if (!img || !imageUrl) return;
+
+    const syncIfReady = () => {
+      if (img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
+        recalculate();
+      }
+    };
+
+    syncIfReady();
+    const frame = requestAnimationFrame(syncIfReady);
+    return () => cancelAnimationFrame(frame);
+  }, [imageUrl, imageRef, recalculate]);
+
   useEffect(() => {
     if (!imageLoaded || !imageRef.current) return;
 

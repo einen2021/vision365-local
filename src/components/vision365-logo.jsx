@@ -14,10 +14,14 @@ export function Vision365Logo({
   alt = "Vision365",
   rounded = true,
 }) {
-  const [src, setSrc] = useState(() => resolvePublicAssetUrl(LOGO_PATH));
+  // Use a stable relative path for the first render (matches SSR output).
+  const [src, setSrc] = useState(LOGO_PATH);
 
   useEffect(() => {
-    setSrc(resolvePublicAssetUrl(LOGO_PATH));
+    const resolved = resolvePublicAssetUrl(LOGO_PATH);
+    if (resolved !== LOGO_PATH) {
+      setSrc(resolved);
+    }
   }, []);
 
   return (

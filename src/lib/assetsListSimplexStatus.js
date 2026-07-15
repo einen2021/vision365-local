@@ -1,8 +1,16 @@
-import { collection, doc, getDoc, getDocs, updateDoc } from "firebase/firestore"
+import { doc, getDoc, updateDoc } from "firebase/firestore"
 import { db } from "@/config/firebase"
-import { getAssetsListIdFromMapping } from "@/lib/floorMapAssets"
+import {
+  getAssetsListIdFromMapping,
+  getAssetsListSnapshot,
+  invalidateAssetsListSnapshotCache,
+} from "@/lib/floorMapAssets"
 import { normalizeSimplexStatus } from "@/lib/assetFireStatus"
-import { resolveAssetDeviceAddress, parseSimplexAddressToken } from "@/lib/simplexDeviceAddress"
+import {
+  resolveAssetDeviceAddress,
+  parseSimplexAddressToken,
+} from "@/lib/simplexDeviceAddress"
+import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
 
 /** Find the global AssetsList document for a floor-map / building asset. */
 export async function resolveAssetsListDocId(asset, deviceAddress = "") {
@@ -21,7 +29,8 @@ export async function resolveAssetsListDocId(asset, deviceAddress = "") {
   const targetAddress = resolveAssetDeviceAddress({ ...asset, deviceAddress })
   if (!targetAddress) return null
 
-  const snapshot = await getDocs(collection(db, "AssetsList"))
+  // Use cached snapshot — avoid re-downloading AssetsList on every lookup.
+  const snapshot = await getAssetsListSnapshot(db)
   for (const docSnap of snapshot.docs) {
     const data = docSnap.data()
     if (resolveAssetDeviceAddress(data) === targetAddress) return docSnap.id
@@ -40,17 +49,34 @@ export async function findAssetsListEntryByPanelAddress(panelAddress) {
   if (parsed?.full) candidates.add(parsed.full)
   if (parsed?.mAddress) candidates.add(parsed.mAddress)
 
+  // Fast path: AssetsList doc id often matches the panel address.
   for (const id of candidates) {
     const snap = await getDoc(doc(db, "AssetsList", id))
     if (snap.exists()) return { id: snap.id, data: snap.data() }
   }
 
-  const snapshot = await getDocs(collection(db, "AssetsList"))
+  // Cached full scan — much faster than getDocs() on every fire address.
+  const snapshot = await getAssetsListSnapshot(db)
   for (const docSnap of snapshot.docs) {
     const data = docSnap.data()
     const resolved = resolveAssetDeviceAddress(data)
-    if (candidates.has(resolved) || candidates.has(docSnap.id)) {
+    if (
+      candidates.has(resolved) ||
+      candidates.has(String(resolved).toUpperCase()) ||
+      candidates.has(docSnap.id)
+    ) {
       return { id: docSnap.id, data }
+    }
+
+    // Also match stripped panel prefix (2:M1-2-0 vs M1-2-0).
+    for (const candidate of candidates) {
+      const a = String(resolved || "").toUpperCase()
+      const b = String(candidate || "").toUpperCase()
+      if (!a || !b) continue
+      if (a === b) return { id: docSnap.id, data }
+      if (a.replace(/^\d+:/, "") === b.replace(/^\d+:/, "")) {
+        return { id: docSnap.id, data }
+      }
     }
   }
 
@@ -77,6 +103,11 @@ export async function resetSimplexFlag(asset, deviceAddress, flag) {
     simplexStatus: next,
     updatedAt: new Date().toISOString(),
   })
+
+  invalidateAssetsListSnapshotCache()
+  useAssetFireStatusStore
+    .getState()
+    .patchSimplexStatusFromEntry(assetsListId, snap.data() || {}, next)
 
   return next
 }

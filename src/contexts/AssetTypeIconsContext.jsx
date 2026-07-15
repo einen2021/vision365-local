@@ -10,6 +10,7 @@ import {
   saveAssetTypeIconOverride,
   uploadAssetTypeIcon,
 } from "@/lib/assetTypeIconStorage";
+import { preloadAssetImage, preloadAssetImages } from "@/lib/assetUrlCache";
 
 const AssetTypeIconsContext = createContext(null);
 
@@ -25,6 +26,7 @@ export function AssetTypeIconsProvider({ children }) {
         loadAssetTypeIconOverrides(),
         loadKnownAssetTypes(),
       ]);
+      await preloadAssetImages(Object.values(savedOverrides));
       setOverrides(savedOverrides);
       setKnownTypes(typeSet);
       setAssetTypeIconOverrides(savedOverrides);
@@ -39,6 +41,7 @@ export function AssetTypeIconsProvider({ children }) {
 
   const uploadTypeIcon = useCallback(async (typeKey, file) => {
     const iconUrl = await uploadAssetTypeIcon(typeKey, file);
+    await preloadAssetImage(iconUrl);
     const next = await saveAssetTypeIconOverride(typeKey, iconUrl);
     setOverrides(next);
     setAssetTypeIconOverrides(next);

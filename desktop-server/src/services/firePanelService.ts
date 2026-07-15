@@ -1,258 +1,305 @@
-import net from "net";
+import path from "path";
+import { Worker } from "worker_threads";
 import { serverLog } from "../log";
 
-const CONNECT_DELAY_MS = 300;
-const COMMAND_TIMEOUT_MS = 2000;
-const LIST_COMMAND_TIMEOUT_MS = 15000;
-const BULK_COMMAND_TIMEOUT_MS = 60000;
-/** Resolve when no bytes arrive for this long (panel finished sending) */
-const IDLE_COMPLETE_MS = 100;
-const CVAL_IDLE_COMPLETE_MS = 450;
-const LIST_IDLE_COMPLETE_MS = 250;
+type IncomingMessage =
+  | { type: "connect"; host: string; port: number }
+  | { type: "disconnect" }
+  | { type: "status"; id: string }
+  | { type: "command"; id: string; command: string; timeoutMs?: number };
 
-let client: net.Socket | null = null;
+type OutgoingMessage =
+  | { type: "connected"; connected: boolean; host: string; port: number }
+  | { type: "status"; id: string; connected: boolean; host: string; port: number }
+  | { type: "chunk"; id: string; response: string; done: boolean }
+  | { type: "result"; id: string; ok: true; response: string }
+  | { type: "result"; id: string; ok: false; error: string };
+
+/** One telnet socket — fire panels reject a second simultaneous session. */
+let panelWorker: Worker | null = null;
+
+let connected = false;
 let currentHost = "";
 let currentPort = 23;
+let connectInFlight: Promise<void> | null = null;
 
-/** Serialize telnet commands — only one in flight on the socket at a time */
-let commandChain: Promise<unknown> = Promise.resolve();
+const pending = new Map<
+  string,
+  { resolve: (val: unknown) => void; reject: (err: Error) => void }
+>();
 
-function enqueueCommand<T>(fn: () => Promise<T>): Promise<T> {
-  const run = commandChain.then(fn, fn);
-  commandChain = run.catch(() => {});
-  return run;
-}
-
-/** Remove hidden control chars (paste/JSON) and collapse whitespace. */
-function cleanCommandText(command: string) {
-  return command
-    .replace(/[\x00-\x1f\x7f]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-function timeoutForCommand(command: string, overrideMs?: number) {
-  if (overrideMs && overrideMs > 0) return overrideMs;
-  const trimmed = cleanCommandText(command).toLowerCase();
-  if (trimmed.includes("cshow *") || trimmed.includes("cshow*"))
-    return BULK_COMMAND_TIMEOUT_MS;
-  if (trimmed.startsWith("list")) return LIST_COMMAND_TIMEOUT_MS;
-  if (trimmed.startsWith("cshow") && trimmed.includes("cval")) return 3000;
-  return COMMAND_TIMEOUT_MS;
-}
-
-function idleMsForCommand(command: string) {
-  const trimmed = cleanCommandText(command).toLowerCase();
-  if (isCvalCommand(command)) return CVAL_IDLE_COMPLETE_MS;
-  if (
-    trimmed.startsWith("list") ||
-    trimmed.includes("cshow *") ||
-    trimmed.includes("cshow*")
-  ) {
-    return LIST_IDLE_COMPLETE_MS;
-  }
-  return IDLE_COMPLETE_MS;
-}
-
-function isDefiniteComplete(response: string) {
-  return /_DNE/i.test(response);
-}
-
-function isQuickComplete(command: string, response: string) {
-  const trimmed = cleanCommandText(command).toLowerCase();
-  if (trimmed.startsWith("cshow") && trimmed.includes("cval")) {
-    return /CVAL\s*=\s*\d+/i.test(response);
-  }
-  if (trimmed.startsWith("login")) {
-    return /ACCESS GRANTED/i.test(response) || /INVALID PASSCODE/i.test(response);
-  }
-  return false;
-}
-
-function isListCommand(command: string) {
-  return cleanCommandText(command).toLowerCase().startsWith("list");
-}
-
-function isCvalCommand(command: string) {
-  const trimmed = cleanCommandText(command).toLowerCase();
-  return trimmed.startsWith("cshow") && trimmed.includes("cval");
-}
-
-function logCvalPresence(command: string, response: string) {
-  if (!isCvalCommand(command)) return;
-  const match = response.match(/CVAL\s*=\s*(\d+)/i);
-  if (match) {
-    addLog(`CVAL present in response: CVAL=${match[1]}`);
-  } else {
-    addLog("CVAL not present in response");
-  }
-}
+const chunkHandlers = new Map<
+  string,
+  (response: string, done: boolean) => void
+>();
 
 function addLog(message: string) {
   serverLog(`[fire-panel] ${message}`);
 }
 
-// Panel service port expects CR (PuTTY default). LF causes login passcode failures.
-function normalizeCommand(command: string) {
-  const cleaned = cleanCommandText(command);
-  if (!cleaned) return "\r";
-  return `${cleaned}\r`;
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function cleanCommandText(command: string) {
+  return String(command || "")
+    .replace(/[\x00-\x1f\x7f]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function getWorkerEntryPath(ext: "js" | "cjs") {
+  // When bundled as CJS (MSI resources), __dirname points to the server directory.
+  // When bundled as ESM (desktop-server/dist), derive from argv[1] (entry path).
+  // eslint-disable-next-line no-undef
+  const maybeDir = typeof __dirname === "string" ? __dirname : null;
+  if (maybeDir) return path.join(maybeDir, `firePanelWorker.${ext}`);
+
+  const entry = typeof process.argv?.[1] === "string" ? process.argv[1] : "";
+  const baseDir = entry ? path.dirname(entry) : process.cwd();
+  return path.join(baseDir, `firePanelWorker.${ext}`);
+}
+
+function ensureWorkers() {
+  if (panelWorker) return;
+
+  // Prefer compiled worker files (desktop:server:build / packaged runtime).
+  // If running via `npx tsx desktop-server/src/index.ts` (desktop:server),
+  // we spin up a TS worker using `--import tsx` so worker threads can run TypeScript too.
+  const fs = require("fs") as typeof import("fs");
+
+  const workerPathJs = getWorkerEntryPath("js");
+  const workerPathCjs = getWorkerEntryPath("cjs");
+  const entry = typeof process.argv?.[1] === "string" ? process.argv[1] : "";
+  const baseDir = entry ? path.dirname(entry) : process.cwd();
+  const workerPathTs = path.join(baseDir, "workers", "firePanelWorker.ts");
+
+  const hasJs = (() => {
+    try {
+      fs.accessSync(workerPathJs);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  const hasCjs = (() => {
+    try {
+      fs.accessSync(workerPathCjs);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  const canUseTsWorker = (() => {
+    try {
+      fs.accessSync(workerPathTs);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  if (hasJs) {
+    panelWorker = new Worker(workerPathJs);
+  } else if (hasCjs) {
+    panelWorker = new Worker(workerPathCjs);
+  } else if (canUseTsWorker) {
+    panelWorker = new Worker(workerPathTs, {
+      execArgv: ["--import", "tsx"],
+    });
+  } else {
+    throw new Error("firePanelWorker not found (js/cjs/ts)");
+  }
+
+  panelWorker.on("message", (msg: OutgoingMessage) => {
+    if (msg.type === "connected") {
+      connected = msg.connected;
+      currentHost = msg.host;
+      currentPort = msg.port;
+      if (!msg.connected) {
+        addLog("Telnet socket closed");
+      }
+      return;
+    }
+
+    if (msg.type === "status") {
+      const pendingReq = pending.get(msg.id);
+      if (!pendingReq) return;
+      pending.delete(msg.id);
+      connected = msg.connected;
+      currentHost = msg.host;
+      currentPort = msg.port;
+      pendingReq.resolve({
+        connected: msg.connected,
+        host: msg.host,
+        port: msg.port,
+      });
+      return;
+    }
+
+    if (msg.type === "chunk") {
+      chunkHandlers.get(msg.id)?.(msg.response, msg.done);
+      return;
+    }
+
+    if (msg.type === "result") {
+      const pendingReq = pending.get(msg.id);
+      if (!pendingReq) return;
+      pending.delete(msg.id);
+      if (msg.ok) pendingReq.resolve(msg.response);
+      else pendingReq.reject(new Error(msg.error));
+    }
+  });
+
+  panelWorker.on("error", (err) => {
+    connected = false;
+    addLog(`Panel worker error: ${err.message}`);
+  });
+}
+
+function request(worker: Worker, msg: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    if (!("id" in msg) || !msg.id) {
+      reject(new Error("Worker request is missing id"));
+      return;
+    }
+    pending.set(msg.id, { resolve, reject });
+    worker.postMessage(msg);
+  });
+}
+
+async function readWorkerStatus() {
+  ensureWorkers();
+  const id = `status-${Date.now()}`;
+  const status = (await request(panelWorker!, { type: "status", id })) as {
+    connected: boolean;
+    host: string;
+    port: number;
+  };
+  connected = status.connected;
+  currentHost = status.host;
+  currentPort = status.port;
+  return status;
 }
 
 function ensureConnected() {
-  if (!client) {
-    throw new Error("Not connected");
-  }
+  if (!connected) throw new Error("Not connected");
 }
 
-function attachSocketHandlers(socket: net.Socket) {
-  socket.on("close", () => {
-    addLog("Socket closed");
-    client = null;
-  });
-  socket.on("error", (err) => {
-    addLog(`Socket error: ${err.message}`);
-  });
-}
+export async function connectFirePanel(host: string, port: number) {
+  ensureWorkers();
 
-export function connectFirePanel(host: string, port: number) {
-  if (client) {
-    client.destroy();
-    client = null;
+  const existing = await readWorkerStatus();
+  if (
+    existing.connected &&
+    existing.host === host &&
+    Number(existing.port) === Number(port)
+  ) {
+    addLog(`Already connected to ${host}:${port}`);
+    return;
   }
 
-  return new Promise<void>((resolve, reject) => {
-    const socket = new net.Socket();
-    socket.setKeepAlive(true);
+  if (connectInFlight) {
+    await connectInFlight;
+    const after = await readWorkerStatus();
+    if (!after.connected) {
+      throw new Error("Failed to connect to fire panel");
+    }
+    return;
+  }
 
-    socket.once("error", (err) => {
-      reject(err);
-    });
+  currentHost = host;
+  currentPort = port;
+  addLog(`Connecting to ${host}:${port}...`);
 
-    socket.connect(port, host, () => {
-      client = socket;
-      currentHost = host;
-      currentPort = port;
-      attachSocketHandlers(socket);
-      addLog(`Connected to ${host}:${port}`);
+  connectInFlight = (async () => {
+    panelWorker!.postMessage({ type: "connect", host, port } satisfies IncomingMessage);
+    // Wait for TCP connect + worker CONNECT_DELAY_MS before status check.
+    await sleep(600);
 
-      // Wait for panel welcome banner before sending commands (like original script)
-      setTimeout(() => {
-        addLog("Ready");
-        resolve();
-      }, CONNECT_DELAY_MS);
-    });
-  });
+    const status = await readWorkerStatus();
+    if (!status.connected) {
+      connected = false;
+      throw new Error("Failed to connect to fire panel");
+    }
+
+    connected = true;
+    addLog(`Connected to ${status.host}:${status.port}`);
+  })();
+
+  try {
+    await connectInFlight;
+  } finally {
+    connectInFlight = null;
+  }
 }
 
 export function disconnectFirePanel() {
-  if (client) {
-    client.removeAllListeners("close");
-    client.end();
-    client.destroy();
-    client = null;
-    addLog("Disconnected");
+  if (panelWorker) {
+    panelWorker.postMessage({ type: "disconnect" } satisfies IncomingMessage);
   }
+  connected = false;
+  addLog("Disconnected");
 }
 
 export function getFirePanelStatus() {
   return {
-    connected: Boolean(client),
+    connected,
     host: currentHost,
     port: currentPort,
   };
 }
 
-function sendCommand(command: string, timeoutMs?: number) {
-  return enqueueCommand(() => sendCommandOnce(command, timeoutMs));
+export async function getFirePanelStatusLive() {
+  try {
+    return await readWorkerStatus();
+  } catch {
+    return {
+      connected: false,
+      host: currentHost,
+      port: currentPort,
+    };
+  }
 }
 
-function sendCommandOnce(command: string, timeoutMs?: number) {
-  ensureConnected();
-  const socket = client as net.Socket;
-  const normalized = normalizeCommand(command);
-  const maxWaitMs = timeoutForCommand(command, timeoutMs);
-  const idleMs = idleMsForCommand(command);
+async function sendCommandViaWorker(
+  command: string,
+  timeoutMs?: number,
+  onChunk?: (response: string, done: boolean) => void,
+) {
+  ensureWorkers();
 
-  return new Promise<string>((resolve, reject) => {
-    let response = "";
-    let idleTimer: ReturnType<typeof setTimeout> | null = null;
-    let settled = false;
+  const trimmed = cleanCommandText(command);
+  addLog(`Command: ${trimmed}`);
 
-    addLog(`>> ${JSON.stringify(normalized)}`);
+  const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const msg: IncomingMessage = { type: "command", id, command, timeoutMs };
 
-    const finish = (label: string) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(hardTimeout);
-      if (idleTimer) clearTimeout(idleTimer);
-      socket.removeListener("data", onData);
-      logCvalPresence(normalized, response);
-      addLog(
-        `<< ${label} ${response.slice(0, 300)}${response.length > 300 ? "..." : ""}`,
-      );
-      resolve(response);
-    };
+  if (onChunk) {
+    chunkHandlers.set(id, onChunk);
+  }
 
-    const fail = (err: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(hardTimeout);
-      if (idleTimer) clearTimeout(idleTimer);
-      socket.removeListener("data", onData);
-      reject(err);
-    };
-
-    const scheduleIdleComplete = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        if (response.length === 0) return;
-        // List output ends with _DNE — keep reading until the panel marks done
-        if (isListCommand(command) && !isDefiniteComplete(response)) {
-          return;
-        }
-        // CVAL responses often arrive in multiple chunks — wait until CVAL= is present
-        if (isCvalCommand(command) && !/CVAL\s*=\s*\d+/i.test(response)) {
-          scheduleIdleComplete();
-          return;
-        }
-        finish("(idle)");
-      }, idleMs);
-    };
-
-    const hardTimeout = setTimeout(() => {
-      if (response.length > 0) {
-        finish("(timeout, partial)");
-        return;
-      }
-      addLog("<< TIMEOUT (no data)");
-      fail(new Error("Timeout waiting for response"));
-    }, maxWaitMs);
-
-    function onData(data: Buffer) {
-      response += data.toString();
-
-      if (isDefiniteComplete(response)) {
-        finish("");
-        return;
-      }
-
-      if (isQuickComplete(command, response)) {
-        scheduleIdleComplete();
-        return;
-      }
-
-      scheduleIdleComplete();
+  try {
+    const response = (await request(panelWorker!, msg)) as string;
+    if (trimmed.toLowerCase().startsWith("show")) {
+      addLog(`show response:\n${response}`);
     }
+    return response;
+  } finally {
+    chunkHandlers.delete(id);
+  }
+}
 
-    socket.on("data", onData);
-    socket.write(normalized, (err) => {
-      if (err) {
-        addLog(`Write error: ${err.message}`);
-        fail(err);
-      }
-    });
-  });
+export async function sendFirePanelCommandStreaming(
+  command: string,
+  timeoutMs: number | undefined,
+  onChunk: (response: string, done: boolean) => void,
+) {
+  ensureConnected();
+  const response = await sendCommandViaWorker(command, timeoutMs, onChunk);
+  return { response };
 }
 
 export async function sendFirePanelCommand(
@@ -260,7 +307,18 @@ export async function sendFirePanelCommand(
   timeoutMs?: number,
 ) {
   ensureConnected();
-  addLog(`Manual command: ${cleanCommandText(command)}`);
-  const response = await sendCommand(command, timeoutMs);
+  const response = await sendCommandViaWorker(command, timeoutMs);
   return { response };
+}
+
+export async function shutdownFirePanelWorkers() {
+  const worker = panelWorker;
+  panelWorker = null;
+  connected = false;
+  if (!worker) return;
+  try {
+    await worker.terminate();
+  } catch {
+    // ignore
+  }
 }

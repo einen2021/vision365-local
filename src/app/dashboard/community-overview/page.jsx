@@ -8,7 +8,7 @@ import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@
 import { AppSidebar } from '@/components/app-sidebar';
 import { SidebarProvider, SidebarInset, SidebarTrigger } from '@/components/ui/sidebar';
 import { ModeToggle } from '@/components/theme-toggle';
-import { FirePanelStatusBadges } from '@/components/fire-panel-status-badges';
+import { DashboardTopBar, DashboardPageContent } from "@/components/dashboard-header";
 import { Separator } from '@/components/ui/separator';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import {
@@ -40,10 +40,12 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { rowsForLiveAlarmLikeDisplay, rowsForLiveTroubleDisplay } from '@/lib/liveAlarmFeedWrite';
+import { rowsForLiveFireSnap } from '@/lib/alarmMessageHistory';
 import { PageHelpBanner } from "@/components/page-help-banner"
 import { Vision365Logo } from "@/components/vision365-logo"
 import { CommunityOverviewFloorMarker } from "@/components/community-overview-floor-marker"
-import { handleImageError } from "@/lib/assetIcons"
+import { handleImageError, resolveAssetTypeFromMapping } from "@/lib/assetIcons"
+import { useAssetTypeIcons } from "@/contexts/AssetTypeIconsContext"
 import { useResolvedAssetUrl } from "@/hooks/useResolvedAssetUrl"
 import {
   mergeFireIntoActiveStatuses,
@@ -93,6 +95,7 @@ function CommunityOverviewContent() {
   const { communities: rawCommunities, isReady, effectiveRole } = useAppData({
     toastOnCommunitiesError: true,
   });
+  const { overrides: assetTypeIconOverrides } = useAssetTypeIcons();
   const communityList = useMemo(
     () =>
       rawCommunities.map((community) => ({
@@ -814,8 +817,13 @@ function CommunityOverviewContent() {
       for (const building of buildingsToFetch) {
         try {
           const dbCol = communityOverviewBuildingDbId(building);
-          const snap = await getDoc(doc(db, dbCol, 'liveAlarm'));
-          const messages = rowsForLiveAlarmLikeDisplay(snap, 'liveAlarm');
+          // Prefer liveFire (written by panel monitor); fall back to legacy liveAlarm.
+          let snap = await getDoc(doc(db, dbCol, 'liveFire'));
+          let messages = snap.exists() ? rowsForLiveFireSnap(snap) : [];
+          if (messages.length === 0) {
+            snap = await getDoc(doc(db, dbCol, 'liveAlarm'));
+            messages = rowsForLiveAlarmLikeDisplay(snap, 'liveAlarm');
+          }
           const details = await FirestoreService.getBuildingAlarmDetails(building);
           buildingData.push({
             buildingName: building,
@@ -1165,18 +1173,10 @@ function CommunityOverviewContent() {
   return (
     <SidebarProvider>
       <AppSidebar />
-      <SidebarInset>
-        <header className="flex h-16 shrink-0 items-center gap-2 transition-[width,height] ease-linear group-has-[[data-collapsible=icon]]/sidebar-wrapper:h-12">
-          <div className="flex items-center gap-2 px-4">
-            <SidebarTrigger className="-ml-1" />
-            <ModeToggle />
-          </div>
-          <div className="ml-auto flex items-center gap-2 px-4">
-            <FirePanelStatusBadges />
-          </div>
-        </header>
+      <SidebarInset className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <DashboardTopBar headerClassName="flex h-16 shrink-0 items-center gap-2 transition-[width,height] ease-linear group-has-[[data-collapsible=icon]]/sidebar-wrapper:h-12" />
 
-        <div className="flex flex-1 flex-col gap-4 p-4 pt-0">
+        <DashboardPageContent className="gap-4 p-4 pt-0">
           <PageHelpBanner />
           {/* Community Selector */}
           <div className="flex gap-4">
@@ -1370,6 +1370,7 @@ function CommunityOverviewContent() {
                                         activeStatuses && activeStatuses[m.id]
                                           ? activeStatuses[m.id].active
                                           : m.active || 0;
+                                      const typeKey = resolveAssetTypeFromMapping(m);
 
                                       return (
                                         <CommunityOverviewFloorMarker
@@ -1379,6 +1380,7 @@ function CommunityOverviewContent() {
                                           y={y}
                                           browserZoom={browserZoom}
                                           fallbackActive={fallbackActive}
+                                          typeIconUrl={typeKey ? assetTypeIconOverrides[typeKey] || "" : ""}
                                           live={assetStatusLive}
                                           onClick={handleAssetClick}
                                         />
@@ -1577,7 +1579,7 @@ function CommunityOverviewContent() {
                                 </span>
                               </h4>
                               {buildingGroup.messages?.length === 0 ? (
-                                <div className="text-sm text-muted-foreground px-2">No liveAlarm rows</div>
+                                <div className="text-sm text-muted-foreground px-2">No live fire rows</div>
                               ) : (
                                 <Table size="sm">
                                   <TableHeader>
@@ -1847,7 +1849,7 @@ function CommunityOverviewContent() {
               Select a community to view details
             </div>
           )}
-        </div>
+        </DashboardPageContent>
       </SidebarInset>
 
       {/* Asset Control Modal */}
@@ -1857,6 +1859,24 @@ function CommunityOverviewContent() {
         asset={selectedAsset}
         selectedBuilding={selectedAsset?.targetBuilding || selectedBuildingForFloor || selectedBuilding}
         userRole={userRole}
+        onDeviceStatusChange={({ assetId, enabled }) => {
+          setCurrentFloorMap((prev) => {
+            if (!prev?.assetMappings) return prev;
+            return {
+              ...prev,
+              assetMappings: prev.assetMappings.map((mapping) =>
+                mapping.id === assetId || mapping.buildingAssetId === assetId
+                  ? { ...mapping, enabled }
+                  : mapping,
+              ),
+            };
+          });
+          setSelectedAsset((prev) =>
+            prev && (prev.id === assetId || prev.buildingAssetId === assetId)
+              ? { ...prev, enabled }
+              : prev,
+          );
+        }}
       />
 
       <Dialog open={isAreaModalOpen} onOpenChange={setIsAreaModalOpen}>

@@ -83,7 +83,12 @@ const navMain = [
     title: "Alarm Messages",
     url: "/dashboard/alarm-messages/history",
     icon: Bell,
-    items: [{ title: "History", url: "/dashboard/alarm-messages/history" }],
+    items: [
+      { title: "History", url: "/dashboard/alarm-messages/history" },
+      { title: "Live Fire", url: "/dashboard/live-fire" },
+      { title: "Live Trouble", url: "/dashboard/live-trouble" },
+      { title: "Live Supervisory", url: "/dashboard/live-supervisory" },
+    ],
   },
 ];
 

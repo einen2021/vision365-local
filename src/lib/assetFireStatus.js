@@ -44,21 +44,134 @@ export function isFireTroubleActive(activeValue) {
 function resolveStatusFromCache(cache, deviceAddress, assetId) {
   if (!cache) return null;
 
+  let fromList = null;
+
   const addressKeys = collectDeviceAddressKeys(deviceAddress);
   for (const addr of addressKeys) {
     if (cache.byDeviceAddress[addr] !== undefined) {
-      return normalizeSimplexStatus(cache.byDeviceAddress[addr]);
+      fromList = normalizeSimplexStatus(cache.byDeviceAddress[addr]);
+      break;
     }
   }
 
-  const idKeys = collectAssetIdKeys(assetId);
-  for (const id of idKeys) {
-    if (cache.byAssetId[id] !== undefined) {
-      return normalizeSimplexStatus(cache.byAssetId[id]);
+  if (!fromList) {
+    const idKeys = collectAssetIdKeys(assetId);
+    for (const id of idKeys) {
+      if (cache.byAssetId[id] !== undefined) {
+        fromList = normalizeSimplexStatus(cache.byAssetId[id]);
+        break;
+      }
     }
   }
 
-  return null;
+  // Panel list F/T/S (optimistic) — OR with AssetsList so a 1s poll cannot wipe live flags.
+  let fromPanel = null;
+  if (cache.panelLiveByAddress) {
+    for (const addr of addressKeys) {
+      if (cache.panelLiveByAddress[addr] !== undefined) {
+        fromPanel = normalizeSimplexStatus(cache.panelLiveByAddress[addr]);
+        break;
+      }
+    }
+  }
+
+  if (!fromList && !fromPanel) return null;
+  if (!fromList) return fromPanel;
+  if (!fromPanel) return fromList;
+  return orSimplexStatus(fromList, fromPanel);
+}
+
+/**
+ * Resolve status using every id/address we might have on a floor-map marker.
+ * Placement doc ids often differ from AssetsList ids, so try them all.
+ * Panel-live F/T is always OR'd so a DB poll with stale F=0 cannot hide a live alarm.
+ */
+export function resolveStatusFromCacheForMapping(
+  cache,
+  mapping = {},
+  deviceAddress = "",
+) {
+  if (!cache) return null;
+
+  const addresses = [
+    deviceAddress,
+    mapping.deviceAddress,
+    mapping.details?.deviceAddress,
+    mapping.partNumber,
+    mapping.details?.partNumber,
+    resolveAssetDeviceAddress(mapping),
+    resolveAssetDeviceAddress(mapping.details || {}),
+  ];
+
+  let fromList = null;
+  for (const address of addresses) {
+    const addressKeys = collectDeviceAddressKeys(address);
+    for (const addr of addressKeys) {
+      if (cache.byDeviceAddress?.[addr] !== undefined) {
+        fromList = normalizeSimplexStatus(cache.byDeviceAddress[addr]);
+        break;
+      }
+    }
+    if (fromList) break;
+  }
+
+  if (!fromList) {
+    const ids = [
+      mapping.assetsListId,
+      mapping.details?.assetsListId,
+      mapping.details?.id,
+      mapping.buildingAssetId,
+      mapping.id,
+      mapping.sanitizedId,
+      mapping.assetId,
+    ];
+    for (const id of ids) {
+      const idKeys = collectAssetIdKeys(id);
+      for (const key of idKeys) {
+        if (cache.byAssetId?.[key] !== undefined) {
+          fromList = normalizeSimplexStatus(cache.byAssetId[key]);
+          break;
+        }
+      }
+      if (fromList) break;
+    }
+  }
+
+  // AssetsList meta may expose the panel address when the mapping omitted it.
+  const metaAddresses = [];
+  if (cache.metaByAssetId) {
+    const ids = [
+      mapping?.assetsListId,
+      mapping?.details?.assetsListId,
+      mapping?.buildingAssetId,
+      mapping?.id,
+      mapping?.assetId,
+    ];
+    for (const id of ids) {
+      const key = String(id || "").trim();
+      if (!key) continue;
+      const meta =
+        cache.metaByAssetId[key] || cache.metaByAssetId[key.toLowerCase()];
+      if (meta?.deviceAddress) metaAddresses.push(meta.deviceAddress);
+    }
+  }
+
+  let fromPanel = null;
+  for (const address of [...addresses, ...metaAddresses]) {
+    for (const addr of collectDeviceAddressKeys(address)) {
+      if (cache.panelLiveByAddress?.[addr] !== undefined) {
+        fromPanel = orSimplexStatus(
+          fromPanel,
+          cache.panelLiveByAddress[addr],
+        );
+      }
+    }
+  }
+
+  if (!fromList && !fromPanel) return null;
+  if (!fromList) return fromPanel;
+  if (!fromPanel) return fromList;
+  return orSimplexStatus(fromList, fromPanel);
 }
 
 /** All cache keys to try for a panel / Simplex device address. */
@@ -112,10 +225,122 @@ export function resolveMarkerStatus(assetId, deviceAddress, fallbackActive, cach
   return { F: 0, T: 0 };
 }
 
-/** Prefer cached panel F/T status (by deviceAddress), else fall back to building active */
+/** Prefer cached panel F/T status (by deviceAddress / id), else fall back to building active */
 export function resolveMarkerActive(assetId, deviceAddress, fallbackActive, cache) {
   const { F, T } = resolveMarkerStatus(assetId, deviceAddress, fallbackActive, cache);
   return simplexStatusToActive(F, T);
+}
+
+/** Prefer full mapping identity (ids + address) when resolving live status. */
+export function resolveMarkerActiveFromMapping(
+  mapping,
+  deviceAddress,
+  fallbackActive,
+  cache,
+) {
+  const { F, T } = resolveMarkerStatusFromMapping(
+    mapping,
+    deviceAddress,
+    fallbackActive,
+    cache,
+  );
+  return simplexStatusToActive(F, T);
+}
+
+/** Resolve raw F/T for a floor-map mapping (with AssetsList meta fallback). */
+export function resolveMarkerStatusFromMapping(
+  mapping,
+  deviceAddress,
+  fallbackActive,
+  cache,
+) {
+  const cached = resolveStatusFromCacheForMapping(cache, mapping, deviceAddress);
+  if (cached) {
+    return {
+      F: Number(cached.F) === 1 ? 1 : 0,
+      T: Number(cached.T) === 1 ? 1 : 0,
+      S: Number(cached.S) === 1 ? 1 : 0,
+    };
+  }
+
+  // AssetsList meta may have the address even when the floor mapping omitted it.
+  const ids = [
+    mapping?.assetsListId,
+    mapping?.details?.assetsListId,
+    mapping?.buildingAssetId,
+    mapping?.id,
+    mapping?.assetId,
+  ];
+  for (const id of ids) {
+    const key = String(id || "").trim();
+    if (!key || !cache?.metaByAssetId) continue;
+    const meta =
+      cache.metaByAssetId[key] || cache.metaByAssetId[key.toLowerCase()];
+    if (!meta?.deviceAddress) continue;
+    const fromMeta = resolveStatusFromCache(cache, meta.deviceAddress, key);
+    if (fromMeta) {
+      return {
+        F: Number(fromMeta.F) === 1 ? 1 : 0,
+        T: Number(fromMeta.T) === 1 ? 1 : 0,
+        S: Number(fromMeta.S) === 1 ? 1 : 0,
+      };
+    }
+  }
+
+  const fallback = Number(fallbackActive ?? FIRE_ACTIVE_NORMAL);
+  if (fallback >= FIRE_ACTIVE_ALARM) return { F: 1, T: 0, S: 0 };
+  if (fallback >= FIRE_ACTIVE_TROUBLE) return { F: 0, T: 1, S: 0 };
+  return { F: 0, T: 0, S: 0 };
+}
+
+/**
+ * Floor-map colors + ripple from F/T:
+ * - F=1 (T=0 or T=1) → red + ripple
+ * - F=0, T=1 → yellow, no ripple
+ * - F=0, T=0 → green, no ripple
+ */
+export function markerVisualFromFT(f, t) {
+  const F = Number(f) === 1 ? 1 : 0;
+  const T = Number(t) === 1 ? 1 : 0;
+
+  if (F === 1) {
+    return {
+      F,
+      T,
+      active: FIRE_ACTIVE_ALARM,
+      borderColor: "rgb(239, 68, 68)",
+      dimColor: "rgba(239, 68, 68, 0.22)",
+      radarColor: "rgba(239, 68, 68, 0.6)",
+      ripple: true,
+    };
+  }
+
+  if (T === 1) {
+    return {
+      F,
+      T,
+      active: FIRE_ACTIVE_TROUBLE,
+      borderColor: "rgb(234, 179, 8)",
+      dimColor: "rgba(234, 179, 8, 0.22)",
+      radarColor: "rgba(234, 179, 8, 0.6)",
+      ripple: false,
+    };
+  }
+
+  return {
+    F,
+    T,
+    active: FIRE_ACTIVE_NORMAL,
+    borderColor: "rgb(34, 197, 94)",
+    dimColor: "rgba(34, 197, 94, 0.22)",
+    radarColor: "rgba(34, 197, 94, 0.6)",
+    ripple: false,
+  };
+}
+
+/** Pulse animation only when fire alarm (F=1) */
+export function shouldFireRipple(activeValue) {
+  return isFireAlarmActive(activeValue);
 }
 
 /** 2D floor map — green normal, yellow trouble, red fire alarm */
@@ -142,11 +367,6 @@ export function getFireMarkerHexColor(activeValue) {
   if (isFireAlarmActive(activeValue)) return "#ef4444";
   if (isFireTroubleActive(activeValue)) return "#eab308";
   return "#16a34a";
-}
-
-/** Pulse animation only when fire alarm (F=1) */
-export function shouldFireRipple(activeValue) {
-  return isFireAlarmActive(activeValue);
 }
 
 /** Human-readable status label + color for UI lists (F/T derived active value) */
@@ -203,6 +423,31 @@ export function cacheChanged(prev, next) {
     !mapsEqual(prev.byAssetId, next.byAssetId) ||
     !metaMapsEqual(prev.metaByAssetId, next.metaByAssetId)
   );
+}
+
+/** OR two simplex status objects (any flag already 1 stays 1). */
+export function orSimplexStatus(a, b) {
+  const left = normalizeSimplexStatus(a);
+  const right = normalizeSimplexStatus(b);
+  return {
+    F: left.F === 1 || right.F === 1 ? 1 : 0,
+    T: left.T === 1 || right.T === 1 ? 1 : 0,
+    S: left.S === 1 || right.S === 1 ? 1 : 0,
+  };
+}
+
+/**
+ * Keep panel-list F/T/S alive on top of AssetsList rows.
+ * The 1s AssetsList poll often still has F=0 before DB writes finish (or when
+ * the address is not in AssetsList) — without this merge, markers snap back to green.
+ */
+export function mergePanelLiveIntoAddressMap(byDeviceAddress = {}, panelLiveByAddress = {}) {
+  const merged = { ...byDeviceAddress };
+  for (const [key, panelStatus] of Object.entries(panelLiveByAddress || {})) {
+    if (!key) continue;
+    merged[key] = orSimplexStatus(merged[key], panelStatus);
+  }
+  return merged;
 }
 
 function metaMapsEqual(a, b) {

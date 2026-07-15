@@ -1,4 +1,5 @@
 import { normalizeBuildingName } from "@/lib/buildingNames";
+import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
 
 const FLOOR_PLAN_VIEW_PATH = "/dashboard/floor_configuration/view";
 
@@ -22,7 +23,10 @@ export function getFireDeviceNavigationTarget(device) {
     floorId,
     sectionId,
     subsectionId: placementLevel === "subsection" ? subsectionId : "",
-    assetId: device.assetId || device.id || "",
+    // Prefer Firestore doc id — human-readable assetId often does not match marker ids.
+    assetId: device.id || device.assetsListId || device.assetId || "",
+    // Address is the reliable match key when mapping doc ids differ from AssetsList ids.
+    address: resolveAssetDeviceAddress(device) || "",
   };
 }
 
@@ -38,6 +42,9 @@ export function buildFloorPlanViewUrl(target) {
   params.set("section", target.sectionId);
   if (target.subsectionId) params.set("subsection", target.subsectionId);
   if (target.assetId) params.set("assetId", target.assetId);
+  if (target.address) params.set("address", target.address);
+  // Only the asset search bar should request the orange "Found" highlight.
+  if (target.highlight) params.set("highlight", "1");
 
   return `${FLOOR_PLAN_VIEW_PATH}?${params.toString()}`;
 }
@@ -48,6 +55,8 @@ export function parseFloorPlanViewSearchParams(searchParams) {
   const sectionId = searchParams?.get("section") || "";
   const subsectionId = searchParams?.get("subsection") || "";
   const assetId = searchParams?.get("assetId") || "";
+  const address = searchParams?.get("address") || "";
+  const highlight = searchParams?.get("highlight") === "1";
 
   if (!building || !floorId || !sectionId) return null;
 
@@ -57,6 +66,8 @@ export function parseFloorPlanViewSearchParams(searchParams) {
     sectionId,
     subsectionId,
     assetId,
+    address,
+    highlight,
   };
 }
 

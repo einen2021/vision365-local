@@ -3,8 +3,9 @@ import { getStoredPanelAlarmTotals, getStoredPanelState, savePanelStateCounts } 
 import {
   connectFirePanel,
   disconnectFirePanel,
-  getFirePanelStatus,
+  getFirePanelStatusLive,
   sendFirePanelCommand,
+  sendFirePanelCommandStreaming,
 } from "../services/firePanelService";
 
 export function createFirePanelRoutes() {
@@ -32,8 +33,8 @@ export function createFirePanelRoutes() {
     return c.json({ connected: false });
   });
 
-  app.get("/status", (c) => {
-    return c.json(getFirePanelStatus());
+  app.get("/status", async (c) => {
+    return c.json(await getFirePanelStatusLive());
   });
 
   app.get("/alarm-totals", async (c) => {
@@ -96,6 +97,57 @@ export function createFirePanelRoutes() {
     } catch (error) {
       return c.json({ error: (error as Error).message }, 500);
     }
+  });
+
+  app.post("/command/stream", async (c) => {
+    const body = await c.req.json();
+    const command = String(body.command || "");
+
+    if (!command.trim()) {
+      return c.json({ error: "Command is required" }, 400);
+    }
+
+    const timeoutMs = Number(body.timeoutMs) || undefined;
+    const encoder = new TextEncoder();
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        let closed = false;
+        const closeStream = () => {
+          if (closed) return;
+          closed = true;
+          controller.close();
+        };
+
+        try {
+          await sendFirePanelCommandStreaming(command, timeoutMs, (response, done) => {
+            controller.enqueue(
+              encoder.encode(`${JSON.stringify({ response, done })}\n`),
+            );
+            if (done) closeStream();
+          });
+          closeStream();
+        } catch (error) {
+          controller.enqueue(
+            encoder.encode(
+              `${JSON.stringify({
+                error: (error as Error).message,
+                done: true,
+              })}\n`,
+            ),
+          );
+          closeStream();
+        }
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+      },
+    });
   });
 
   return app;

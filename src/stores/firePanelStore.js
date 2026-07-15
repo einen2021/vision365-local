@@ -1,19 +1,9 @@
 import { create } from "zustand";
-import { apiFetch } from "@/lib/apiClient";
+import { apiFetch, parseApiJsonResponse } from "@/lib/apiClient";
 
 /** Parse API JSON safely — avoids cryptic errors when HTML error pages are returned */
 async function parseJsonResponse(res) {
-  const contentType = res.headers.get("content-type") || "";
-  if (!contentType.includes("application/json")) {
-    const text = await res.text();
-    if (text.trimStart().startsWith("<")) {
-      throw new Error(
-        "Fire panel API unavailable. Run npm run desktop:dev to start the local server."
-      );
-    }
-    throw new Error(text.slice(0, 200) || `Request failed (${res.status})`);
-  }
-  return res.json();
+  return parseApiJsonResponse(res);
 }
 
 export const useFirePanelStore = create((set, get) => ({
@@ -26,8 +16,10 @@ export const useFirePanelStore = create((set, get) => ({
   lastError: "",
   loading: false,
   rawResponse: "",
-  /** When true, the app keeps retrying telnet until connected (disabled on manual disconnect). */
+  /** When true, the app retries telnet until connected (disabled on manual disconnect). */
   autoReconnect: true,
+  /** Consecutive /status polls that reported disconnected before UI drops to offline. */
+  disconnectStreak: 0,
 
   setHost: (host) => set({ host }),
   setPort: (port) => set({ port }),
@@ -40,32 +32,33 @@ export const useFirePanelStore = create((set, get) => ({
       lastError: errorMessage || state.lastError,
     })),
 
-  /** Retry connect immediately (no delay) until connected or autoReconnect is off. */
+  /** Sync status, then connect once if still offline and auto-reconnect is enabled. */
   ensureConnected: async () => {
+    // Don't block reconnect forever if a previous command left loading stuck.
+    if (get().loading) {
+      const started = Date.now();
+      while (get().loading && Date.now() - started < 4000) {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      if (get().loading) {
+        set({ loading: false });
+      }
+    }
+
+    await get().syncStatus();
     if (get().connected) return true;
     if (!get().autoReconnect) return false;
 
-    while (!get().connected && get().autoReconnect) {
-      await get().syncStatus();
-      if (get().connected) return true;
-
-      if (!get().loading) {
-        await get().connect();
-        if (get().connected) return true;
-      }
-
-      // Yield to the event loop without an intentional retry delay
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
-
-    return get().connected;
+    const result = await get().connect();
+    return Boolean(result?.ok) || get().connected;
   },
 
   syncStatus: async () => {
     try {
       const res = await apiFetch("/api/telnet/fire-panel/status");
       if (!res.ok) {
-        get().markDisconnected();
+        // Proxy/API hiccups must not drop a live telnet session in the UI
+        if (res.status === 404 || res.status === 502 || res.status === 503) return;
         return;
       }
 
@@ -78,28 +71,49 @@ export const useFirePanelStore = create((set, get) => ({
           host: status.host || get().host,
           port: status.port ? String(status.port) : get().port,
           lastError: "",
+          disconnectStreak: 0,
+          loading: false,
         });
-      } else {
-        // Always trust server — do not keep stale "connected" during reconnect attempts
-        set({
-          connected: false,
-          loading: get().loading,
-        });
+        return;
       }
+
+      const wasConnected = get().connected;
+      const nextStreak = (get().disconnectStreak || 0) + 1;
+      // Require two consecutive offline polls before flipping the header badge.
+      if (wasConnected && nextStreak < 2) {
+        set({ disconnectStreak: nextStreak });
+        return;
+      }
+
+      set({
+        connected: false,
+        loading: false,
+        disconnectStreak: nextStreak,
+        lastError: wasConnected
+          ? get().lastError || "Telnet session ended"
+          : get().lastError,
+      });
     } catch {
-      // API not available yet — no error banner on startup
+      // API not available yet — keep current connection state
     }
   },
 
   connect: async () => {
     const { host, port } = get();
     if (!host.trim()) return { ok: false };
+    if (get().loading) return { ok: false, reason: "in_progress" };
+
+    await get().syncStatus();
+    if (get().connected) {
+      return { ok: true, alreadyConnected: true };
+    }
 
     set({
       loading: true,
       lastError: "",
       rawResponse: "",
       autoReconnect: true,
+      disconnectStreak: 0,
     });
 
     try {
@@ -119,6 +133,7 @@ export const useFirePanelStore = create((set, get) => ({
         connectedAt: new Date().toISOString(),
         loading: false,
         lastError: "",
+        disconnectStreak: 0,
       });
       return { ok: true };
     } catch (error) {
@@ -142,6 +157,7 @@ export const useFirePanelStore = create((set, get) => ({
         lastError: "",
         loading: false,
         autoReconnect: false,
+        disconnectStreak: 0,
       });
       return { ok: true };
     } catch (error) {
@@ -162,6 +178,8 @@ export const useFirePanelStore = create((set, get) => ({
         ? 60000
         : lower.startsWith("list")
           ? 15000
+        : lower.startsWith("show")
+          ? 8000
           : lower.includes("cval")
             ? 3000
             : 5000;
@@ -183,11 +201,11 @@ export const useFirePanelStore = create((set, get) => ({
       }
 
       set({ rawResponse: data.response || "", loading: false });
-      return { ok: true };
+      return { ok: true, response: data.response || "" };
     } catch (error) {
       if (/not connected/i.test(error.message || "")) {
-        const connected = await get().ensureConnected();
-        if (connected) {
+        await get().syncStatus();
+        if (get().connected) {
           return get().sendCommand(command);
         }
         get().markDisconnected(error.message);

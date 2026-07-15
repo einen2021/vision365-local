@@ -21,6 +21,9 @@ export const commonRoutes = [
   "/dashboard/assets/view/details",
   "/dashboard/network",
   "/dashboard/alarm-messages/history",
+  "/dashboard/live-fire",
+  "/dashboard/live-trouble",
+  "/dashboard/live-supervisory",
 ];
 
 export const faqRoute = "/dashboard/faq";
@@ -32,6 +35,9 @@ export const clientMainRoute = "/dashboard/floor_configuration/view";
 export const clientRoutes = [
   clientMainRoute,
   "/dashboard/alarm-messages/history",
+  "/dashboard/live-fire",
+  "/dashboard/live-trouble",
+  "/dashboard/live-supervisory",
 ];
 
 export const roleRoutes = {

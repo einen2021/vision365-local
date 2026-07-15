@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ImageIcon, Loader2, RotateCcw, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -17,8 +17,47 @@ import { useAssetTypeIcons } from "@/contexts/AssetTypeIconsContext";
 import {
   getIconForAssetType,
   handleImageError,
-  normalizeAssetTypeKey,
 } from "@/lib/assetIcons";
+import { buildAssetTypeList } from "@/lib/floorPlanLegend";
+import { isAssetImageLoaded, preloadAssetImage } from "@/lib/assetUrlCache";
+
+function AssetTypeIconPreview({ src, fallbackSrc, alt = "" }) {
+  const [displaySrc, setDisplaySrc] = useState(fallbackSrc);
+
+  useEffect(() => {
+    if (!src || src === fallbackSrc) {
+      setDisplaySrc(fallbackSrc);
+      return;
+    }
+
+    if (isAssetImageLoaded(src)) {
+      setDisplaySrc(src);
+      return;
+    }
+
+    let cancelled = false;
+    setDisplaySrc(fallbackSrc);
+
+    void preloadAssetImage(src).then((loaded) => {
+      if (!cancelled) {
+        setDisplaySrc(loaded ? src : fallbackSrc);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fallbackSrc, src]);
+
+  return (
+    <img
+      src={displaySrc}
+      alt={alt}
+      className="h-8 w-8 shrink-0 rounded-full border bg-white object-contain p-0.5"
+      onError={handleImageError}
+    />
+  );
+}
 
 export function AssetTypeIconSettings({ extraTypes = [] }) {
   const { toast } = useToast();
@@ -29,13 +68,10 @@ export function AssetTypeIconSettings({ extraTypes = [] }) {
   const fileInputRef = useRef(null);
   const pendingTypeRef = useRef("");
 
-  const typeList = useMemo(() => {
-    const merged = new Set([...knownTypes, ...extraTypes.map(normalizeAssetTypeKey)]);
-    Object.keys(overrides || {}).forEach((key) => merged.add(key));
-    return Array.from(merged)
-      .filter(Boolean)
-      .sort((a, b) => a.localeCompare(b));
-  }, [knownTypes, extraTypes, overrides]);
+  const typeList = useMemo(
+    () => buildAssetTypeList({ knownTypes, extraTypes, overrides }),
+    [knownTypes, extraTypes, overrides],
+  );
 
   const filteredTypes = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -137,6 +173,7 @@ export function AssetTypeIconSettings({ extraTypes = [] }) {
           ) : (
             filteredTypes.map((typeKey) => {
               const iconSrc = overrides[typeKey] || getIconForAssetType(typeKey);
+              const fallbackSrc = getIconForAssetType(typeKey);
               const hasCustom = Boolean(overrides[typeKey]);
               const isBusy = busyType === typeKey;
 
@@ -145,12 +182,7 @@ export function AssetTypeIconSettings({ extraTypes = [] }) {
                   key={typeKey}
                   className="flex items-center gap-3 rounded-lg border bg-muted/20 px-3 py-2"
                 >
-                  <img
-                    src={iconSrc}
-                    alt=""
-                    className="h-8 w-8 shrink-0 rounded-full border bg-white object-contain p-0.5"
-                    onError={handleImageError}
-                  />
+                  <AssetTypeIconPreview src={iconSrc} fallbackSrc={fallbackSrc} />
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium">{typeKey}</p>
                     <p className="text-xs text-muted-foreground">

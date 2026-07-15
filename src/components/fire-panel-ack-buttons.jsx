@@ -1,12 +1,19 @@
 "use client";
 
 import { useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
+import { LIVE_PANEL_ROUTE_BY_LABEL } from "@/config/live-panel-routes";
+import { normalizePathname } from "@/lib/roleAccess";
+import {
+  silenceSupervisoryAlertBeep,
+  silenceTroubleAlertBeep,
+} from "@/lib/troubleAlertBeep";
 
 /** Taller header controls — status badges keep default compact height. */
 const HEADER_ACTION_BUTTON_CLASS = "h-10 px-4 text-sm";
@@ -37,6 +44,8 @@ const ACK_BUTTONS = [
 
 /** Fire panel acknowledge commands for dashboard headers. */
 export function FirePanelAckButtons() {
+  const router = useRouter();
+  const pathname = normalizePathname(usePathname());
   const { acknowledge, firePanelState } = useFirePanelMonitor();
   const connected = useFirePanelStore((s) => s.connected);
   const { toast } = useToast();
@@ -70,11 +79,31 @@ export function FirePanelAckButtons() {
     }
   };
 
+  const handleButtonClick = (label, title) => {
+    const route = LIVE_PANEL_ROUTE_BY_LABEL[label];
+    if (route && pathname === route) {
+      if (label === "Trouble") {
+        silenceTroubleAlertBeep();
+      }
+      if (label === "Supervisory") {
+        silenceSupervisoryAlertBeep();
+      }
+      void handleAck(label, title);
+      return;
+    }
+    if (route) {
+      router.push(route);
+      return;
+    }
+    void handleAck(label, title);
+  };
+
   return (
     <>
       {ACK_BUTTONS.map(({ label, title, variant, cvalField, activeClassName }) => {
         const cval = firePanelState?.[cvalField] ?? 0;
         const active = cval > 0;
+        const onLivePage = pathname === LIVE_PANEL_ROUTE_BY_LABEL[label];
 
         return (
           <Button
@@ -87,7 +116,12 @@ export function FirePanelAckButtons() {
               active && variant === "outline" ? activeClassName : undefined,
             )}
             disabled={!connected || loadingLabel !== null}
-            onClick={() => handleAck(label, title)}
+            title={
+              onLivePage
+                ? `${title} on this page`
+                : `Open ${title.replace(" Ack", "")} list page`
+            }
+            onClick={() => handleButtonClick(label, title)}
           >
             {loadingLabel === label ? (
               <Loader2 className="h-4 w-4 animate-spin" />

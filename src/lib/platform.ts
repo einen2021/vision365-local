@@ -33,14 +33,14 @@ export function resolvePublicAssetUrl(path: string): string {
 
   try {
     const { origin, protocol } = window.location;
+    // Keep relative paths in the browser — absolute URLs cause SSR hydration mismatches.
     if (protocol === "http:" || protocol === "https:") {
-      return new URL(normalized, origin).href;
+      return normalized;
     }
+    return new URL(normalized, origin).href;
   } catch {
-    // fall through
+    return normalized;
   }
-
-  return normalized;
 }
 
 export function isDesktopApiReady(): boolean {

@@ -10,7 +10,15 @@ import {
   useState,
 } from "react";
 import { useRouter } from "next/navigation";
-import { Flame, Loader2, Volume2, VolumeX } from "lucide-react";
+import {
+  Building2,
+  Flame,
+  Layers,
+  Loader2,
+  MapPin,
+  Volume2,
+  VolumeX,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -21,28 +29,80 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { startFireAlertSiren } from "@/lib/fireAlertSiren";
-import {
-  buildFloorPlanViewUrl,
-  getFireDeviceNavigationTarget,
-} from "@/lib/fireAlertFloorNavigation";
+import { buildFloorPlanViewUrl } from "@/lib/fireAlertFloorNavigation";
+import { resolveAssetNavigationTarget } from "@/lib/assetPlacementNavigation";
+import { buildGraphicsViewUrl } from "@/lib/graphicsViewSelection";
+import { buildPanelAckCommand } from "@/lib/firePanelMonitor";
+import { useFirePanelStore } from "@/stores/firePanelStore";
+import { useToast } from "@/hooks/use-toast";
+import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
 
 const FireAlertContext = createContext();
 
 export const useFireAlert = () => useContext(FireAlertContext);
 
-function FireAlertModalView({ open, isMuted, onToggleMute, addressLoading }) {
+function getFloorPlacementLabel(target = {}) {
+  const parts = [];
+  if (target.floorName) parts.push(`Floor: ${target.floorName}`);
+  if (target.sectionName) parts.push(`Section: ${target.sectionName}`);
+  if (target.subsectionName) parts.push(`Subsection: ${target.subsectionName}`);
+  return parts.join(" · ");
+}
+
+function getDeviceLabel(device) {
+  const d = device && typeof device === "object" ? device : {};
+  return (
+    d.assetName ||
+    d.name ||
+    d.deviceType ||
+    d.category ||
+    "Fire alarm device"
+  );
+}
+
+function getDeviceLocationLabel(device) {
+  const d = device && typeof device === "object" ? device : {};
+  return (
+    d.deviceLocation ||
+    d.deviceDescription ||
+    d.description ||
+    ""
+  ).trim();
+}
+
+function FireAlertModalView({
+  open,
+  isMuted,
+  addressLoading,
+  placementResolving,
+  ackLoading,
+  device,
+  navigationTarget,
+  onToggleMute,
+  onAcknowledge,
+}) {
+  const deviceAddress = device ? resolveAssetDeviceAddress(device) : "";
+  const deviceLabel = device ? getDeviceLabel(device) : "";
+  const locationLabel = device ? getDeviceLocationLabel(device) : "";
+  const placementLabel = getFloorPlacementLabel(navigationTarget || {});
+  const hasPlacement =
+    Boolean(navigationTarget?.floorName) ||
+    Boolean(navigationTarget?.sectionName) ||
+    Boolean(navigationTarget?.subsectionName);
+  const isLocating = addressLoading || placementResolving;
+
   return (
     <Dialog open={open}>
       <DialogContent
         className={cn(
-          "gap-0 overflow-hidden border-red-500/60 p-0 shadow-2xl shadow-red-950/30 sm:max-w-[500px]",
+          "gap-0 overflow-hidden border-red-500/60 p-0 shadow-2xl shadow-red-950/30 sm:max-w-[520px]",
           "ring-2 ring-red-500/40 ring-offset-2 ring-offset-background",
           "[&>button]:hidden",
         )}
         onPointerDownOutside={(e) => e.preventDefault()}
         onEscapeKeyDown={(e) => e.preventDefault()}
       >
-        <div className="relative overflow-hidden bg-gradient-to-br from-red-700 via-red-600 to-red-700 px-6 py-5 text-white">
+        <div className="relative overflow-hidden bg-gradient-to-br from-red-700 via-red-600 to-red-700 px-6 py-6 text-white">
           <div
             className="pointer-events-none absolute inset-0 opacity-30"
             aria-hidden
@@ -74,30 +134,110 @@ function FireAlertModalView({ open, isMuted, onToggleMute, addressLoading }) {
           </DialogHeader>
         </div>
 
-        <div className="bg-background px-6 py-8 text-center">
+        <div className="bg-background px-6 py-8">
           <p className="text-lg font-bold uppercase tracking-wide text-red-600 dark:text-red-400">
             Emergency
           </p>
-          <p className="mt-3 text-2xl font-bold leading-snug text-foreground sm:text-3xl">
-            There is fire in your building.
-          </p>
-          <p className="mt-2 text-lg font-semibold text-red-700 dark:text-red-300">
-            Immediate action required.
+          <p className="mt-2 text-xl font-bold leading-snug text-foreground sm:text-2xl">
+            Fire condition detected on the panel.
           </p>
 
-          <div className={cn("flex items-center px-5 w-full", addressLoading ? "justify-between" : "justify-center")}>
-            {addressLoading ? (
-              <div className="mt-6 flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Locating alarm device…
+          {isLocating ? (
+            <div className="mt-5 flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-3 text-sm text-red-900 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-100">
+              <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+              Locating alarm device and floor placement…
+            </div>
+          ) : device ? (
+            <dl className="mt-5 space-y-3 text-sm">
+              <div className="flex items-start gap-3">
+                <Building2 className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                <div>
+                  <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Building
+                  </dt>
+                  <dd className="font-medium">
+                    {navigationTarget?.building || device.buildingName || device.building || "Unknown"}
+                  </dd>
+                </div>
               </div>
-            ) : null}
 
+              {hasPlacement ? (
+                <div className="flex items-start gap-3">
+                  <Layers className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                  <div>
+                    <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Floor Plan
+                    </dt>
+                    <dd className="font-medium">{placementLabel}</dd>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-start gap-3">
+                  <Layers className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                  <div>
+                    <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Floor Plan
+                    </dt>
+                    <dd className="text-muted-foreground">
+                      Device not placed on a nested floor map
+                    </dd>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-start gap-3">
+                <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                <div>
+                  <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Location
+                  </dt>
+                  <dd className="font-medium">
+                    {locationLabel || "No location description"}
+                  </dd>
+                  {deviceAddress ? (
+                    <dd className="font-mono text-xs text-muted-foreground">{deviceAddress}</dd>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="flex items-start gap-3">
+                <Flame className="mt-0.5 h-4 w-4 shrink-0 text-red-600" />
+                <div>
+                  <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Device
+                  </dt>
+                  <dd className="font-medium">{deviceLabel}</dd>
+                </div>
+              </div>
+            </dl>
+          ) : (
+            <p className="mt-5 text-sm text-muted-foreground">
+              Could not match the panel alarm to an asset in AssetsList.
+            </p>
+          )}
+
+          <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+            <Button
+              type="button"
+              variant="destructive"
+              className="min-w-[140px] font-semibold"
+              onClick={onAcknowledge}
+              disabled={ackLoading || isLocating}
+            >
+              {ackLoading ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Acknowledging…
+                </>
+              ) : (
+                "Acknowledge"
+              )}
+            </Button>
             <Button
               type="button"
               variant="outline"
-              className="mt-6"
               onClick={onToggleMute}
+              disabled={ackLoading}
               aria-pressed={isMuted}
               aria-label={isMuted ? "Unmute alarm siren" : "Mute alarm siren"}
             >
@@ -122,17 +262,31 @@ function FireAlertModalView({ open, isMuted, onToggleMute, addressLoading }) {
 
 export function FireAlertProvider({ children }) {
   const router = useRouter();
+  const { toast } = useToast();
+  const sendPanelCommand = useFirePanelStore((s) => s.sendCommand);
   const [isFireAlertOpen, setIsFireAlertOpen] = useState(false);
   const [isAlarmActive, setIsAlarmActive] = useState(false);
   const [isSirenMuted, setIsSirenMuted] = useState(false);
   const [addressLoading, setAddressLoading] = useState(false);
+  const [placementResolving, setPlacementResolving] = useState(false);
+  const [ackLoading, setAckLoading] = useState(false);
   const [deviceList, setDeviceList] = useState([]);
+  const [navigationTarget, setNavigationTarget] = useState(null);
   const stopSirenRef = useRef(null);
-  const hasNavigatedRef = useRef(false);
+
+  const activeDevice = useMemo(() => {
+    for (let i = deviceList.length - 1; i >= 0; i -= 1) {
+      const item = deviceList[i];
+      if (item && typeof item === "object") return item;
+    }
+    return null;
+  }, [deviceList]);
 
   const showFireAlert = useCallback(() => {
-    hasNavigatedRef.current = false;
     setDeviceList([]);
+    setNavigationTarget(null);
+    setPlacementResolving(false);
+    setAckLoading(false);
     setIsAlarmActive(true);
     setIsFireAlertOpen(true);
   }, []);
@@ -142,8 +296,10 @@ export function FireAlertProvider({ children }) {
     setIsAlarmActive(false);
     setIsSirenMuted(false);
     setAddressLoading(false);
+    setPlacementResolving(false);
+    setAckLoading(false);
     setDeviceList([]);
-    hasNavigatedRef.current = false;
+    setNavigationTarget(null);
   }, []);
 
   const closeFireAlertModal = useCallback(() => {
@@ -162,19 +318,89 @@ export function FireAlertProvider({ children }) {
     setIsSirenMuted(false);
   }, []);
 
-  // Navigate to the nested floor plan for the last resolved fire device, then close modal
+  // Resolve nested floor placement once the fire list lookup finishes.
   useEffect(() => {
-    if (!isFireAlertOpen || addressLoading || deviceList.length === 0) return;
-    if (hasNavigatedRef.current) return;
+    if (addressLoading || !activeDevice) return;
 
-    const device = deviceList[deviceList.length - 1];
-    const target = getFireDeviceNavigationTarget(device);
-    if (!target) return;
+    let cancelled = false;
+    setPlacementResolving(true);
 
-    hasNavigatedRef.current = true;
-    router.push(buildFloorPlanViewUrl(target));
-    setIsFireAlertOpen(false);
-  }, [isFireAlertOpen, addressLoading, deviceList, router]);
+    void (async () => {
+      try {
+        const target = await resolveAssetNavigationTarget(activeDevice, activeDevice.id);
+        if (!cancelled) {
+          setNavigationTarget(target);
+        }
+      } catch (error) {
+        console.error("[fire-alert] placement resolve failed:", error);
+        if (!cancelled) {
+          setNavigationTarget(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setPlacementResolving(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [addressLoading, activeDevice]);
+
+  const handleAcknowledge = useCallback(async () => {
+    const connected = useFirePanelStore.getState().connected;
+    if (!connected) {
+      toast({
+        title: "Not connected",
+        description: "Connect to the fire panel before acknowledging.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setAckLoading(true);
+    try {
+      const cmd = buildPanelAckCommand("Fire");
+      const result = await sendPanelCommand(cmd);
+      if (!result?.ok) {
+        throw new Error(useFirePanelStore.getState().lastError || "Acknowledge command failed");
+      }
+
+      muteSiren();
+      closeFireAlertModal();
+
+      if (
+        navigationTarget?.building &&
+        navigationTarget.floorId &&
+        navigationTarget.sectionId
+      ) {
+        router.push(buildFloorPlanViewUrl(navigationTarget));
+      } else if (navigationTarget?.building || activeDevice?.buildingName || activeDevice?.building) {
+        router.push(
+          buildGraphicsViewUrl({
+            building: navigationTarget?.building || activeDevice.buildingName || activeDevice.building,
+          }),
+        );
+      }
+    } catch (error) {
+      toast({
+        title: "Acknowledge failed",
+        description: error?.message || "Could not acknowledge the fire alarm.",
+        variant: "destructive",
+      });
+    } finally {
+      setAckLoading(false);
+    }
+  }, [
+    activeDevice,
+    closeFireAlertModal,
+    muteSiren,
+    navigationTarget,
+    router,
+    sendPanelCommand,
+    toast,
+  ]);
 
   // Siren runs while alarm is active (even after modal is closed)
   useEffect(() => {
@@ -203,6 +429,7 @@ export function FireAlertProvider({ children }) {
       toggleSirenMute,
       addressLoading,
       deviceList,
+      navigationTarget,
       setAddressLoading,
       setDeviceList,
       muteSiren,
@@ -218,6 +445,7 @@ export function FireAlertProvider({ children }) {
       toggleSirenMute,
       addressLoading,
       deviceList,
+      navigationTarget,
       muteSiren,
       unmuteSiren,
     ],
@@ -229,8 +457,13 @@ export function FireAlertProvider({ children }) {
       <FireAlertModalView
         open={isFireAlertOpen}
         isMuted={isSirenMuted}
-        onToggleMute={toggleSirenMute}
         addressLoading={addressLoading}
+        placementResolving={placementResolving}
+        ackLoading={ackLoading}
+        device={activeDevice}
+        navigationTarget={navigationTarget}
+        onToggleMute={toggleSirenMute}
+        onAcknowledge={() => void handleAcknowledge()}
       />
     </FireAlertContext.Provider>
   );

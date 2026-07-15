@@ -1,10 +1,9 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { AppSidebar } from "@/components/app-sidebar"
-import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges"
+import { DashboardHeader } from "@/components/dashboard-header";
 import { Separator } from "@/components/ui/separator"
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar"
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -248,20 +247,9 @@ export default function CommunityManagementPage() {
   }
 
   return (
-    <SidebarProvider>
-      <AppSidebar />
-      <SidebarInset>
-        <header className="flex min-h-16 shrink-0 items-center gap-3 py-2 transition-[width,height] ease-linear group-has-[[data-collapsible=icon]]/sidebar-wrapper:h-12">
-          <div className="flex items-center gap-2 px-8">
-            <SidebarTrigger className="-ml-1" />
-            <ClientModeToggle />
-          </div>
-          <div className="ml-auto flex items-center gap-2 px-8">
-            <FirePanelStatusBadges />
-          </div>
-        </header>
+    <DashboardHeader>
 
-        <div className="flex flex-1 flex-col gap-6 p-6 pt-0">
+<div className="flex flex-1 flex-col gap-6 p-6 pt-0">
           <PageHelpBanner />
           {/* Header */}
           <div className="flex flex-col gap-2">
@@ -655,7 +643,6 @@ export default function CommunityManagementPage() {
             </DialogContent>
           </Dialog>
         </div>
-      </SidebarInset>
-    </SidebarProvider>
+    </DashboardHeader>
   )
 }

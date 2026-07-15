@@ -101,9 +101,21 @@ function dispatch(action) {
   })
 }
 
+const suppressedToastHandle = {
+  dismiss: () => {},
+  update: () => {},
+}
+
 function toast({
   ...props
 }) {
+  if (props.variant === "destructive") {
+    return {
+      ...suppressedToastHandle,
+      id: genId(),
+    }
+  }
+
   const id = genId()
 
   const update = (props) =>

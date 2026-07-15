@@ -3,10 +3,10 @@
 import { useEffect, useState, Suspense } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import dynamic from "next/dynamic"
-import { AppSidebar } from "@/components/app-sidebar"
+import { DashboardHeader } from "@/components/dashboard-header"
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges"
 import { Separator } from "@/components/ui/separator"
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar"
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -98,20 +98,8 @@ function AssetDetailsContent() {
   if (!mounted) return null
 
   return (
-    <SidebarProvider>
-      <AppSidebar />
-      <SidebarInset>
-        <header className="flex min-h-16 shrink-0 items-center gap-3 py-2 transition-[width,height] ease-linear group-has-[[data-collapsible=icon]]/sidebar-wrapper:h-12">
-          <div className="flex items-center gap-2 px-8">
-            <SidebarTrigger className="-ml-1" />
-            <ClientModeToggle />
-          </div>
-          <div className="ml-auto flex items-center gap-2 px-8">
-            <FirePanelStatusBadges />
-          </div>
-        </header>
-
-        <div className="flex flex-1 flex-col gap-6 p-6 pt-0">
+    <DashboardHeader>
+<div className="flex flex-1 flex-col gap-6 p-6 pt-0">
           <div className="flex items-center justify-between">
             <div className="space-y-1">
               <h1 className="text-3xl font-bold tracking-tight">Asset Details</h1>
@@ -284,9 +272,7 @@ function AssetDetailsContent() {
             </>
           )}
         </div>
-      </SidebarInset>
-    </SidebarProvider>
-  )
+  </DashboardHeader>  )
 }
 
 export default function AssetDetailsPage() {

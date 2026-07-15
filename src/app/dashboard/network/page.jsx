@@ -5,10 +5,7 @@ import { AppSidebar } from "@/components/app-sidebar";
 import {
   SidebarProvider,
   SidebarInset,
-  SidebarTrigger,
 } from "@/components/ui/sidebar";
-import { ModeToggle } from "@/components/theme-toggle";
-import { Separator } from "@/components/ui/separator";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,7 +26,7 @@ import { usePageAuth } from "@/hooks/usePageAuth";
 import { useToast } from "@/hooks/use-toast";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
-import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
+import { DashboardTopBar, DashboardPageContent } from "@/components/dashboard-header";
 
 const COMMAND_PLACEHOLDER = "cshow a0 cval";
 
@@ -116,6 +113,8 @@ export default function NetworkTelnetPage() {
     supervisory: firePanelState?.totalSupervisory ?? 0,
   };
   const lastPanelSync = firePanelState?.lastPanelSync ?? null;
+  const lastPolledAt = firePanelState?.lastPolledAt ?? null;
+  const lastUpdatedAt = lastPolledAt || lastPanelSync;
 
   const handleConnect = async () => {
     const result = await connect();
@@ -161,16 +160,10 @@ export default function NetworkTelnetPage() {
   return (
     <SidebarProvider>
       <AppSidebar />
-      <SidebarInset>
-        <header className="flex min-h-16 shrink-0 items-center gap-3 py-2 border-b px-4">
-          <SidebarTrigger className="-ml-1" />
-          <div className="ml-auto flex items-center gap-2">
-            <FirePanelStatusBadges />
-            <ModeToggle />
-          </div>
-        </header>
+      <SidebarInset className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <DashboardTopBar headerClassName="flex min-h-16 shrink-0 items-center gap-3 py-2 px-4" />
 
-        <main className="flex flex-1 flex-col gap-4 p-4 md:p-6">
+        <DashboardPageContent className="gap-4 p-4 md:p-6">
           <div className="flex items-center gap-2">
             <Network className="h-6 w-6" />
             <div>
@@ -280,10 +273,13 @@ export default function NetworkTelnetPage() {
                 </Alert>
               ) : null}
 
-              {lastPanelSync ? (
+              {lastUpdatedAt ? (
                 <p className="text-xs text-muted-foreground">
-                  Last firePanelState sync:{" "}
-                  {new Date(lastPanelSync).toLocaleString()}
+                  Last CVAL update:{" "}
+                  {new Date(lastUpdatedAt).toLocaleString()}
+                  {lastPolledAt && lastPanelSync && lastPolledAt !== lastPanelSync
+                    ? ` (DB sync ${new Date(lastPanelSync).toLocaleString()})`
+                    : null}
                 </p>
               ) : null}
 
@@ -376,7 +372,7 @@ export default function NetworkTelnetPage() {
               </Card>
             </div>
           </div>
-        </main>
+        </DashboardPageContent>
       </SidebarInset>
     </SidebarProvider>
   );

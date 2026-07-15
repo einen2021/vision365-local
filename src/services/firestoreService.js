@@ -33,6 +33,8 @@ import {
   getFloorMapName,
   hasFloorPosition,
   loadFloorMapAssetsFromAssetsList,
+  loadNestedAssetMappingsFromAssetsList,
+  mergeNestedAssetMappings,
   matchesFloorMap,
 } from "@/lib/floorMapAssets";
 
@@ -930,15 +932,12 @@ class FirestoreService {
 
   static async getNestedSection(buildingName, floorId, sectionId) {
     const ref = this._nestedSectionRef(buildingName, floorId, sectionId);
-    const snap = await getDoc(ref);
+    const [snap, assetMappings] = await Promise.all([
+      getDoc(ref),
+      this.getSectionAssetMappings(buildingName, floorId, sectionId),
+    ]);
     if (!snap.exists()) return null;
-    const data = { id: snap.id, ...snap.data() };
-    data.assetMappings = await this.getSectionAssetMappings(
-      buildingName,
-      floorId,
-      sectionId,
-    );
-    return data;
+    return { id: snap.id, ...snap.data(), assetMappings };
   }
 
   static async saveNestedSection(buildingName, floorId, section) {
@@ -1057,16 +1056,17 @@ class FirestoreService {
       sectionId,
       subsectionId,
     );
-    const snap = await getDoc(ref);
+    const [snap, assetMappings] = await Promise.all([
+      getDoc(ref),
+      this.getSubsectionAssetMappings(
+        buildingName,
+        floorId,
+        sectionId,
+        subsectionId,
+      ),
+    ]);
     if (!snap.exists()) return null;
-    const data = { id: snap.id, ...snap.data() };
-    data.assetMappings = await this.getSubsectionAssetMappings(
-      buildingName,
-      floorId,
-      sectionId,
-      subsectionId,
-    );
-    return data;
+    return { id: snap.id, ...snap.data(), assetMappings };
   }
 
   static async saveNestedSubsection(buildingName, floorId, sectionId, subsection) {
@@ -1493,10 +1493,17 @@ class FirestoreService {
       sectionId,
       "assetMappings",
     );
-    const snap = await getDocs(mappingsRef);
+    const [snap, fromAssetsList] = await Promise.all([
+      getDocs(mappingsRef),
+      loadNestedAssetMappingsFromAssetsList(db, buildingName, {
+        floorId,
+        sectionId,
+        placementLevel: "section",
+      }),
+    ]);
     const mappings = [];
     snap.forEach((d) => mappings.push({ id: d.id, ...d.data() }));
-    return mappings;
+    return mergeNestedAssetMappings(mappings, fromAssetsList);
   }
 
   static async updateSectionAssetMappings(
@@ -1573,10 +1580,18 @@ class FirestoreService {
       subsectionId,
       "assetMappings",
     );
-    const snap = await getDocs(mappingsRef);
+    const [snap, fromAssetsList] = await Promise.all([
+      getDocs(mappingsRef),
+      loadNestedAssetMappingsFromAssetsList(db, buildingName, {
+        floorId,
+        sectionId,
+        subsectionId,
+        placementLevel: "subsection",
+      }),
+    ]);
     const mappings = [];
     snap.forEach((d) => mappings.push({ id: d.id, ...d.data() }));
-    return mappings;
+    return mergeNestedAssetMappings(mappings, fromAssetsList);
   }
 
   static async _deleteMatchingNestedMappingDocs(mappingsRef, asset) {
@@ -3965,33 +3980,54 @@ class FirestoreService {
 
   static async getAlarmMessages(buildingName) {
     try {
-      // Get alarm messages from alarmMessage document
+      // Get alarm messages from alarmMessages / alarmMessage document
       const tryCollections = [`${buildingName}BuildingDB`, buildingName];
       let messagesArray = [];
 
       for (const col of tryCollections) {
         try {
-          const alarmMessageRef = doc(db, col, "alarmMessage");
-          const snapshot = await getDoc(alarmMessageRef);
+          for (const docId of ["alarmMessages", "alarmMessage"]) {
+            const alarmMessageRef = doc(db, col, docId);
+            const snapshot = await getDoc(alarmMessageRef);
 
-          if (snapshot.exists()) {
+            if (!snapshot.exists()) continue;
+
             const data = snapshot.data();
-            // Check for alarmMessage field (array) or messages field
-            const messages = data.alarmMessage || data.messages || [];
+            // Prefer the matching field, then common legacy shapes
+            const messages =
+              data[docId] || data.alarmMessages || data.alarmMessage || data.messages || [];
 
             if (Array.isArray(messages) && messages.length > 0) {
-              messagesArray = messages.map((msg) => ({
-                message: msg.message || msg,
-                time: msg.time || Date.now(),
-                formattedTime: msg.time
-                  ? new Date(msg.time).toLocaleString()
-                  : "N/A",
-              }));
+              messagesArray = messages.map((msg) => {
+                if (typeof msg === "string") {
+                  return {
+                    message: msg,
+                    time: Date.now(),
+                    formattedTime: "N/A",
+                  };
+                }
+                const timeRaw = msg?.time;
+                const timeMs =
+                  typeof timeRaw === "number"
+                    ? timeRaw
+                    : typeof timeRaw === "string"
+                      ? Date.parse(timeRaw)
+                      : NaN;
+                const time = Number.isFinite(timeMs) ? timeMs : Date.now();
+                return {
+                  message: msg?.message || String(msg || ""),
+                  time,
+                  formattedTime: Number.isFinite(timeMs)
+                    ? new Date(time).toLocaleString()
+                    : "N/A",
+                };
+              });
+              break;
             }
-            break; // Found messages, stop trying
           }
+          if (messagesArray.length > 0) break;
         } catch (err) {
-          console.error(`Error accessing ${col}/alarmMessage:`, err);
+          console.error(`Error accessing ${col}/alarmMessages:`, err);
         }
       }
 

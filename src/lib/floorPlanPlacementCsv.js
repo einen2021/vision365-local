@@ -416,6 +416,65 @@ function applyCsvPlacementCoords(row, coordOptions) {
   return converted;
 }
 
+/**
+ * Build one floor-plan asset mapping (shared by CSV import and manual placement).
+ * Spreads placementContext from buildNestedPlacementContext for floor/section fields.
+ */
+export function buildPlacementMapping({
+  asset,
+  coords,
+  placementContext = null,
+  mappingIndex = 0,
+  deviceAddressOverride = null,
+  deviceLocationOverride = null,
+}) {
+  const isGeneral = (asset.assetMode || "general") === "general";
+  const assetsListId = isGeneral ? asset.assetsListId || asset.id : null;
+  const stableId = assetsListId || asset.id || "asset";
+
+  return {
+    id: `map_${stableId}_${mappingIndex}`,
+    assetName: asset.assetName || asset.name || asset.itemType || "",
+    itemType: asset.itemType || asset.assetName || asset.name || "",
+    category: asset.category || asset.categoryKey || "fire-life-safety",
+    assetMode: isGeneral ? "general" : "building",
+    assetsListId,
+    buildingAssetId: isGeneral ? null : asset.id,
+    x: coords.x,
+    y: coords.y,
+    relativeX: coords.relativeX,
+    relativeY: coords.relativeY,
+    ...pickMappingDeviceFields({
+      ...asset,
+      ...(deviceAddressOverride ? { deviceAddress: deviceAddressOverride } : {}),
+      ...(deviceLocationOverride != null && deviceLocationOverride !== ""
+        ? { deviceLocation: deviceLocationOverride }
+        : {}),
+    }),
+    ...(placementContext || {}),
+    placedAt: new Date().toISOString(),
+  };
+}
+
+/** Replace existing markers for the same asset when importing or placing manually. */
+export function mergePlacementMappings(currentMappings = [], newMappings = []) {
+  let next = [...currentMappings];
+
+  for (const mapping of newMappings) {
+    const assetRef = {
+      assetMode: mapping.assetMode || "general",
+      assetsListId: mapping.assetsListId,
+      id: mapping.buildingAssetId || mapping.assetsListId || mapping.id,
+      category: mapping.category,
+      buildingAssetId: mapping.buildingAssetId,
+    };
+    next = next.filter((item) => !pickerAssetMatchesMapping(assetRef, item));
+    next.push(mapping);
+  }
+
+  return next;
+}
+
 function buildMappingFromImportRow(row, asset, buildingName, target, coordOptions = {}) {
   const { floor, section, subsection, placementLevel } = target;
   const pathParts = [buildingName, floor.name, section.name];
@@ -540,26 +599,16 @@ export function buildMappingsFromLocationCsvRows(rows, options = {}) {
       continue;
     }
 
-    mappings.push({
-      id: `map_${assetsListId}_${mappingIndex++}`,
-      assetName: row.assetName || asset.assetName || asset.name || asset.itemType || "",
-      itemType: row.itemType || asset.itemType || asset.assetName || "",
-      category: row.category || asset.category || "fire-life-safety",
-      assetMode: "general",
-      assetsListId,
-      buildingAssetId: null,
-      x: coords.x,
-      y: coords.y,
-      relativeX: coords.relativeX,
-      relativeY: coords.relativeY,
-      ...pickMappingDeviceFields({
-        ...asset,
-        deviceAddress: row.deviceAddress,
-        deviceLocation: row.deviceLocation || asset.deviceLocation,
+    mappings.push(
+      buildPlacementMapping({
+        asset,
+        coords,
+        placementContext,
+        mappingIndex: mappingIndex++,
+        deviceAddressOverride: row.deviceAddress,
+        deviceLocationOverride: row.deviceLocation || asset.deviceLocation,
       }),
-      ...(placementContext || {}),
-      placedAt: new Date().toISOString(),
-    });
+    );
   }
 
   return {

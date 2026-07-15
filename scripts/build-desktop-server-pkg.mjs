@@ -28,17 +28,21 @@ function copyDir(src, dest) {
 fs.mkdirSync(serverResDir, { recursive: true });
 
 await esbuild.build({
-  entryPoints: [path.join(root, "desktop-server/src/index.ts")],
+  entryPoints: [
+    path.join(root, "desktop-server/src/index.ts"),
+    path.join(root, "desktop-server/src/workers/firePanelWorker.ts"),
+  ],
   bundle: true,
   platform: "node",
   target: "node20",
-  outfile: path.join(serverResDir, "index.cjs"),
+  outdir: serverResDir,
+  entryNames: "[name]",
   format: "cjs",
   external: ["mongodb"],
   sourcemap: false,
 });
 
-console.log("[bundle] Built src-tauri/resources/server/index.cjs");
+console.log("[bundle] Built src-tauri/resources/server/*.cjs");
 
 // 2. Ensure portable Node.js
 const nodeExe = path.join(nodeResDir, "node.exe");

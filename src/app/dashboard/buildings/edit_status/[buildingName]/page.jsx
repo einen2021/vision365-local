@@ -1,18 +1,14 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { DashboardHeader } from "@/components/dashboard-header";
 import { useParams, useRouter } from "next/navigation";
 import { usePageAuth } from "@/hooks/usePageAuth";
 import { Loader2, Plus, Trash2 } from "lucide-react";
-import { AppSidebar } from "@/components/app-sidebar";
 import { ModeToggle } from "@/components/theme-toggle";
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
 import { Separator } from "@/components/ui/separator";
-import {
-  SidebarInset,
-  SidebarProvider,
-  SidebarTrigger,
-} from "@/components/ui/sidebar";
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -387,30 +383,15 @@ export default function EditBuildingDetailsPage() {
 
   if (loading) {
     return (
-      <SidebarProvider>
-        <AppSidebar />
-        <SidebarInset>
           <div className="flex h-full items-center justify-center">
             <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
           </div>
-        </SidebarInset>
-      </SidebarProvider>
     );
   }
 
   return (
-    <SidebarProvider>
-      <AppSidebar />
-      <SidebarInset>
-        <header className="flex h-16 items-center gap-2 px-4">
-          <SidebarTrigger className="-ml-1" />
-          <ModeToggle />
-          <div className="ml-auto flex items-center gap-2">
-            <FirePanelStatusBadges />
-          </div>
-        </header>
-
-        <div className="flex flex-1 flex-col gap-4 p-4 pt-0">
+    <DashboardHeader>
+<div className="flex flex-1 flex-col gap-4 p-4 pt-0">
           <Card className="w-full">
             <CardHeader>
               <CardTitle>Edit Building Details</CardTitle>
@@ -711,7 +692,5 @@ export default function EditBuildingDetailsPage() {
             </CardContent>
           </Card>
         </div>
-      </SidebarInset>
-    </SidebarProvider>
-  );
+  </DashboardHeader>  );
 }

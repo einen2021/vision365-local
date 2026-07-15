@@ -54,6 +54,10 @@ import {
   findPickerAssetMapping,
   pickerAssetMatchesMapping,
 } from "@/lib/floorMapAssets";
+import {
+  buildPlacementMapping,
+  mergePlacementMappings,
+} from "@/lib/floorPlanPlacementCsv";
 
 /** Compare asset mapping arrays to detect unsaved placements. */
 function assetMappingsEqual(a, b) {
@@ -285,7 +289,12 @@ export function NestedFloorPlanEditor({ buildingName }) {
   const addFloor = async () => {
     const name = newFloorName.trim();
     if (!name) return;
-    if (floors.some((f) => f.name.toLowerCase() === name.toLowerCase())) {
+    const normalizedName = name.toLowerCase();
+    if (
+      floors.some(
+        (f) => String(f?.name || "").trim().toLowerCase() === normalizedName,
+      )
+    ) {
       toast({
         title: "Duplicate",
         description: "A floor with this name already exists",
@@ -564,28 +573,17 @@ export function NestedFloorPlanEditor({ buildingName }) {
       placementLevel,
     });
 
-    const mapping = {
-      id: `asset_${mappingCounter}`,
-      assetName: selectedAsset.name,
-      itemType: selectedAsset.itemType || selectedAsset.name || "",
-      category: selectedAsset.category,
-      assetMode: selectedAsset.assetMode || assetMode,
-      assetsListId:
-        selectedAsset.assetMode === "general"
-          ? selectedAsset.assetsListId || selectedAsset.id
-          : null,
-      buildingAssetId:
-        selectedAsset.assetMode === "building" ? selectedAsset.id : null,
-      ...coords,
-      ...pickMappingDeviceFields(selectedAsset),
-      ...placementContext,
-      placedAt: new Date().toISOString(),
-    };
+    const mapping = buildPlacementMapping({
+      asset: { ...selectedAsset, assetMode: selectedAsset.assetMode || assetMode },
+      coords,
+      placementContext,
+      mappingIndex: mappingCounter,
+    });
 
     if (level === NAV_LEVELS.SECTION) {
-      setSectionAssetMappings([...sectionAssetMappings, mapping]);
+      setSectionAssetMappings((prev) => mergePlacementMappings(prev, [mapping]));
     } else if (level === NAV_LEVELS.SUBSECTION) {
-      setAssetMappings([...assetMappings, mapping]);
+      setAssetMappings((prev) => mergePlacementMappings(prev, [mapping]));
     }
 
     setMappingCounter(mappingCounter + 1);
@@ -610,38 +608,31 @@ export function NestedFloorPlanEditor({ buildingName }) {
     });
   };
 
-  const mergeImportedLocationMappings = (currentMappings, newMappings) => {
-    let next = [...currentMappings];
-    for (const mapping of newMappings) {
-      const assetRef = {
-        assetMode: "general",
-        assetsListId: mapping.assetsListId,
-        id: mapping.assetsListId,
-      };
-      next = next.filter((item) => !pickerAssetMatchesMapping(assetRef, item));
-      next.push(mapping);
-    }
-    return next;
-  };
-
   const handleCsvLocationImport = (result, targetLevel) => {
     if (targetLevel === "section") {
-      setSectionAssetMappings((prev) => mergeImportedLocationMappings(prev, result.mappings));
+      setSectionAssetMappings((prev) => mergePlacementMappings(prev, result.mappings));
     } else {
-      setAssetMappings((prev) => mergeImportedLocationMappings(prev, result.mappings));
+      setAssetMappings((prev) => mergePlacementMappings(prev, result.mappings));
     }
     setMappingCounter((count) => count + result.mappings.length);
   };
 
   const handleAssetReposition = (mapping, coords, targetLevel) => {
+    const placementLevel = targetLevel === "subsection" ? "subsection" : "section";
+    const placementContext = buildNestedPlacementContext({
+      buildingName,
+      floor,
+      section,
+      subsection: targetLevel === "subsection" ? subsection : null,
+      placementLevel,
+    });
+
     const updateMapping = (item) =>
       item.id === mapping.id
         ? {
             ...item,
-            x: coords.x,
-            y: coords.y,
-            relativeX: coords.relativeX,
-            relativeY: coords.relativeY,
+            ...coords,
+            ...placementContext,
           }
         : item;
 
@@ -996,7 +987,7 @@ export function NestedFloorPlanEditor({ buildingName }) {
                       onClick={() => openFloor(f)}
                     >
                       <MapPin className="mb-2 h-5 w-5 text-primary" />
-                      <span className="font-medium text-center">{f.name}</span>
+                      <span className="font-medium text-center">{f.name || f.id || "Unnamed floor"}</span>
                       {f.imageUrl ? (
                         <Badge variant="secondary" className="mt-2 text-xs">
                           Plan uploaded

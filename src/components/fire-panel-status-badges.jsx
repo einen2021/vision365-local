@@ -18,6 +18,7 @@ import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 import { FirePanelAckButtons } from "@/components/fire-panel-ack-buttons";
+import { GraphicsViewNavButton } from "@/components/graphics-view-nav-button";
 
 /** Taller header controls — connection/monitoring badges stay compact. */
 const HEADER_ACTION_BUTTON_CLASS = "h-10 px-4 text-sm";
@@ -79,8 +80,9 @@ export function FirePanelStatusBadges() {
       await systemReset();
       setSystemResetDialogOpen(false);
       toast({
-        title: "System reset complete",
-        description: "All asset fire (F) statuses were cleared in AssetsList.",
+        title: "System reset successful",
+        description:
+          "Panel reset command completed. Asset statuses are being cleared in the background.",
       });
     } catch (error) {
       console.error("System reset failed:", error);
@@ -96,7 +98,8 @@ export function FirePanelStatusBadges() {
 
   return (
     <>
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+        <div className="flex flex-wrap items-center gap-2">
         <div className="flex flex-col gap-0.5">
           {connected ? (
             <Badge
@@ -179,6 +182,8 @@ export function FirePanelStatusBadges() {
           )}
           System Reset
         </Button>
+        </div>
+        <GraphicsViewNavButton />
       </div>
 
       <AlertDialog open={systemResetDialogOpen} onOpenChange={setSystemResetDialogOpen}>
@@ -186,8 +191,8 @@ export function FirePanelStatusBadges() {
           <AlertDialogHeader>
             <AlertDialogTitle>System reset</AlertDialogTitle>
             <AlertDialogDescription>
-              This clears fire (F) status on every asset in AssetsList. Floor map markers will
-              return to normal. Trouble and supervisory values are not changed.
+              This clears fire (F), trouble (T), and supervisory (S) status on every asset in
+              AssetsList. Floor map markers will return to normal.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
