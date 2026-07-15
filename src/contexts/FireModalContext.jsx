@@ -33,6 +33,10 @@ import { buildFloorPlanViewUrl } from "@/lib/fireAlertFloorNavigation";
 import { resolveAssetNavigationTarget } from "@/lib/assetPlacementNavigation";
 import { buildGraphicsViewUrl } from "@/lib/graphicsViewSelection";
 import { buildPanelAckCommand } from "@/lib/firePanelMonitor";
+import {
+  pauseMonitorLoop,
+  resumeMonitorLoop,
+} from "@/lib/firePanelMonitorSession";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
@@ -371,6 +375,9 @@ export function FireAlertProvider({ children }) {
     }
 
     setAckLoading(true);
+    // Stop starting new list/CVAL cycles; send ack immediately so the worker
+    // can preempt an in-flight list t dump (do not wait for the dump to finish).
+    pauseMonitorLoop();
     try {
       const cmd = buildPanelAckCommand("Fire");
       const result = await sendPanelCommand(cmd);
@@ -401,6 +408,7 @@ export function FireAlertProvider({ children }) {
         variant: "destructive",
       });
     } finally {
+      resumeMonitorLoop();
       setAckLoading(false);
     }
   }, [

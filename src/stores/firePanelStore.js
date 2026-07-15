@@ -182,7 +182,12 @@ export const useFirePanelStore = create((set, get) => ({
           ? 8000
           : lower.includes("cval")
             ? 3000
-            : 5000;
+            : lower.startsWith("ack") ||
+                lower.startsWith("silence") ||
+                lower.startsWith("login") ||
+                /^set\s+p21[27]\s+on$/i.test(lower)
+              ? 3000
+              : 5000;
 
     try {
       const res = await apiFetch("/api/telnet/fire-panel/command", {
