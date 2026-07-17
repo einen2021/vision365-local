@@ -5,7 +5,11 @@
 
 import fs from "fs";
 import path from "path";
-import { resolveAppDataPath, initAppDirectories } from "./storageService";
+import {
+  resolveAppDataPath,
+  resolveAppDataSearchRoots,
+  initAppDirectories,
+} from "./storageService";
 
 const LATEST_NAME = "db_snapshot_latest.json";
 const MAX_ROTATING = 12;
@@ -18,6 +22,37 @@ function snapshotsDir(appDataPath = resolveAppDataPath()): string {
   const dir = path.join(paths.backups, "db-snapshots");
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** Collect snapshot JSON candidates from one app-data root (no mkdir side effects). */
+function collectSnapshotCandidates(appDataPath: string): string[] {
+  const candidates: string[] = [];
+  const backupsRoot = path.join(appDataPath, "backups");
+  const snapshots = path.join(backupsRoot, "db-snapshots");
+
+  const latest = path.join(snapshots, LATEST_NAME);
+  if (fs.existsSync(latest)) candidates.push(latest);
+
+  if (fs.existsSync(snapshots)) {
+    for (const name of fs.readdirSync(snapshots)) {
+      if (!name.endsWith(".json")) continue;
+      const full = path.join(snapshots, name);
+      if (full === latest) continue;
+      candidates.push(full);
+    }
+  }
+
+  // Also accept a manually placed recovery file in backups/.
+  for (const name of [
+    "recovered_snapshot.json",
+    "db_snapshot_latest.json",
+    "manual_restore.json",
+  ]) {
+    const full = path.join(backupsRoot, name);
+    if (fs.existsSync(full)) candidates.push(full);
+  }
+
+  return candidates;
 }
 
 /** Rough “does this look like real building / asset data?” check. */
@@ -182,32 +217,16 @@ function readSnapshotFile(filePath: string): DbRecord | null {
   }
 }
 
-/** Best available JSON backup with the most productive data. */
+/** Best available JSON backup with the most productive data.
+ * Searches the active AppData root (`com.vision365.desktop`) and legacy `Vision365`.
+ */
 export function findBestDbSnapshotBackup(
   appDataPath = resolveAppDataPath(),
 ): { path: string; data: DbRecord; score: number } | null {
-  const dir = snapshotsDir(appDataPath);
+  const roots = resolveAppDataSearchRoots(appDataPath);
   const candidates: string[] = [];
-
-  const latest = path.join(dir, LATEST_NAME);
-  if (fs.existsSync(latest)) candidates.push(latest);
-
-  for (const name of fs.readdirSync(dir)) {
-    if (!name.endsWith(".json")) continue;
-    const full = path.join(dir, name);
-    if (full === latest) continue;
-    candidates.push(full);
-  }
-
-  // Also accept a manually placed recovery file in backups/.
-  const paths = initAppDirectories(appDataPath);
-  for (const name of [
-    "recovered_snapshot.json",
-    "db_snapshot_latest.json",
-    "manual_restore.json",
-  ]) {
-    const full = path.join(paths.backups, name);
-    if (fs.existsSync(full)) candidates.push(full);
+  for (const root of roots) {
+    candidates.push(...collectSnapshotCandidates(root));
   }
 
   let best: { path: string; data: DbRecord; score: number } | null = null;

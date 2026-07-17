@@ -611,7 +611,7 @@ export const AppProvider = ({ children }) => {
   }, [sendFirePanelCommand]);
 
   const systemReset = useCallback(async () => {
-    const loginResponse = await sendFirePanelCommand("login 444");
+    const loginResponse = await sendFirePanelCommand("login 333");
     if (!loginResponse.includes("ACCESS GRANTED")) {
       throw new Error("Panel login failed");
     }

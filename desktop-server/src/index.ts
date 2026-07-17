@@ -40,6 +40,7 @@ async function main() {
 
   serverLog(`App data: ${appDataPath}`);
   serverLog(`MongoDB data: ${paths.mongoData}`);
+  serverLog(`Backups: ${paths.backups}`);
   serverLog(`Seed path: ${process.env.VISION365_SEED_PATH || "(built-in defaults)"}`);
   serverLog(`Port: ${PORT}`);
   serverLog(`CWD: ${process.cwd()}`);

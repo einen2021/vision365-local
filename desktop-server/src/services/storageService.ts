@@ -1,7 +1,10 @@
 import fs from "fs";
 import path from "path";
 
-const APP_NAME = "Vision365";
+/** Tauri app identifier — AppData folder used by the installed desktop app. */
+const TAURI_APP_ID = "com.vision365.desktop";
+/** Older desktop:dev / early builds used this folder name. */
+const LEGACY_APP_NAME = "Vision365";
 
 export interface AppPaths {
   root: string;
@@ -21,22 +24,51 @@ export interface AppPaths {
   logs: string;
 }
 
-/** Resolve platform-specific app data directory */
-export function resolveAppDataPath(customPath?: string): string {
-  if (customPath) return customPath;
-  if (process.env.VISION365_APP_DATA) return process.env.VISION365_APP_DATA;
-
+function platformAppDataRoot(folderName: string): string {
   const home = process.env.HOME || process.env.USERPROFILE || "";
   const platform = process.platform;
 
   if (platform === "win32") {
     const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
-    return path.join(appData, APP_NAME);
+    return path.join(appData, folderName);
   }
   if (platform === "darwin") {
-    return path.join(home, "Library", "Application Support", APP_NAME);
+    return path.join(home, "Library", "Application Support", folderName);
   }
-  return path.join(home, ".config", APP_NAME);
+  return path.join(home, ".config", folderName);
+}
+
+/**
+ * Resolve platform-specific app data directory.
+ * Prefer the Tauri identifier folder (`com.vision365.desktop`) so desktop:dev
+ * and the installed app share the same backups / uploads / database files.
+ */
+export function resolveAppDataPath(customPath?: string): string {
+  if (customPath) return customPath;
+  if (process.env.VISION365_APP_DATA) return process.env.VISION365_APP_DATA;
+
+  return platformAppDataRoot(TAURI_APP_ID);
+}
+
+/** Older %APPDATA%/Vision365 installs — used as a restore fallback. */
+export function resolveLegacyAppDataPath(): string | null {
+  const legacy = platformAppDataRoot(LEGACY_APP_NAME);
+  if (!fs.existsSync(legacy)) return null;
+  return legacy;
+}
+
+/**
+ * All known app-data roots to search when restoring an empty DB
+ * (current Tauri folder first, then legacy Vision365).
+ */
+export function resolveAppDataSearchRoots(primaryPath?: string): string[] {
+  const primary = primaryPath || resolveAppDataPath();
+  const roots = [primary];
+  const legacy = resolveLegacyAppDataPath();
+  if (legacy && path.resolve(legacy) !== path.resolve(primary)) {
+    roots.push(legacy);
+  }
+  return roots;
 }
 
 /** Initialize all required app data directories */
