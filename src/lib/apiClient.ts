@@ -62,6 +62,49 @@ async function resolveWebApiBaseUrl(): Promise<string> {
   return webDesktopApiBase;
 }
 
+/**
+ * Poll until the local Hono API answers /health.
+ * Prevents "socket hang up" when Next rewrites to an API that is still booting Mongo.
+ */
+async function waitForLocalHonoApi(timeoutMs = 45000): Promise<string> {
+  const existing = await resolveWebApiBaseUrl();
+  if (existing) return existing;
+
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    webDesktopApiBase = undefined;
+    webDesktopApiLastCheck = 0;
+    const base = await resolveWebApiBaseUrl();
+    if (base) return base;
+    await new Promise((r) => setTimeout(r, 400));
+  }
+
+  throw new Error(
+    "Local API is not running yet. Wait for desktop:dev (API on port 47821) to finish starting, then try again.",
+  );
+}
+
+/** Map Node/undici network failures into a clear UI message. */
+function friendlyFetchError(error: unknown): Error {
+  const err = error as Error & { cause?: Error };
+  const raw = `${err?.message || ""} ${err?.cause?.message || ""}`.toLowerCase();
+
+  if (
+    raw.includes("socket hang up") ||
+    raw.includes("econnreset") ||
+    raw.includes("econnrefused") ||
+    raw.includes("fetch failed") ||
+    raw.includes("failed to fetch") ||
+    raw.includes("networkerror")
+  ) {
+    return new Error(
+      "Local API connection dropped (socket hang up). Wait until Mongo/API finishes starting, then reconnect.",
+    );
+  }
+
+  return err instanceof Error ? err : new Error(String(error));
+}
+
 export function getApiBaseUrl(): string {
   if (isDesktop()) {
     const port = getDesktopApiPort() || DESKTOP_API_PORT;
@@ -126,14 +169,30 @@ export async function apiFetch(
 ): Promise<Response> {
   if (isDesktop()) {
     await waitForDesktopApi();
-    return fetch(apiUrl(path), options);
+    try {
+      return await fetch(apiUrl(path), options);
+    } catch (error) {
+      throw friendlyFetchError(error);
+    }
   }
 
-  const base = await resolveWebApiBaseUrl();
   const normalized = path.startsWith("/") ? path : `/${path}`;
-  // Fall back to same-origin /api when health check fails — Next.js rewrites to Hono
-  const url = base ? `${base}${normalized}` : normalized;
-  return fetch(url, options);
+  // Telnet and other desktop APIs need Hono — wait instead of proxying into a dead port.
+  const needsDesktopApi =
+    normalized.startsWith("/api/telnet/") ||
+    normalized.startsWith("/api/db") ||
+    normalized.startsWith("/local/");
+
+  try {
+    let base = await resolveWebApiBaseUrl();
+    if (!base && needsDesktopApi) {
+      base = await waitForLocalHonoApi();
+    }
+    const url = base ? `${base}${normalized}` : normalized;
+    return await fetch(url, options);
+  } catch (error) {
+    throw friendlyFetchError(error);
+  }
 }
 
 export async function apiPost<T = unknown>(

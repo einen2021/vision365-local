@@ -2,7 +2,7 @@ import net from "net";
 import { parentPort } from "worker_threads";
 
 type IncomingMessage =
-  | { type: "connect"; host: string; port: number }
+  | { type: "connect"; id?: string; host: string; port: number }
   | { type: "disconnect" }
   | { type: "status"; id: string }
   | {
@@ -13,6 +13,9 @@ type IncomingMessage =
       /** For list f/t/s: keep waiting until this many device rows arrive. */
       expectedCount?: number;
     };
+
+/** How long TCP connect may take before we fail (panel offline / wrong IP). */
+const TCP_CONNECT_TIMEOUT_MS = 10000;
 
 type OutgoingMessage =
   | { type: "connected"; connected: boolean; host: string; port: number }
@@ -197,16 +200,41 @@ async function connect(host: string, port: number) {
 
     await new Promise<void>((resolve, reject) => {
       const socket = new net.Socket();
+      let settled = false;
+
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        try {
+          socket.destroy();
+        } catch {
+          // ignore
+        }
+        reject(err);
+      };
+
       socket.setKeepAlive(true, 15000);
       socket.setNoDelay(true);
-      // Detect dead peers faster on Windows LAN drops.
-      socket.setTimeout(0);
-      socket.once("error", (err) => reject(err));
+      // Fail fast if the panel never accepts the TCP connection.
+      socket.setTimeout(TCP_CONNECT_TIMEOUT_MS);
+      socket.once("timeout", () => {
+        fail(
+          new Error(
+            `Connection timed out after ${TCP_CONNECT_TIMEOUT_MS / 1000}s (${host}:${port})`,
+          ),
+        );
+      });
+      socket.once("error", (err) => fail(err));
       socket.connect(port, host, () => {
+        if (settled) return;
+        settled = true;
+        // After connect succeeds, disable the connect timeout (idle traffic is fine).
+        socket.setTimeout(0);
         client = socket;
         currentHost = host;
         currentPort = port;
         attachSocketHandlers(socket);
+        // Brief settle so the panel can send its initial banner before commands.
         setTimeout(resolve, CONNECT_DELAY_MS);
       });
     });
@@ -706,9 +734,24 @@ function shouldAcceptCommand(_command: string) {
 
 parentPort?.on("message", (msg: IncomingMessage) => {
   if (msg.type === "connect") {
-    void connect(msg.host, msg.port).catch((err) => {
-      post({ type: "result", id: "connect", ok: false, error: (err as Error).message });
-    });
+    const connectId = msg.id || "connect";
+    void connect(msg.host, msg.port)
+      .then(() => {
+        post({
+          type: "result",
+          id: connectId,
+          ok: true,
+          response: `connected ${currentHost}:${currentPort}`,
+        });
+      })
+      .catch((err) => {
+        post({
+          type: "result",
+          id: connectId,
+          ok: false,
+          error: (err as Error).message || "Failed to connect to fire panel",
+        });
+      });
     return;
   }
 

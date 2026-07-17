@@ -138,12 +138,19 @@ export const useFirePanelStore = create((set, get) => ({
       });
       return { ok: true };
     } catch (error) {
+      const message = String(error?.message || "Failed to connect");
+      const friendly =
+        /socket hang up|failed to fetch|fetch failed|econnrefused|econnreset/i.test(
+          message,
+        )
+          ? "Local API not ready yet (socket hang up). Wait for desktop:dev to finish starting Mongo/API, then click Connect again."
+          : message;
       set({
         connected: false,
         loading: false,
-        lastError: error.message || "Failed to connect",
+        lastError: friendly,
       });
-      return { ok: false, error: error.message };
+      return { ok: false, error: friendly };
     }
   },
 

@@ -3,7 +3,7 @@ import { Worker } from "worker_threads";
 import { serverLog } from "../log";
 
 type IncomingMessage =
-  | { type: "connect"; host: string; port: number }
+  | { type: "connect"; id: string; host: string; port: number }
   | { type: "disconnect" }
   | { type: "status"; id: string }
   | {
@@ -13,6 +13,9 @@ type IncomingMessage =
       timeoutMs?: number;
       expectedCount?: number;
     };
+
+/** Max time to wait for the worker TCP connect result. */
+const CONNECT_REQUEST_TIMEOUT_MS = 15000;
 
 type OutgoingMessage =
   | { type: "connected"; connected: boolean; host: string; port: number }
@@ -41,10 +44,6 @@ const chunkHandlers = new Map<
 
 function addLog(message: string) {
   serverLog(`[fire-panel] ${message}`);
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function cleanCommandText(command: string) {
@@ -174,19 +173,53 @@ function ensureWorkers() {
     }
   });
 
-  panelWorker.on("error", (err) => {
+  panelWorker.on("error", (err: Error) => {
     connected = false;
     addLog(`Panel worker error: ${err.message}`);
+    // Unblock any waiting connect/command so the HTTP handler can return an error.
+    for (const [id, req] of pending) {
+      pending.delete(id);
+      req.reject(new Error(`Panel worker error: ${err.message}`));
+    }
+  });
+
+  panelWorker.on("exit", (code) => {
+    connected = false;
+    panelWorker = null;
+    addLog(`Panel worker exited (code ${code})`);
+    for (const [id, req] of pending) {
+      pending.delete(id);
+      req.reject(new Error("Panel worker exited during request"));
+    }
   });
 }
 
-function request(worker: Worker, msg: IncomingMessage): Promise<unknown> {
+function request(worker: Worker, msg: IncomingMessage, timeoutMs?: number): Promise<unknown> {
   return new Promise((resolve, reject) => {
     if (!("id" in msg) || !msg.id) {
       reject(new Error("Worker request is missing id"));
       return;
     }
-    pending.set(msg.id, { resolve, reject });
+
+    const timer =
+      timeoutMs && timeoutMs > 0
+        ? setTimeout(() => {
+            if (!pending.has(msg.id)) return;
+            pending.delete(msg.id);
+            reject(new Error(`Timed out waiting for fire panel (${timeoutMs}ms)`));
+          }, timeoutMs)
+        : null;
+
+    pending.set(msg.id, {
+      resolve: (val) => {
+        if (timer) clearTimeout(timer);
+        resolve(val);
+      },
+      reject: (err) => {
+        if (timer) clearTimeout(timer);
+        reject(err);
+      },
+    });
     worker.postMessage(msg);
   });
 }
@@ -236,14 +269,43 @@ export async function connectFirePanel(host: string, port: number) {
   addLog(`Connecting to ${host}:${port}...`);
 
   connectInFlight = (async () => {
-    panelWorker!.postMessage({ type: "connect", host, port } satisfies IncomingMessage);
-    // Wait for TCP connect + worker CONNECT_DELAY_MS before status check.
-    await sleep(600);
+    const id = `connect-${Date.now()}`;
+    try {
+      // Wait for the worker's real TCP connect result (success or error).
+      await request(
+        panelWorker!,
+        { type: "connect", id, host, port },
+        CONNECT_REQUEST_TIMEOUT_MS,
+      );
+    } catch (error) {
+      connected = false;
+      const message = (error as Error).message || "Failed to connect to fire panel";
+      // Common Node TCP errors when the panel IP/port is wrong or unreachable.
+      if (/ECONNREFUSED/i.test(message)) {
+        throw new Error(
+          `Panel refused connection at ${host}:${port}. Check IP, port, and that another session is not already connected.`,
+        );
+      }
+      if (/ETIMEDOUT|timed out/i.test(message)) {
+        throw new Error(
+          `No response from panel at ${host}:${port}. Check LAN connectivity and firewall.`,
+        );
+      }
+      if (/ENETUNREACH|EHOSTUNREACH/i.test(message)) {
+        throw new Error(
+          `Host unreachable (${host}:${port}). Confirm you are on the same network as the panel.`,
+        );
+      }
+      throw new Error(message);
+    }
 
+    // Confirm the socket is still live after the brief settle delay.
     const status = await readWorkerStatus();
     if (!status.connected) {
       connected = false;
-      throw new Error("Failed to connect to fire panel");
+      throw new Error(
+        `Connected then dropped immediately (${host}:${port}). The panel may already have another telnet session open.`,
+      );
     }
 
     connected = true;
