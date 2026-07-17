@@ -451,8 +451,11 @@ function sendCommand(
   timeoutMs?: number,
   commandId?: string,
   expectedCount?: number,
+  forcePriority?: boolean,
 ) {
-  const priority = isPriorityCommand(command);
+  // Allow the service layer to explicitly mark ack/silence as priority even if
+  // the heuristic doesn't catch the exact command text.
+  const priority = Boolean(forcePriority) || isPriorityCommand(command);
   const isShow = isShowCommand(command);
 
   // Make room for fire ack / Asset Control show: stop the active list dump and
@@ -782,7 +785,7 @@ parentPort?.on("message", (msg: IncomingMessage) => {
       return;
     }
 
-    void sendCommand(msg.command, msg.timeoutMs, msg.id, msg.expectedCount)
+    void sendCommand(msg.command, msg.timeoutMs, msg.id, msg.expectedCount, msg.priority)
       .then((response) => post({ type: "result", id: msg.id, ok: true, response }))
       .catch((err) => post({ type: "result", id: msg.id, ok: false, error: (err as Error).message }));
   }

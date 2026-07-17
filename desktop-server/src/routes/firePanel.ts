@@ -5,6 +5,7 @@ import {
   disconnectFirePanel,
   getFirePanelStatusLive,
   sendFirePanelCommand,
+  sendFirePanelCommandPriority,
   sendFirePanelCommandStreaming,
 } from "../services/firePanelService";
 
@@ -101,6 +102,27 @@ export function createFirePanelRoutes() {
 
     try {
       const result = await sendFirePanelCommand(command, timeoutMs, expectedCount);
+      return c.json(result);
+    } catch (error) {
+      return c.json({ error: (error as Error).message }, 500);
+    }
+  });
+
+  // Priority command — jumps ahead of any queued list/CVAL work in the panel worker.
+  // Use for ack/silence only so normal monitoring is not disrupted.
+  app.post("/command/priority", async (c) => {
+    const body = await c.req.json();
+    const command = String(body.command || "");
+
+    if (!command.trim()) {
+      return c.json({ error: "Command is required" }, 400);
+    }
+
+    // Default 5s — enough for ack/silence; caller can override.
+    const timeoutMs = Number(body.timeoutMs) > 0 ? Number(body.timeoutMs) : 5000;
+
+    try {
+      const result = await sendFirePanelCommandPriority(command, timeoutMs);
       return c.json(result);
     } catch (error) {
       return c.json({ error: (error as Error).message }, 500);

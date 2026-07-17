@@ -22,6 +22,7 @@ import {
 import { cn } from "@/lib/utils";
 import { LIVE_FIRE_ROUTE } from "@/config/live-panel-routes";
 import { startFireAlertSiren } from "@/lib/fireAlertSiren";
+import { apiFetch } from "@/lib/apiClient";
 import { buildPanelAckCommand } from "@/lib/firePanelMonitor";
 import { withMonitorPausedForPriority } from "@/lib/firePanelMonitorSession";
 import { useFirePanelStore } from "@/stores/firePanelStore";
@@ -143,10 +144,21 @@ function FireAlertModalView({
   );
 }
 
+/** Send a priority command directly — bypasses client-side command queue. */
+async function sendPriorityCommand(command, timeoutMs = 5000) {
+  const res = await apiFetch("/api/telnet/fire-panel/command/priority", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command, timeoutMs }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Priority command failed");
+  return data;
+}
+
 export function FireAlertProvider({ children }) {
   const router = useRouter();
   const { toast } = useToast();
-  const sendPanelCommand = useFirePanelStore((s) => s.sendCommand);
   const [isFireAlertOpen, setIsFireAlertOpen] = useState(false);
   const [isAlarmActive, setIsAlarmActive] = useState(false);
   const [isSirenMuted, setIsSirenMuted] = useState(false);
@@ -195,17 +207,11 @@ export function FireAlertProvider({ children }) {
 
     setAckLoading(true);
     try {
-      // 1) Block CVAL/list monitoring and serialize other UI commands.
-      // 2) Worker preempts any in-flight list and jumps ack ahead of the queue.
-      // 3) Then send ack f.
-      const result = await withMonitorPausedForPriority(async () => {
-        const cmd = buildPanelAckCommand("Fire");
-        return sendPanelCommand(cmd);
-      });
-
-      if (!result?.ok) {
-        throw new Error(useFirePanelStore.getState().lastError || "Acknowledge command failed");
-      }
+      // Pause CVAL monitoring and send ack f via the priority endpoint.
+      // Priority endpoint skips the client-side command chain and jumps ahead
+      // of any queued list/CVAL work in the panel worker.
+      const cmd = buildPanelAckCommand("Fire");
+      await withMonitorPausedForPriority(() => sendPriorityCommand(cmd, 5000));
 
       muteSiren();
       closeFireAlertModal();
@@ -219,7 +225,7 @@ export function FireAlertProvider({ children }) {
     } finally {
       setAckLoading(false);
     }
-  }, [closeFireAlertModal, muteSiren, router, sendPanelCommand, toast]);
+  }, [closeFireAlertModal, muteSiren, router, toast]);
 
   // Siren runs while alarm is active (even after modal is closed)
   useEffect(() => {

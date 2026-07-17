@@ -26,6 +26,7 @@ type IncomingMessage =
       command: string;
       timeoutMs?: number;
       expectedCount?: number;
+      priority?: boolean;
     };
 
 /** Max time to wait for the worker TCP connect result. */
@@ -442,11 +443,12 @@ async function sendCommandViaWorker(
   timeoutMs?: number,
   onChunk?: (response: string, done: boolean) => void,
   expectedCount?: number,
+  priority?: boolean,
 ) {
   ensureWorkers();
 
   const trimmed = cleanCommandText(command);
-  addLog(`Command: ${trimmed}`);
+  addLog(`Command${priority ? " [priority]" : ""}: ${trimmed}`);
 
   const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const msg: IncomingMessage = {
@@ -455,6 +457,7 @@ async function sendCommandViaWorker(
     command,
     timeoutMs,
     expectedCount,
+    priority,
   };
 
   if (onChunk) {
@@ -500,6 +503,19 @@ export async function sendFirePanelCommand(
     undefined,
     expectedCount,
   );
+  return { response };
+}
+
+/**
+ * Send a priority command — jumps ahead of any queued list/CVAL work in the worker.
+ * Used for ack/silence where waiting behind a 200-row list dump is unacceptable.
+ */
+export async function sendFirePanelCommandPriority(
+  command: string,
+  timeoutMs?: number,
+) {
+  ensureConnected();
+  const response = await sendCommandViaWorker(command, timeoutMs, undefined, undefined, true);
   return { response };
 }
 

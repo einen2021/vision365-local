@@ -116,28 +116,17 @@ export async function withMonitorPaused(fn) {
 }
 
 /**
- * Pause the monitor loop and run immediately — do not wait out a long list dump.
- * Use for Asset Control `show`: the worker preempts in-flight lists so PRIMARY
- * STATUS can return while monitoring is still mid-list.
+ * Pause the monitor loop and run immediately — do NOT wait on the command chain.
+ * Used for ack/silence/show where waiting behind a 200-row list dump is unacceptable.
+ * The worker-side priority queue ensures the command jumps ahead of any in-flight list.
  */
 export async function withMonitorPausedForPriority(fn) {
-  const state = getSessionState();
-
-  const run = state.exclusiveCommandChain.then(async () => {
-    pauseMonitorLoop();
-    try {
-      return await fn();
-    } finally {
-      resumeMonitorLoop();
-    }
-  });
-
-  state.exclusiveCommandChain = run.then(
-    () => undefined,
-    () => undefined,
-  );
-
-  return run;
+  pauseMonitorLoop();
+  try {
+    return await fn();
+  } finally {
+    resumeMonitorLoop();
+  }
 }
 
 export function setMonitorLoopActive(active) {
