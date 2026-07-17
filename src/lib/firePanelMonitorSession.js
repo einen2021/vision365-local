@@ -117,28 +117,17 @@ export async function withMonitorPaused(fn) {
 }
 
 /**
- * Pause the monitor and serialize client ops WITHOUT waiting for an in-flight
- * list dump. Use for ack/silence — the worker preempts lists and priority-queues ack.
- * Do not use for Asset Control `show` (that still needs withMonitorPaused).
+ * Pause the monitor and run immediately — do NOT wait on exclusiveCommandChain.
+ * Manual list fetches use withMonitorPaused (can hold the chain for minutes on
+ * list t). Ack/silence must still go out right away; the worker preempts lists.
  */
 export async function withMonitorPausedForPriority(fn) {
-  const state = getSessionState();
-
-  const run = state.exclusiveCommandChain.then(async () => {
-    pauseMonitorLoop();
-    try {
-      return await fn();
-    } finally {
-      resumeMonitorLoop();
-    }
-  });
-
-  state.exclusiveCommandChain = run.then(
-    () => undefined,
-    () => undefined,
-  );
-
-  return run;
+  pauseMonitorLoop();
+  try {
+    return await fn();
+  } finally {
+    resumeMonitorLoop();
+  }
 }
 
 export function setMonitorLoopActive(active) {
