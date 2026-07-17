@@ -181,6 +181,12 @@ export const AppProvider = ({ children }) => {
     Trouble: null,
     Supervisory: null,
   });
+  // One list fetch per category when CVAL > 0 but we have no cached addresses yet.
+  const listBootstrappedRef = useRef({
+    Fire: false,
+    Trouble: false,
+    Supervisory: false,
+  });
 
   /** Push one polled CVAL into React state as soon as the panel responds. */
   const syncFirePanelFieldToUi = useCallback((field, value) => {
@@ -899,6 +905,53 @@ export const AppProvider = ({ children }) => {
           } catch (error) {
             appendFirePanelMonitorLog(`!! ${listCmd} failed: ${error.message}`);
             console.error(`[fire-panel monitor] ${listCmd} failed:`, error);
+          }
+        }
+      }
+
+      // Re-apply live monitor F/T to markers every CVAL cycle (not only on increase).
+      if (!cycleYielded && !isMonitorLoopPaused()) {
+        for (const { label, listCmd, field } of CVAL_COMMANDS) {
+          const statusKey = simplexKeyForCategoryLabel(label);
+          const count = counts[field];
+
+          if (count === 0) {
+            listBootstrappedRef.current[label] = false;
+            continue;
+          }
+
+          const knownAddresses = previousListAddressesRef.current[label] || [];
+          if (knownAddresses.length > 0) {
+            useAssetFireStatusStore
+              .getState()
+              .syncPanelLiveFlagsForCategory(statusKey, knownAddresses);
+            continue;
+          }
+
+          if (listBootstrappedRef.current[label]) continue;
+
+          listBootstrappedRef.current[label] = true;
+          appendFirePanelMonitorLog(
+            `>> ${label} CVAL=${count} — bootstrap ${listCmd} for marker colors`,
+          );
+          try {
+            const listResponse = await sendFirePanelListCommandAndWait(listCmd, label, {
+              markNewest: false,
+              expectedCount: count,
+            });
+            const deviceAddresses = extractPanelDeviceAddresses(listResponse);
+            useAssetFireStatusStore
+              .getState()
+              .syncPanelLiveFlagsForCategory(statusKey, deviceAddresses);
+            storeFirePanelListResponse(label, listCmd, listResponse, {
+              markNewest: false,
+              expectedCount: count,
+            });
+          } catch (error) {
+            listBootstrappedRef.current[label] = false;
+            appendFirePanelMonitorLog(
+              `!! bootstrap ${listCmd} failed: ${error.message}`,
+            );
           }
         }
       }

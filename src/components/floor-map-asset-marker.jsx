@@ -4,7 +4,9 @@ import { memo, useState } from "react";
 import { resolveAssetTypeFromMapping } from "@/lib/assetIcons";
 import { AssetTypeMarkerImage } from "@/components/floor-plan/asset-type-marker-image";
 import { useAssetMarkerVisualFromMapping } from "@/stores/assetFireStatusStore";
+import { useIsDeviceEnabled } from "@/stores/deviceEnabledStore";
 import { resolveMappingDeviceFields } from "@/lib/floorMapAssets";
+import { DISABLED_MARKER_STYLES } from "@/lib/assetEnabledStatus";
 import {
   Tooltip,
   TooltipContent,
@@ -57,15 +59,33 @@ function FloorMapAssetMarkerInner({
   );
   const address = resolvedAddress;
   const location = String(deviceLocation || "").trim();
-  // Enabled/disabled from AssetsList mapping only (tooltip). Marker paint = F/T.
-  const isDeviceEnabled = mapping?.enabled !== false;
-  const radarColor = suppressFireEffects ? "transparent" : visual.radarColor;
+
+  // Live enabled/disabled: checks deviceEnabledStore (updated by asset control)
+  // then falls back to the static mapping.enabled field.
+  const isDeviceEnabled = useIsDeviceEnabled(resolvedAddress, mapping?.enabled !== false);
+
+  // Colors: disabled overrides F/T colors with gray.
+  const radarColor = suppressFireEffects
+    ? "transparent"
+    : !isDeviceEnabled
+      ? "transparent"
+      : visual.radarColor;
   const borderColor = suppressFireEffects
     ? "hsl(var(--primary))"
-    : visual.borderColor;
-  const dimColor = suppressFireEffects ? "transparent" : visual.dimColor;
-  // Ripple only when F=1 (fire), never for trouble-only yellow.
-  const showFireRipple = !suppressFireEffects && visual.ripple;
+    : !isDeviceEnabled
+      ? DISABLED_MARKER_STYLES.borderColor
+      : visual.borderColor;
+  const dimColor = suppressFireEffects
+    ? "transparent"
+    : !isDeviceEnabled
+      ? DISABLED_MARKER_STYLES.dimColor
+      : visual.dimColor;
+  // Icon becomes grayscale + semi-transparent when disabled.
+  const iconStyle = !isDeviceEnabled
+    ? { filter: DISABLED_MARKER_STYLES.iconFilter, opacity: DISABLED_MARKER_STYLES.iconOpacity }
+    : undefined;
+  // Ripple only when F=1 (fire) and device is enabled.
+  const showFireRipple = !suppressFireEffects && isDeviceEnabled && visual.ripple;
 
   const handlePointerDown = (event) => {
     if (!editable || event.button !== 0) return;
@@ -194,6 +214,7 @@ function FloorMapAssetMarkerInner({
                 boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
                 position: "relative",
                 zIndex: 1,
+                ...iconStyle,
               }}
             >
               <AssetTypeMarkerImage
@@ -224,9 +245,15 @@ function FloorMapAssetMarkerInner({
             ) : null}
             <p>
               <span className="font-semibold">Status:</span>{" "}
-              <span className={isDeviceEnabled ? "text-green-600" : "text-red-600"}>
-                {isDeviceEnabled ? "Enabled" : "Disabled"}
-              </span>
+              {!isDeviceEnabled ? (
+                <span className="text-gray-400">Disabled</span>
+              ) : visual.F === 1 ? (
+                <span className="text-red-500">Fire Alarm</span>
+              ) : visual.T === 1 ? (
+                <span className="text-yellow-500">Trouble</span>
+              ) : (
+                <span className="text-green-500">Normal</span>
+              )}
             </p>
           </div>
         ) : (

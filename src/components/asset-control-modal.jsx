@@ -25,6 +25,7 @@ import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
 import {
   getPrimaryStatusTone,
   parsePanelShowResponse,
+  primaryStatusToSimplex,
 } from "@/lib/parsePanelShowResponse"
 import { withMonitorPausedForPriority, pauseMonitorLoop, resumeMonitorLoop } from "@/lib/firePanelMonitorSession"
 import { cn } from "@/lib/utils"
@@ -40,6 +41,34 @@ function statusLabelFromFT(F = 0, T = 0) {
   if (Number(F) === 1) return "FIRE ALARM"
   if (Number(T) === 1) return "DISABLE TROUBLE"
   return "NORMAL"
+}
+
+/** Push parsed PRIMARY STATUS into the marker store (lowest priority tier). */
+function syncShowStatusToMarkers(address, primaryStatus, assetRef) {
+  const trimmed = String(address || "").trim()
+  if (!trimmed) return
+
+  let status = primaryStatus
+    ? primaryStatusToSimplex(primaryStatus)
+    : null
+
+  if (!status) {
+    const assetId =
+      assetRef?.buildingAssetId ||
+      assetRef?.assetsListId ||
+      assetRef?.id ||
+      ""
+    const cached = useAssetFireStatusStore
+      .getState()
+      .getSimplexStatus(assetId, trimmed)
+    if (cached) {
+      status = cached
+    }
+  }
+
+  if (status) {
+    useAssetFireStatusStore.getState().patchShowStatusForAddress(trimmed, status)
+  }
 }
 
 /** Read cached F/T for this asset address and return a display label. */
@@ -134,7 +163,9 @@ export function AssetControlModal({
       // Read live connection state (avoid a stale closed-over value).
       if (!useFirePanelStore.getState().connected) {
         // Panel offline — still show F/T backup so status is not stuck empty.
-        setPrimaryStatus(backupStatusFromFT(trimmed, assetRef))
+        const backupLabel = backupStatusFromFT(trimmed, assetRef)
+        setPrimaryStatus(backupLabel)
+        syncShowStatusToMarkers(trimmed, backupLabel, assetRef)
         return
       }
 
@@ -170,17 +201,17 @@ export function AssetControlModal({
 
         if (parsed.primaryStatus) {
           setPrimaryStatus(parsed.primaryStatus)
+          syncShowStatusToMarkers(trimmed, parsed.primaryStatus, assetRef)
         } else {
           // Show worked for ENABLED STATE but missed PRIMARY STATUS — use F/T.
           const backupLabel = backupStatusFromFT(trimmed, assetRef)
           setPrimaryStatus(backupLabel)
+          syncShowStatusToMarkers(trimmed, backupLabel, assetRef)
           console.warn("[show] missing PRIMARY STATUS, using F/T backup:", backupLabel)
         }
         if (parsed.enabledState) {
           setEnabledState(parsed.enabledState)
         }
-        // ENABLED STATE / PRIMARY STATUS are for this modal only.
-        // Floor-map marker colors come from monitoring list F/T — never from `show`.
         if (parsed.enabled !== null) {
           setEnabled(parsed.enabled)
         }
@@ -191,6 +222,7 @@ export function AssetControlModal({
         // Backup: monitoring F/T values when show response is not usable.
         const backupLabel = backupStatusFromFT(trimmed, assetRef)
         setPrimaryStatus(backupLabel)
+        syncShowStatusToMarkers(trimmed, backupLabel, assetRef)
         console.warn("[show] failed, using F/T backup status:", backupLabel)
 
         const incomplete = /incomplete show response/i.test(error?.message || "")

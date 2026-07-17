@@ -82,6 +82,8 @@ export const useAssetFireStatusStore = create((set, get) => ({
   metaByAssetId: {},
   // Live panel list flags (F/T/S) keyed by address — survives AssetsList poll.
   panelLiveByAddress: {},
+  /** Asset Control `show` status — lowest priority vs monitor + AssetsList. */
+  showStatusByAddress: {},
   lastSync: null,
   isPolling: false,
 
@@ -95,6 +97,7 @@ export const useAssetFireStatusStore = create((set, get) => ({
     set({
       ...nextCache,
       panelLiveByAddress: prev.panelLiveByAddress,
+      showStatusByAddress: prev.showStatusByAddress,
       lastSync: Date.now(),
     });
   },
@@ -221,6 +224,32 @@ export const useAssetFireStatusStore = create((set, get) => ({
    * before AssetsList writes finish. Stored in panelLiveByAddress so the 1s
    * AssetsList poll cannot overwrite live F/T with stale zeros.
    */
+  /**
+   * Store `show` PRIMARY STATUS for a device (lowest marker priority).
+   * Used when monitor list has not synced this address yet.
+   */
+  patchShowStatusForAddress: (deviceAddress, status) => {
+    const normalized = normalizeSimplexStatus(status);
+    set((state) => {
+      const showStatusByAddress = { ...state.showStatusByAddress };
+      let changed = false;
+      for (const addrKey of collectDeviceAddressKeys(deviceAddress)) {
+        const prev = normalizeSimplexStatus(showStatusByAddress[addrKey]);
+        if (
+          prev.F === normalized.F &&
+          prev.T === normalized.T &&
+          prev.S === normalized.S
+        ) {
+          continue;
+        }
+        showStatusByAddress[addrKey] = { ...normalized };
+        changed = true;
+      }
+      if (!changed) return state;
+      return { showStatusByAddress, lastSync: Date.now() };
+    });
+  },
+
   optimisticallySetFlagForAddresses: (addresses = [], statusKey, value = 1) => {
     if (!["F", "T", "S"].includes(statusKey)) return;
 
@@ -345,6 +374,7 @@ export const useAssetFireStatusStore = create((set, get) => ({
         byDeviceAddress,
         byAssetId,
         panelLiveByAddress,
+        showStatusByAddress: state.showStatusByAddress,
         lastSync: Date.now(),
       };
     });
@@ -357,6 +387,7 @@ export const useAssetFireStatusStore = create((set, get) => ({
       const byDeviceAddress = {};
       const byAssetId = {};
       const panelLiveByAddress = {};
+      const showStatusByAddress = {};
 
       for (const key of Object.keys(state.byDeviceAddress)) {
         byDeviceAddress[key] = cleared;
@@ -367,8 +398,17 @@ export const useAssetFireStatusStore = create((set, get) => ({
       for (const key of Object.keys(state.panelLiveByAddress)) {
         panelLiveByAddress[key] = cleared;
       }
+      for (const key of Object.keys(state.showStatusByAddress || {})) {
+        showStatusByAddress[key] = cleared;
+      }
 
-      return { byDeviceAddress, byAssetId, panelLiveByAddress, lastSync: Date.now() };
+      return {
+        byDeviceAddress,
+        byAssetId,
+        panelLiveByAddress,
+        showStatusByAddress,
+        lastSync: Date.now(),
+      };
     });
   },
 }));

@@ -64,8 +64,7 @@ function resolveStatusFromCache(cache, deviceAddress, assetId) {
     }
   }
 
-  // Panel-list F/T/S from monitoring — preferred over AssetsList so a stale
-  // or show-command AssetsList row cannot flip marker colors.
+  // 1) Live monitor list F/T/S — highest priority.
   let fromPanel = null;
   if (cache.panelLiveByAddress) {
     for (const addr of addressKeys) {
@@ -75,16 +74,25 @@ function resolveStatusFromCache(cache, deviceAddress, assetId) {
       }
     }
   }
-
   if (fromPanel) return fromPanel;
-  return fromList;
+  if (fromList) return fromList;
+
+  // 3) Asset Control `show` PRIMARY STATUS — lowest priority fallback.
+  if (cache.showStatusByAddress) {
+    for (const addr of addressKeys) {
+      if (cache.showStatusByAddress[addr] !== undefined) {
+        return normalizeSimplexStatus(cache.showStatusByAddress[addr]);
+      }
+    }
+  }
+
+  return null;
 }
 
 /**
  * Resolve status using every id/address we might have on a floor-map marker.
  * Placement doc ids often differ from AssetsList ids, so try them all.
- * Panel-live F/T from monitoring is preferred over AssetsList.
- * `show` PRIMARY STATUS must not drive marker colors.
+ * Priority: panel-live monitor F/T > AssetsList > Asset Control `show` status.
  */
 export function resolveStatusFromCacheForMapping(
   cache,
@@ -168,9 +176,23 @@ export function resolveStatusFromCacheForMapping(
     }
   }
 
-  // Monitoring list wins — do not OR with AssetsList (can still hold old show data).
   if (fromPanel) return fromPanel;
-  return fromList;
+  if (fromList) return fromList;
+
+  // Lowest priority: `show` PRIMARY STATUS from Asset Control modal.
+  let fromShow = null;
+  for (const address of [...addresses, ...metaAddresses]) {
+    for (const addr of collectDeviceAddressKeys(address)) {
+      if (cache.showStatusByAddress?.[addr] !== undefined) {
+        fromShow = normalizeSimplexStatus(cache.showStatusByAddress[addr]);
+        break;
+      }
+    }
+    if (fromShow) break;
+  }
+  if (fromShow) return fromShow;
+
+  return null;
 }
 
 /** All cache keys to try for a panel / Simplex device address. */
