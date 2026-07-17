@@ -21,6 +21,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Loader2, Edit, MapPin, CheckCircle, XCircle, RefreshCcw } from "lucide-react"
 import { resolveAssetsListDocId } from "@/lib/assetsListSimplexStatus"
 import { useDeviceEnabledStore } from "@/stores/deviceEnabledStore"
+import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
 import {
   getPrimaryStatusTone,
   parsePanelShowResponse,
@@ -30,6 +31,32 @@ import { cn } from "@/lib/utils"
 
 /** Small delay between show retries when the panel returns a partial chunk. */
 const SHOW_RETRY_DELAY_MS = 400
+
+/**
+ * Backup device status from monitoring F/T when `show` PRIMARY STATUS is missing.
+ * F=1 → FIRE ALARM; T=1 → DISABLE TROUBLE; otherwise NORMAL.
+ */
+function statusLabelFromFT(F = 0, T = 0) {
+  if (Number(F) === 1) return "FIRE ALARM"
+  if (Number(T) === 1) return "DISABLE TROUBLE"
+  return "NORMAL"
+}
+
+/** Read cached F/T for this asset address and return a display label. */
+function backupStatusFromFT(address, assetRef) {
+  const assetId =
+    assetRef?.buildingAssetId ||
+    assetRef?.assetsListId ||
+    assetRef?.id ||
+    ""
+  const status = useAssetFireStatusStore
+    .getState()
+    .getSimplexStatus(assetId, address)
+
+  if (!status) return statusLabelFromFT(0, 0)
+
+  return statusLabelFromFT(status.F, status.T)
+}
 
 const getCategoryKey = (categoryName) => {
   if (!categoryName) return "general"
@@ -105,7 +132,11 @@ export function AssetControlModal({
       if (!trimmed) return
 
       // Read live connection state (avoid a stale closed-over value).
-      if (!useFirePanelStore.getState().connected) return
+      if (!useFirePanelStore.getState().connected) {
+        // Panel offline — still show F/T backup so status is not stuck empty.
+        setPrimaryStatus(backupStatusFromFT(trimmed, assetRef))
+        return
+      }
 
       const requestId = ++statusRequestIdRef.current
       setIsLoadingPanelStatus(true)
@@ -139,6 +170,11 @@ export function AssetControlModal({
 
         if (parsed.primaryStatus) {
           setPrimaryStatus(parsed.primaryStatus)
+        } else {
+          // Show worked for ENABLED STATE but missed PRIMARY STATUS — use F/T.
+          const backupLabel = backupStatusFromFT(trimmed, assetRef)
+          setPrimaryStatus(backupLabel)
+          console.warn("[show] missing PRIMARY STATUS, using F/T backup:", backupLabel)
         }
         if (parsed.enabledState) {
           setEnabledState(parsed.enabledState)
@@ -151,12 +187,18 @@ export function AssetControlModal({
       } catch (error) {
         if (requestId !== statusRequestIdRef.current) return
         console.error("Panel show command failed:", error)
+
+        // Backup: monitoring F/T values when show response is not usable.
+        const backupLabel = backupStatusFromFT(trimmed, assetRef)
+        setPrimaryStatus(backupLabel)
+        console.warn("[show] failed, using F/T backup status:", backupLabel)
+
         const incomplete = /incomplete show response/i.test(error?.message || "")
         toast({
           title: incomplete ? "Panel status incomplete" : "Could not read panel status",
           description: incomplete
-            ? "Show returned without PRIMARY STATUS / ENABLED STATE. Try refresh."
-            : error.message || "show command failed",
+            ? `Show returned without PRIMARY STATUS / ENABLED STATE. Showing F/T backup: ${backupLabel}.`
+            : `${error.message || "show command failed"}. Showing F/T backup: ${backupLabel}.`,
           variant: "destructive",
         })
       } finally {
@@ -490,7 +532,9 @@ export function AssetControlModal({
 
   if (!asset) return null
 
-  const statusTone = getPrimaryStatusTone(primaryStatus)
+  // Default to NORMAL when show has not returned a status yet.
+  const displayPrimaryStatus = primaryStatus || "NORMAL"
+  const statusTone = getPrimaryStatusTone(displayPrimaryStatus)
   const statusToneClass =
     statusTone === "fire"
       ? "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300"
@@ -558,12 +602,8 @@ export function AssetControlModal({
                       <Loader2 className="h-4 w-4 animate-spin" />
                       Reading panel status...
                     </span>
-                  ) : primaryStatus ? (
-                    primaryStatus
-                  ) : panelConnected ? (
-                    "Status not available"
                   ) : (
-                    "Connect to fire panel to read live status"
+                    displayPrimaryStatus
                   )}
                 </div>
                 {enabledState ? (

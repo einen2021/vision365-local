@@ -2,12 +2,19 @@
  * Starts embedded MongoDB for offline desktop use.
  * - Production: Tauri spawns bundled mongod and sets VISION365_MONGO_URI
  * - Dev fallback: spawns bundled mongod or downloads via mongodb-memory-server
+ *
+ * Exit code 62 = data files incompatible with this mongod version.
+ * We never crash the API on that — quarantine the bad dbpath and start fresh,
+ * then seed/restore from JSON backups + floor-plans under AppData.
  */
 
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, execFile, type ChildProcess } from "child_process";
+import { promisify } from "util";
 import fs from "fs";
 import path from "path";
 import net from "net";
+
+const execFileAsync = promisify(execFile);
 
 const DEFAULT_PORT = 47820;
 
@@ -16,6 +23,7 @@ let memoryServer: {
   stop: () => Promise<boolean>;
   getUri: () => string;
 } | null = null;
+let mongodDownloadPromise: Promise<string | null> | null = null;
 
 export function getEmbeddedMongoPort(): number {
   return Number(process.env.VISION365_MONGO_PORT || DEFAULT_PORT);
@@ -43,6 +51,59 @@ function resolveMongodPath(): string | null {
   }
 
   return null;
+}
+
+/**
+ * Ensure portable mongod exists under src-tauri/resources/mongodb.
+ * Runs scripts/download-mongodb.mjs once when the binary is missing.
+ */
+async function ensureBundledMongod(): Promise<string | null> {
+  const existing = resolveMongodPath();
+  if (existing) return existing;
+
+  if (mongodDownloadPromise) return mongodDownloadPromise;
+
+  mongodDownloadPromise = (async () => {
+    const script = path.join(process.cwd(), "scripts", "download-mongodb.mjs");
+    if (!fs.existsSync(script)) {
+      console.warn(
+        `[mongo] Bundled mongod missing and download script not found: ${script}`,
+      );
+      return null;
+    }
+
+    console.log(
+      "[mongo] Bundled mongod not found — downloading into src-tauri/resources/mongodb ...",
+    );
+    try {
+      await execFileAsync(process.execPath, [script], {
+        cwd: process.cwd(),
+        windowsHide: true,
+        maxBuffer: 20 * 1024 * 1024,
+      });
+    } catch (error) {
+      console.warn(
+        `[mongo] Failed to download bundled mongod: ${(error as Error).message}`,
+      );
+      return null;
+    }
+
+    const downloaded = resolveMongodPath();
+    if (downloaded) {
+      console.log(`[mongo] Bundled mongod ready at ${downloaded}`);
+    } else {
+      console.warn(
+        "[mongo] Download finished but mongod binary still missing — falling back to memory-server",
+      );
+    }
+    return downloaded;
+  })();
+
+  try {
+    return await mongodDownloadPromise;
+  } finally {
+    mongodDownloadPromise = null;
+  }
 }
 
 function waitForPort(port: number, timeoutMs: number): Promise<void> {
@@ -73,6 +134,61 @@ function waitForPort(port: number, timeoutMs: number): Promise<void> {
   });
 }
 
+function removeStaleLocks(dbPath: string) {
+  for (const name of ["mongod.lock", "WiredTiger.lock"]) {
+    const lockPath = path.join(dbPath, name);
+    try {
+      if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Move incompatible/corrupt data aside so a clean mongod can start. */
+function quarantineDbPath(dbPath: string, reason: string): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const parent = path.dirname(dbPath);
+  const quarantine = path.join(parent, `mongodb-quarantine-${stamp}`);
+  try {
+    if (fs.existsSync(dbPath)) {
+      fs.renameSync(dbPath, quarantine);
+      console.warn(
+        `[mongo] Quarantined incompatible dbpath (${reason}): ${quarantine}`,
+      );
+    }
+  } catch (error) {
+    console.warn(
+      `[mongo] Could not quarantine ${dbPath}: ${(error as Error).message} — recreating empty folder`,
+    );
+    try {
+      fs.rmSync(dbPath, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  }
+  fs.mkdirSync(dbPath, { recursive: true });
+  return quarantine;
+}
+
+function dbPathHasDataFiles(dbPath: string): boolean {
+  try {
+    if (!fs.existsSync(dbPath)) return false;
+    return fs.readdirSync(dbPath).some((name) => {
+      const lower = name.toLowerCase();
+      return (
+        lower.startsWith("wiredtiger") ||
+        lower.endsWith(".wt") ||
+        lower === "storage.bson" ||
+        lower === "collection" ||
+        lower === "index"
+      );
+    });
+  } catch {
+    return false;
+  }
+}
+
 async function spawnBundledMongod(
   dbPath: string,
   port: number,
@@ -83,158 +199,153 @@ async function spawnBundledMongod(
   }
 
   fs.mkdirSync(dbPath, { recursive: true });
-
-  let exitCode: number | null = null;
-  mongodProcess = spawn(
-    mongodPath,
-    ["--dbpath", dbPath, "--port", String(port), "--bind_ip", "127.0.0.1"],
-    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
-  );
-
-  mongodProcess.stderr?.on("data", (chunk: Buffer) => {
-    const line = chunk.toString().trim();
-    if (line) console.log(`[mongod] ${line}`);
-  });
-
-  mongodProcess.on("error", (err) => {
-    console.error("[mongod] Process error:", err.message);
-  });
-
-  mongodProcess.on("exit", (code) => {
-    exitCode = code;
-    if (code != null && code !== 0) {
-      console.error(`[mongod] exited with code ${code}`);
-    }
-  });
+  removeStaleLocks(dbPath);
 
   const uri = `mongodb://127.0.0.1:${port}`;
-  try {
-    await waitForPort(port, 60000);
-  } catch (err) {
-    // Exit 62 = data files incompatible with this mongod version.
-    // Quarantine the folder and retry once with a fresh dbpath.
-    const code =
-      exitCode ?? (await waitBrieflyForExitCode(mongodProcess, 2000));
-    if (code === 62) {
-      console.warn(
-        `[mongo] dbpath incompatible with bundled mongod (exit 62). ` +
-          `Moving old data aside and starting fresh: ${dbPath}`,
+
+  const attemptStart = (): Promise<void> =>
+    new Promise((resolve, reject) => {
+      let settled = false;
+      let stderrBuf = "";
+
+      mongodProcess = spawn(
+        mongodPath,
+        ["--dbpath", dbPath, "--port", String(port), "--bind_ip", "127.0.0.1"],
+        { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
       );
-      // Make sure the failed process released WiredTiger file locks.
-      if (mongodProcess && !mongodProcess.killed) {
-        try {
-          mongodProcess.kill();
-        } catch {
-          // ignore
-        }
-      }
-      await waitBrieflyForExitCode(mongodProcess, 3000);
-      mongodProcess = null;
-      quarantineDbPath(dbPath);
-      fs.mkdirSync(dbPath, { recursive: true });
-      return spawnBundledMongodFresh(mongodPath, dbPath, port);
-    }
-    throw err;
-  }
 
-  console.log(`[mongo] Bundled mongod ready at ${uri}`);
-  return uri;
-}
+      mongodProcess.stderr?.on("data", (chunk: Buffer) => {
+        const line = chunk.toString();
+        stderrBuf += line;
+        const trimmed = line.trim();
+        if (trimmed) console.log(`[mongod] ${trimmed}`);
+      });
 
-function quarantineDbPath(dbPath: string) {
-  if (!fs.existsSync(dbPath)) return;
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const dest = `${dbPath}-incompatible-${stamp}`;
-  try {
-    fs.renameSync(dbPath, dest);
-    console.warn(`[mongo] Quarantined incompatible data → ${dest}`);
-    return;
-  } catch (error) {
-    console.warn(
-      `[mongo] Rename failed (${(error as Error).message}); clearing files instead`,
-    );
-  }
+      mongodProcess.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      });
 
-  // Windows often locks WiredTiger files briefly after mongod exits — clear in place.
-  try {
-    for (const entry of fs.readdirSync(dbPath)) {
-      fs.rmSync(path.join(dbPath, entry), { recursive: true, force: true });
-    }
-    console.warn(`[mongo] Cleared incompatible files in ${dbPath}`);
-  } catch (error) {
-    console.warn(
-      `[mongo] Could not clear ${dbPath}: ${(error as Error).message}`,
-    );
-  }
-}
+      mongodProcess.on("exit", (code) => {
+        if (settled) return;
+        settled = true;
+        mongodProcess = null;
+        const err = new Error(
+          `mongod exited with code ${code}${stderrBuf ? `: ${stderrBuf.slice(-400)}` : ""}`,
+        );
+        (err as Error & { exitCode?: number | null }).exitCode = code;
+        reject(err);
+      });
 
-function waitBrieflyForExitCode(
-  child: ChildProcess | null,
-  timeoutMs: number,
-): Promise<number | null> {
-  if (!child) return Promise.resolve(null);
-  if (child.exitCode != null) return Promise.resolve(child.exitCode);
-
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(child.exitCode), timeoutMs);
-    child.once("exit", (code) => {
-      clearTimeout(timer);
-      resolve(code);
+      void waitForPort(port, 60000)
+        .then(() => {
+          if (settled) return;
+          settled = true;
+          // Keep listening for later crashes, but startup succeeded.
+          mongodProcess?.removeAllListeners("exit");
+          mongodProcess?.on("exit", (code) => {
+            console.error(`[mongod] Process exited unexpectedly with code ${code}`);
+            mongodProcess = null;
+          });
+          resolve();
+        })
+        .catch((err) => {
+          if (settled) return;
+          settled = true;
+          try {
+            mongodProcess?.kill();
+          } catch {
+            // ignore
+          }
+          mongodProcess = null;
+          reject(err);
+        });
     });
-  });
-}
 
-/** Second attempt after quarantine — do not recurse on another code 62. */
-async function spawnBundledMongodFresh(
-  mongodPath: string,
-  dbPath: string,
-  port: number,
-): Promise<string> {
-  if (mongodProcess && !mongodProcess.killed) {
-    try {
-      mongodProcess.kill();
-    } catch {
-      // ignore
+  try {
+    await attemptStart();
+    console.log(`[mongo] Bundled mongod ready at ${uri}`);
+    return uri;
+  } catch (error) {
+    const exitCode = (error as Error & { exitCode?: number | null }).exitCode;
+    const message = String((error as Error).message || "");
+    const isIncompatible =
+      exitCode === 62 ||
+      /\bcode\s*62\b/i.test(message) ||
+      /incompatible/i.test(message) ||
+      /EXIT_NEED_DOWNGRADE/i.test(message);
+
+    if (isIncompatible) {
+      quarantineDbPath(dbPath, "exit code 62 / incompatible data files");
+      removeStaleLocks(dbPath);
+      await attemptStart();
+      console.log(
+        `[mongo] Bundled mongod ready at ${uri} (fresh dbpath after code-62 recovery)`,
+      );
+      return uri;
     }
-    mongodProcess = null;
+
+    throw error;
   }
-
-  mongodProcess = spawn(
-    mongodPath,
-    ["--dbpath", dbPath, "--port", String(port), "--bind_ip", "127.0.0.1"],
-    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
-  );
-
-  mongodProcess.stderr?.on("data", (chunk: Buffer) => {
-    const line = chunk.toString().trim();
-    if (line) console.log(`[mongod] ${line}`);
-  });
-
-  const uri = `mongodb://127.0.0.1:${port}`;
-  await waitForPort(port, 60000);
-  console.log(`[mongo] Bundled mongod ready at ${uri} (fresh dbpath)`);
-  return uri;
 }
 
+/**
+ * Memory server uses its own Mongo build — never point it at Tauri/bundled
+ * WiredTiger files (that causes exit code 62). Use a sibling folder instead.
+ */
 async function startMemoryServer(
-  dbPath: string,
+  preferredDbPath: string,
   port: number,
 ): Promise<string> {
   const { MongoMemoryServer } = await import("mongodb-memory-server");
 
-  const server = await MongoMemoryServer.create({
-    instance: {
-      dbPath,
-      port,
-      ip: "127.0.0.1",
-      storageEngine: "wiredTiger",
-    },
-  });
+  let dbPath = preferredDbPath;
+  if (dbPathHasDataFiles(preferredDbPath)) {
+    dbPath = path.join(path.dirname(preferredDbPath), "mongodb-memory");
+    console.warn(
+      `[mongo] Existing WiredTiger data at ${preferredDbPath} — using ${dbPath} for memory-server to avoid exit code 62`,
+    );
+  }
 
-  memoryServer = server;
-  const uri = server.getUri();
-  console.log(`[mongo] Memory server ready at ${uri} (data: ${dbPath})`);
-  return uri;
+  fs.mkdirSync(dbPath, { recursive: true });
+  removeStaleLocks(dbPath);
+
+  try {
+    const server = await MongoMemoryServer.create({
+      instance: {
+        dbPath,
+        port,
+        ip: "127.0.0.1",
+        storageEngine: "wiredTiger",
+      },
+    });
+
+    memoryServer = server;
+    const uri = server.getUri();
+    console.log(`[mongo] Memory server ready at ${uri} (data: ${dbPath})`);
+    return uri;
+  } catch (error) {
+    const message = String((error as Error).message || "");
+    if (/\b62\b/.test(message) || /incompatible/i.test(message)) {
+      quarantineDbPath(dbPath, "memory-server incompatible data");
+      const server = await MongoMemoryServer.create({
+        instance: {
+          dbPath,
+          port,
+          ip: "127.0.0.1",
+          storageEngine: "wiredTiger",
+        },
+      });
+      memoryServer = server;
+      const uri = server.getUri();
+      console.log(
+        `[mongo] Memory server ready at ${uri} after quarantine (data: ${dbPath})`,
+      );
+      return uri;
+    }
+    throw error;
+  }
 }
 
 /** Start or connect to embedded MongoDB. Returns connection URI. */
@@ -254,7 +365,9 @@ export async function startEmbeddedMongo(dbPath: string): Promise<string> {
     return uri;
   }
 
-  if (resolveMongodPath()) {
+  // Create/download portable mongod under src-tauri/resources/mongodb when missing.
+  const mongodPath = await ensureBundledMongod();
+  if (mongodPath) {
     return spawnBundledMongod(dbPath, port);
   }
 

@@ -1,10 +1,10 @@
 import fs from "fs";
 import path from "path";
 
-/** Tauri app identifier — AppData folder used by the installed desktop app. */
-const TAURI_APP_ID = "com.vision365.desktop";
-/** Older desktop:dev / early builds used this folder name. */
-const LEGACY_APP_NAME = "Vision365";
+/** Tauri app identifier — primary AppData folder on Windows/macOS. */
+export const DESKTOP_APP_ID = "com.vision365.desktop";
+/** Older desktop:dev folder name. */
+export const LEGACY_APP_NAME = "Vision365";
 
 export interface AppPaths {
   root: string;
@@ -24,51 +24,79 @@ export interface AppPaths {
   logs: string;
 }
 
-function platformAppDataRoot(folderName: string): string {
+function roamingOrConfigRoot(): string {
   const home = process.env.HOME || process.env.USERPROFILE || "";
   const platform = process.platform;
 
   if (platform === "win32") {
-    const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
-    return path.join(appData, folderName);
+    return process.env.APPDATA || path.join(home, "AppData", "Roaming");
   }
   if (platform === "darwin") {
-    return path.join(home, "Library", "Application Support", folderName);
+    return path.join(home, "Library", "Application Support");
   }
-  return path.join(home, ".config", folderName);
+  return path.join(home, ".config");
+}
+
+/** Known Vision365 AppData roots (Tauri first, then legacy). */
+export function listVision365AppDataRoots(): string[] {
+  const base = roamingOrConfigRoot();
+  const roots = [
+    path.join(base, DESKTOP_APP_ID),
+    path.join(base, LEGACY_APP_NAME),
+  ];
+  // De-dupe while preserving order.
+  return [...new Set(roots.map((p) => path.resolve(p)))];
+}
+
+function directoryLooksPopulated(dir: string): boolean {
+  try {
+    if (!fs.existsSync(dir)) return false;
+    const entries = fs.readdirSync(dir);
+    return entries.some((name) => !name.startsWith("."));
+  } catch {
+    return false;
+  }
+}
+
+function mongoDataLooksPresent(root: string): boolean {
+  return directoryLooksPopulated(path.join(root, "database", "mongodb"));
+}
+
+function floorPlansLookPresent(root: string): boolean {
+  return directoryLooksPopulated(path.join(root, "floor-plans"));
 }
 
 /**
  * Resolve platform-specific app data directory.
- * Prefer the Tauri identifier folder (`com.vision365.desktop`) so desktop:dev
- * and the installed app share the same backups / uploads / database files.
+ * Prefers %APPDATA%/com.vision365.desktop when it already has data
+ * (installed desktop app), otherwise creates/uses that canonical folder.
  */
 export function resolveAppDataPath(customPath?: string): string {
   if (customPath) return customPath;
   if (process.env.VISION365_APP_DATA) return process.env.VISION365_APP_DATA;
 
-  return platformAppDataRoot(TAURI_APP_ID);
-}
+  const roots = listVision365AppDataRoots();
+  const desktopRoot = roots[0];
+  const legacyRoot = roots[1];
 
-/** Older %APPDATA%/Vision365 installs — used as a restore fallback. */
-export function resolveLegacyAppDataPath(): string | null {
-  const legacy = platformAppDataRoot(LEGACY_APP_NAME);
-  if (!fs.existsSync(legacy)) return null;
-  return legacy;
-}
-
-/**
- * All known app-data roots to search when restoring an empty DB
- * (current Tauri folder first, then legacy Vision365).
- */
-export function resolveAppDataSearchRoots(primaryPath?: string): string[] {
-  const primary = primaryPath || resolveAppDataPath();
-  const roots = [primary];
-  const legacy = resolveLegacyAppDataPath();
-  if (legacy && path.resolve(legacy) !== path.resolve(primary)) {
-    roots.push(legacy);
+  // Prefer the Tauri folder when it already has mongo or floor-plans.
+  if (
+    desktopRoot &&
+    (mongoDataLooksPresent(desktopRoot) || floorPlansLookPresent(desktopRoot))
+  ) {
+    return desktopRoot;
   }
-  return roots;
+
+  // Fall back to legacy Vision365 if that is where data lives.
+  if (
+    legacyRoot &&
+    (mongoDataLooksPresent(legacyRoot) || floorPlansLookPresent(legacyRoot))
+  ) {
+    return legacyRoot;
+  }
+
+  // Default for new installs: Tauri identifier folder.
+  return desktopRoot || path.join(roamingOrConfigRoot(), DESKTOP_APP_ID);
 }
 
 /** Initialize all required app data directories */
@@ -100,6 +128,45 @@ export function initAppDirectories(appDataPath: string): AppPaths {
   fs.mkdirSync(paths.settings, { recursive: true });
 
   return paths;
+}
+
+function copyDirRecursive(src: string, dest: string) {
+  fs.mkdirSync(dest, { recursive: true });
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const from = path.join(src, entry.name);
+    const to = path.join(dest, entry.name);
+    if (entry.isDirectory()) {
+      copyDirRecursive(from, to);
+    } else if (entry.isFile()) {
+      if (!fs.existsSync(to)) {
+        fs.copyFileSync(from, to);
+      }
+    }
+  }
+}
+
+/**
+ * If the active AppData floor-plans folder is empty, copy images from
+ * %APPDATA%/com.vision365.desktop (or legacy Vision365) when present.
+ */
+export function ensureFloorPlansFromDesktopApp(appDataPath: string): void {
+  const dest = path.join(appDataPath, "floor-plans");
+  if (directoryLooksPopulated(dest)) return;
+
+  for (const root of listVision365AppDataRoots()) {
+    if (path.resolve(root) === path.resolve(appDataPath)) continue;
+    const src = path.join(root, "floor-plans");
+    if (!directoryLooksPopulated(src)) continue;
+    try {
+      console.log(`[storage] Copying floor-plans from ${src} → ${dest}`);
+      copyDirRecursive(src, dest);
+      return;
+    } catch (error) {
+      console.warn(
+        `[storage] Could not copy floor-plans from ${src}: ${(error as Error).message}`,
+      );
+    }
+  }
 }
 
 /** Prevent path traversal — ensures resolved path stays within base */

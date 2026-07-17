@@ -32,16 +32,12 @@ import {
   getExpectedListCountForLabel,
   getListCmdForLabel,
   isListResponseComplete,
-  isValidListCommandResponse,
+  isListResponseReady,
   parsePanelListResponse,
   readSimplexStatus,
   simplexKeyForCategoryLabel,
   buildPanelAckCommand,
 } from "@/lib/firePanelMonitor";
-import {
-  resolveBuildingFromAsset,
-  syncNewListLinesToBuildingFeed,
-} from "@/lib/buildingAlarmFeedWrite";
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
 import { streamFirePanelListCommand } from "@/lib/firePanelListStream";
 import { pickNewestAppearedAddresses } from "@/lib/livePanelListHighlight";
@@ -49,14 +45,12 @@ import {
   isFirePanelMonitoringPersisted,
   isMonitorLoopActive,
   isMonitorLoopPaused,
-  markPostAckFireListPending,
   pauseMonitorLoop,
   resumeMonitorLoop,
   setFirePanelMonitoringPersisted,
   setMonitorCycleRunning,
   setMonitorLoopActive,
   withMonitorPaused,
-  withMonitorPausedForPriority,
 } from "@/lib/firePanelMonitorSession";
 import { useFireAlert } from "./FireModalContext";
 import { useDeviceEnabledStore } from "@/stores/deviceEnabledStore";
@@ -96,9 +90,6 @@ export const useFirePanelMonitor = () => {
     acknowledge,
     firePanelListResponses,
     fetchFirePanelListResponse,
-    tempFireArray,
-    runListFireAndSaveToTempFireArray,
-    postAckFireListPending,
     disableDevice,
     enableDevice,
   } = useApp();
@@ -116,9 +107,6 @@ export const useFirePanelMonitor = () => {
     acknowledge,
     firePanelListResponses,
     fetchFirePanelListResponse,
-    tempFireArray,
-    runListFireAndSaveToTempFireArray,
-    postAckFireListPending,
     disableDevice,
     enableDevice,
   };
@@ -165,7 +153,7 @@ export const AppProvider = ({ children }) => {
   const openFireAlertModal = useCallback(() => setIsFireAlertOpen(true), []);
   const closeFireAlertModal = useCallback(() => setIsFireAlertOpen(false), []);
 
-  const { showFireAlert, muteSiren, unmuteSiren, setOnAfterFireAck } = useFireAlert();
+  const { showFireAlert, muteSiren, unmuteSiren } = useFireAlert();
   const { showTroubleAlert, showSupervisoryAlert } = useLivePanelAlert();
 
   // Global fire-panel CVAL monitor (persists across routes and reloads)
@@ -175,9 +163,6 @@ export const AppProvider = ({ children }) => {
   const [firePanelMonitorLogs, setFirePanelMonitorLogs] = useState([]);
   const [firePanelState, setFirePanelState] = useState(null);
   const [firePanelStateLoading, setFirePanelStateLoading] = useState(true);
-  const [tempFireArray, setTempFireArray] = useState([]);
-  /** True while post-ack `list f` is running — Live Fire skips a second list f. */
-  const [postAckFireListPending, setPostAckFireListPending] = useState(false);
   const [firePanelListResponses, setFirePanelListResponses] = useState({
     Fire: null,
     Trouble: null,
@@ -187,20 +172,11 @@ export const AppProvider = ({ children }) => {
   const firePanelWasConnectedRef = useRef(false);
   const pendingMonitorLogsRef = useRef([]);
   const monitorLogFlushTimerRef = useRef(null);
-  // Keep building names fresh for list→history sync without re-binding callbacks.
-  const allBuildingsRef = useRef([]);
-  const selectedBuildingRef = useRef(null);
   // Last known addresses per list category — used to stamp only the newest device.
   const previousListAddressesRef = useRef({
     Fire: [],
     Trouble: [],
     Supervisory: [],
-  });
-  // Last raw list f/t/s text per category — used to find newly appeared lines.
-  const previousListResponseRef = useRef({
-    Fire: "",
-    Trouble: "",
-    Supervisory: "",
   });
   // Newest device from the most recent list parse (readable before React state flushes).
   const lastListNewestRef = useRef({
@@ -208,14 +184,6 @@ export const AppProvider = ({ children }) => {
     Trouble: null,
     Supervisory: null,
   });
-
-  useEffect(() => {
-    allBuildingsRef.current = allBuildings;
-  }, [allBuildings]);
-
-  useEffect(() => {
-    selectedBuildingRef.current = selectedBuilding;
-  }, [selectedBuilding]);
 
   /** Push one polled CVAL into React state as soon as the panel responds. */
   const syncFirePanelFieldToUi = useCallback((field, value) => {
@@ -312,14 +280,17 @@ export const AppProvider = ({ children }) => {
   }, []);
 
   const acknowledge = useCallback(async (label, deviceAddress = null) => {
-    // Pause + exclusive client lock (no 180s yield wait). Worker priority-queues
-    // ack ahead of list/CVAL so acknowledging stays fast in the desktop app.
-    return withMonitorPausedForPriority(async () => {
+    // Pause polling so a new list does not start; send ack right away so the
+    // worker can preempt any in-flight list dump (do not wait 180s for yield).
+    pauseMonitorLoop();
+    try {
       const cmd = buildPanelAckCommand(label, deviceAddress);
-      const response = await sendFirePanelCommand(cmd, 3000);
+      // const response = await sendFirePanelCommand(cmd, 3000);
       console.log({ response });
       return response;
-    });
+    } finally {
+      resumeMonitorLoop();
+    }
   }, [sendFirePanelCommand]);
 
   const storeFirePanelListResponse = useCallback((label, listCmd, response, meta = {}) => {
@@ -327,10 +298,6 @@ export const AppProvider = ({ children }) => {
     const previous = previousListAddressesRef.current[label] || [];
     const newlyAppeared = pickNewestAppearedAddresses(addresses, previous);
     const fetchedAt = new Date().toISOString();
-    // Snapshot before we overwrite — used to find only brand-new panel lines.
-    const previousResponse = String(
-      previousListResponseRef.current[label] ?? "",
-    );
 
     let newestAddress = String(meta.newestAddress || "").trim();
     if (!newestAddress && newlyAppeared.length > 0) {
@@ -350,7 +317,6 @@ export const AppProvider = ({ children }) => {
     }
 
     previousListAddressesRef.current[label] = addresses;
-    previousListResponseRef.current[label] = String(response || "");
     lastListNewestRef.current[label] = newestAddress
       ? { address: newestAddress, at: fetchedAt }
       : null;
@@ -377,67 +343,26 @@ export const AppProvider = ({ children }) => {
         },
       };
     });
-
-    // Save every dump we finalize — take as many messages as the panel sent.
-    // (Clear / empty still runs so live feed can be wiped when count hits 0.)
-    const building = resolveBuildingFromAsset(
-      null,
-      (allBuildingsRef.current || []).map((b) => b.name).filter(Boolean),
-      selectedBuildingRef.current || "",
-    );
-    if (building) {
-      void syncNewListLinesToBuildingFeed({
-        building,
-        label,
-        listCmd,
-        response,
-        previousResponse,
-        fetchedAt,
-      })
-        .then((result) => {
-          if (!result?.saved) return;
-          appendFirePanelMonitorLog(
-            `DB ${label}: ${result.added} new row(s) appended → ${building}`,
-          );
-        })
-        .catch((error) => {
-          appendFirePanelMonitorLog(
-            `!! DB ${label} live/history save failed: ${error.message}`,
-          );
-          console.error(`[fire-panel] sync ${label} live/history failed:`, error);
-        });
-    } else {
-      appendFirePanelMonitorLog(
-        `!! DB ${label} live feed skipped — no building selected`,
-      );
-    }
-  }, [appendFirePanelMonitorLog]);
+  }, []);
 
   const updateStreamingListResponse = useCallback((label, listCmd, response, streaming) => {
-    setFirePanelListResponses((prev) => {
-      const prior = prev[label];
-      // New dump started — stamp "fetched at" once (no compare with previous dumps).
-      const isNewFetch = !prior?.streaming;
-      return {
-        ...prev,
-        [label]: {
-          listCmd,
-          response: String(response || ""),
-          fetchedAt: isNewFetch
-            ? new Date().toISOString()
-            : prior?.fetchedAt ?? new Date().toISOString(),
-          streaming: Boolean(streaming),
-          newestAddress: prior?.newestAddress || "",
-        },
-      };
-    });
+    setFirePanelListResponses((prev) => ({
+      ...prev,
+      [label]: {
+        listCmd,
+        response: String(response || ""),
+        fetchedAt: prev[label]?.fetchedAt ?? new Date().toISOString(),
+        streaming: Boolean(streaming),
+        newestAddress: prev[label]?.newestAddress || "",
+      },
+    }));
   }, []);
 
   const sendFirePanelListCommandAndWait = useCallback(
     async (listCmd, label = null, options = {}) => {
       const { onPartial, markNewest = false, expectedCount: expectedOverride } = options;
 
-      // Use CVAL total so the worker keeps reading until all ~200+ rows arrive.
+      // Complete around CVAL totalFire / totalTrouble / totalSupervisory.
       const expectedCount =
         expectedOverride != null && Number.isFinite(Number(expectedOverride))
           ? Number(expectedOverride)
@@ -446,59 +371,43 @@ export const AppProvider = ({ children }) => {
             : null;
 
       appendFirePanelMonitorLog(
-        `>> ${listCmd} — waiting for full list${
-          expectedCount != null ? ` (~${expectedCount} message(s))` : ' (until "-" prompt)'
-        }`,
+        `>> ${listCmd} (${label ? "streaming" : "waiting for"} dump${
+          expectedCount != null ? `, expect ~${expectedCount} message(s)` : ""
+        }...)`,
       );
 
-      // One shot: wait until CVAL count is met (or "-" / _DNE when count unknown).
-      let response = "";
-      try {
-        response = label
-          ? await streamFirePanelListCommand(
-              listCmd,
-              LIST_COMMAND_TIMEOUT_MS,
-              (partial, done) => {
-                updateStreamingListResponse(label, listCmd, partial, !done);
-                onPartial?.(partial, done);
-              },
-              { expectedCount },
-            )
-          : await sendFirePanelCommand(listCmd, LIST_COMMAND_TIMEOUT_MS);
-      } catch (error) {
-        // Ack/silence aborted this list before any message arrived — expected.
-        if (/list preempted/i.test(error?.message || "")) {
-          appendFirePanelMonitorLog(`!! ${listCmd}: preempted by ack/silence`);
-          throw error;
-        }
-        throw error;
-      }
+      const response = label
+        ? await streamFirePanelListCommand(
+            listCmd,
+            LIST_COMMAND_TIMEOUT_MS,
+            (partial, done) => {
+              // Always push partials to UI so Live Trouble/Fire fills while dumping.
+              // Mark streaming done when worker says done OR we already hit CVAL count.
+              const enough =
+                done ||
+                (expectedCount != null &&
+                  isListResponseReady(partial, expectedCount));
+              updateStreamingListResponse(label, listCmd, partial, !done && !enough);
+              onPartial?.(partial, done);
+            },
+            { expectedCount },
+          )
+        : await sendFirePanelCommand(listCmd, LIST_COMMAND_TIMEOUT_MS);
 
       const messageCount = countListMessages(response);
-      if (!isValidListCommandResponse(response)) {
+      if (isListResponseReady(response, expectedCount)) {
         appendFirePanelMonitorLog(
-          `!! ${listCmd}: no list message line yet (${response.length} chars)`,
+          `<< ${listCmd} complete (${messageCount}${
+            expectedCount != null ? `/${expectedCount}` : ""
+          } message(s), ${response.length} chars)`,
         );
-        throw new Error(
-          `${listCmd} did not return a list message (expected address + location/status line)`,
+      } else {
+        appendFirePanelMonitorLog(
+          `!! ${listCmd}: best effort — have ${messageCount}${
+            expectedCount != null ? `/${expectedCount}` : ""
+          } message(s)`,
         );
       }
-
-      if (
-        expectedCount != null &&
-        expectedCount > 0 &&
-        messageCount < expectedCount
-      ) {
-        appendFirePanelMonitorLog(
-          `!! ${listCmd}: partial list ${messageCount}/${expectedCount} — showing what arrived`,
-        );
-      }
-
-      appendFirePanelMonitorLog(
-        `<< ${listCmd} list received (${messageCount}${
-          expectedCount != null ? `/${expectedCount}` : ""
-        } message(s), ${response.length} chars)`,
-      );
 
       if (label) {
         storeFirePanelListResponse(label, listCmd, response, {
@@ -530,7 +439,7 @@ export const AppProvider = ({ children }) => {
         const addressCount = extractPanelDeviceAddresses(response).length;
         appendFirePanelMonitorLog(
           `<< ${listCmd} parsed ${rowCount} row(s), ${addressCount} address(es)${
-            isListResponseComplete(response) ? " (_DNE)" : ""
+            isListResponseComplete(response) ? "" : " (best effort — no _DNE)"
           }`,
         );
 
@@ -599,16 +508,13 @@ export const AppProvider = ({ children }) => {
   }, [appendFirePanelMonitorLog, flushFirePanelMonitorLogs]);
 
   const silenceAlarm = useCallback(async () => {
-    muteSiren();
+    muteSiren()
     const loginResponse = await sendFirePanelCommand("login 333");
     if (!loginResponse.includes("ACCESS GRANTED")) {
       throw new Error("Panel login failed");
     }
-    // "set" is a normal panel command — not a list dump.
-    await sendFirePanelCommand("set 2:p217 on");
-    await sendFirePanelCommand("set 3:p217 on");
-    await sendFirePanelCommand("set 4:p217 on");
-  }, [sendFirePanelCommand]);
+    return [await sendFirePanelListCommandAndWait("set 2:p217 on"), await sendFirePanelListCommandAndWait("set 3:p217 on"), await sendFirePanelListCommandAndWait("set 4:p217 on")];
+  }, []);
 
   const systemReset = useCallback(async () => {
     const loginResponse = await sendFirePanelCommand("login 333");
@@ -616,10 +522,9 @@ export const AppProvider = ({ children }) => {
       throw new Error("Panel login failed");
     }
 
-    // "set" is a normal panel command — not a list dump.
-    await sendFirePanelCommand("set 2:p212 on");
-    await sendFirePanelCommand("set 3:p212 on");
-    await sendFirePanelCommand("set 4:p212 on");
+    await sendFirePanelListCommandAndWait("set 2:p212 on");
+    await sendFirePanelListCommandAndWait("set 3:p212 on");
+    await sendFirePanelListCommandAndWait("set 4:p212 on");
 
     // Reflect reset in header badges immediately after the panel accepts the command.
     syncFirePanelCountsToUi({
@@ -678,6 +583,7 @@ export const AppProvider = ({ children }) => {
     appendFirePanelMonitorLog,
     saveFirePanelState,
     sendFirePanelCommand,
+    sendFirePanelListCommandAndWait,
     syncFirePanelCountsToUi,
   ]);
 
@@ -926,6 +832,7 @@ export const AppProvider = ({ children }) => {
             cycleYielded = true;
             break;
           }
+          const isIncrement = true;
           appendFirePanelMonitorLog(
             `>> ${label} increased (${previous[field]}→${counts[field]}) — ${listCmd}`,
           );
@@ -985,7 +892,7 @@ export const AppProvider = ({ children }) => {
                     `AssetsList synced ${label} → ${statusKey}=1: ${updatedCount}, cleared: ${clearedCount}`,
                   );
                   useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
-                } else if (deviceAddresses.length > 0) {
+                } else if (deviceAddresses.length > 0 || !isIncrement) {
                   appendFirePanelMonitorLog(
                     `Panel live ${statusKey} flags synced for ${deviceAddresses.length} address(es)`,
                   );
@@ -996,15 +903,8 @@ export const AppProvider = ({ children }) => {
               }
             })();
           } catch (error) {
-            // Fire ack often preempts an in-flight list f — post-ack load will fetch it.
-            if (/list preempted/i.test(error?.message || "")) {
-              appendFirePanelMonitorLog(
-                `!! ${listCmd} preempted by priority command — skipped`,
-              );
-            } else {
-              appendFirePanelMonitorLog(`!! ${listCmd} failed: ${error.message}`);
-              console.error(`[fire-panel monitor] ${listCmd} failed:`, error);
-            }
+            appendFirePanelMonitorLog(`!! ${listCmd} failed: ${error.message}`);
+            console.error(`[fire-panel monitor] ${listCmd} failed:`, error);
           }
         }
       }
@@ -1028,30 +928,6 @@ export const AppProvider = ({ children }) => {
     waitWhileMonitorPaused,
     syncFirePanelFieldToUi,
   ]);
-
-  const runListFireAndSaveToTempFireArray = useCallback(async () => {
-    // Never start list f before ack f — only called after ack has completed.
-    markPostAckFireListPending(true);
-    setPostAckFireListPending(true);
-    try {
-      const listFireResponse = await sendFirePanelListCommandAndWait("list f", "Fire", {
-        markNewest: true,
-      });
-      const rows = parsePanelListResponse(listFireResponse);
-      // Prefer full parsed rows for the Live Fire table; fall back to addresses only.
-      setTempFireArray(rows.length > 0 ? rows : extractPanelDeviceAddresses(listFireResponse));
-      return listFireResponse;
-    } finally {
-      markPostAckFireListPending(false);
-      setPostAckFireListPending(false);
-    }
-  }, [sendFirePanelListCommandAndWait]);
-
-  // Fire alert modal lives above AppProvider — register this so ack can load list f first.
-  useEffect(() => {
-    setOnAfterFireAck(runListFireAndSaveToTempFireArray);
-    return () => setOnAfterFireAck(null);
-  }, [runListFireAndSaveToTempFireArray, setOnAfterFireAck]);
 
   const startFirePanelMonitoring = useCallback(async () => {
     await useFirePanelStore.getState().syncStatus();
@@ -1329,9 +1205,6 @@ export const AppProvider = ({ children }) => {
     acknowledge,
     firePanelListResponses,
     fetchFirePanelListResponse,
-    tempFireArray,
-    runListFireAndSaveToTempFireArray,
-    postAckFireListPending,
     // Global fire alert modal
     isFireAlertOpen,
     openFireAlertModal,

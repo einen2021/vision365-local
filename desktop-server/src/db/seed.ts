@@ -94,7 +94,7 @@ export async function restoreFromBackupIfEmpty(
     if (isDbEssentiallyEmpty(live)) {
       console.warn(
         "[seed] Database is empty and no JSON snapshot backup was found under " +
-          "%APPDATA%/com.vision365.desktop/backups (or legacy Vision365/backups)",
+          "backups/db-snapshots/ (checked com.vision365.desktop and Vision365 AppData).",
       );
     }
     return false;

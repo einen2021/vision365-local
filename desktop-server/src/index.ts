@@ -12,7 +12,7 @@ import { connectMongo, closeDatabase } from "./db/client";
 import { startEmbeddedMongo, stopEmbeddedMongo } from "./db/embeddedMongo";
 import { runMigrations } from "./db/migrate";
 import { seedIfEmpty, restoreFromBackupIfEmpty } from "./db/seed";
-import { resolveAppDataPath, initAppDirectories } from "./services/storageService";
+import { resolveAppDataPath, initAppDirectories, ensureFloorPlansFromDesktopApp } from "./services/storageService";
 import { loadSettings } from "./services/settingsService";
 import { initServerLog, serverLog, serverLogError } from "./log";
 import dbRoutes from "./routes/db";
@@ -36,11 +36,13 @@ function writePortFile(appDataPath: string, port: number) {
 async function main() {
   const appDataPath = resolveAppDataPath();
   const paths = initAppDirectories(appDataPath);
+  // Pull floor-plan images from com.vision365.desktop when this folder is empty.
+  ensureFloorPlansFromDesktopApp(appDataPath);
   initServerLog(paths.logs);
 
   serverLog(`App data: ${appDataPath}`);
   serverLog(`MongoDB data: ${paths.mongoData}`);
-  serverLog(`Backups: ${paths.backups}`);
+  serverLog(`Floor plans: ${paths.floorPlans}`);
   serverLog(`Seed path: ${process.env.VISION365_SEED_PATH || "(built-in defaults)"}`);
   serverLog(`Port: ${PORT}`);
   serverLog(`CWD: ${process.cwd()}`);
@@ -59,6 +61,7 @@ async function main() {
 
   let mongoUri: string;
   try {
+    // startEmbeddedMongo recovers from exit code 62 by quarantining bad data files.
     mongoUri = await startEmbeddedMongo(paths.mongoData);
     serverLog(`MongoDB URI: ${mongoUri}`);
   } catch (err) {
@@ -77,6 +80,7 @@ async function main() {
   await runMigrations();
   serverLog("Migrations complete");
 
+  // Seeds / restores from JSON backups under com.vision365.desktop when mongo is empty.
   await seedIfEmpty(appDataPath);
   serverLog("Seed complete");
 
@@ -86,6 +90,9 @@ async function main() {
   } catch (error) {
     serverLogError(`Backup restore check failed: ${(error as Error).message}`);
   }
+
+  // Floor plans may have been copied after a fresh mongo quarantine — ensure again.
+  ensureFloorPlansFromDesktopApp(appDataPath);
 
   loadSettings(paths);
 

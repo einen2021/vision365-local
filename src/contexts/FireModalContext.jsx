@@ -10,7 +10,7 @@ import {
   useState,
 } from "react";
 import { useRouter } from "next/navigation";
-import { Flame, Loader2, Volume2, VolumeX, X } from "lucide-react";
+import { Flame, Loader2, Volume2, VolumeX } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -22,6 +22,7 @@ import {
 import { cn } from "@/lib/utils";
 import { LIVE_FIRE_ROUTE } from "@/config/live-panel-routes";
 import { startFireAlertSiren } from "@/lib/fireAlertSiren";
+import { buildPanelAckCommand } from "@/lib/firePanelMonitor";
 import { withMonitorPausedForPriority } from "@/lib/firePanelMonitorSession";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
@@ -30,6 +31,7 @@ const FireAlertContext = createContext();
 
 export const useFireAlert = () => useContext(FireAlertContext);
 
+/** Fire alert UI — acknowledge, mute siren, and close only. */
 function FireAlertModalView({
   open,
   isMuted,
@@ -44,28 +46,11 @@ function FireAlertModalView({
         className={cn(
           "gap-0 overflow-hidden border-red-500/60 p-0 shadow-2xl shadow-red-950/30 sm:max-w-[520px]",
           "ring-2 ring-red-500/40 ring-offset-2 ring-offset-background",
-          // Hide the default dialog X — we render our own so it works during ack.
           "[&>button]:hidden",
         )}
         onPointerDownOutside={(e) => e.preventDefault()}
-        onEscapeKeyDown={(e) => {
-          // Allow Escape to close even while acknowledging.
-          e.preventDefault();
-          onClose?.();
-        }}
+        onEscapeKeyDown={(e) => e.preventDefault()}
       >
-        {/* Always-available close — works even while Acknowledge is in progress. */}
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="absolute right-3 top-3 z-20 h-8 w-8 rounded-full text-white hover:bg-white/20 hover:text-white"
-          onClick={onClose}
-          aria-label="Close fire alert"
-        >
-          <X className="h-4 w-4" />
-        </Button>
-
         <div className="relative overflow-hidden bg-gradient-to-br from-red-700 via-red-600 to-red-700 px-6 py-6 text-white">
           <div
             className="pointer-events-none absolute inset-0 opacity-30"
@@ -75,7 +60,7 @@ function FireAlertModalView({
                 "repeating-linear-gradient(-45deg, transparent, transparent 8px, rgba(255,255,255,0.08) 8px, rgba(255,255,255,0.08) 16px)",
             }}
           />
-          <DialogHeader className="relative space-y-0 text-left pr-8">
+          <DialogHeader className="relative space-y-0 text-left">
             <div className="flex items-center gap-4">
               <div className="relative flex h-14 w-14 shrink-0 items-center justify-center">
                 <span className="absolute inset-0 animate-ping rounded-full bg-white/20" />
@@ -98,15 +83,12 @@ function FireAlertModalView({
           </DialogHeader>
         </div>
 
-        <div className="bg-background px-6 py-8 text-center">
+        <div className="bg-background px-6 py-8">
           <p className="text-lg font-bold uppercase tracking-wide text-red-600 dark:text-red-400">
             Emergency
           </p>
-          <p className="mt-3 text-2xl font-bold leading-snug text-foreground sm:text-3xl">
+          <p className="mt-2 text-xl font-bold leading-snug text-foreground sm:text-2xl">
             Fire condition detected on the panel.
-          </p>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Acknowledge to dismiss this alert and review the live fire list.
           </p>
 
           <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
@@ -130,6 +112,7 @@ function FireAlertModalView({
               type="button"
               variant="outline"
               onClick={onToggleMute}
+              disabled={ackLoading}
               aria-pressed={isMuted}
               aria-label={isMuted ? "Unmute alarm siren" : "Mute alarm siren"}
             >
@@ -145,7 +128,12 @@ function FireAlertModalView({
                 </>
               )}
             </Button>
-            <Button type="button" variant="secondary" onClick={onClose}>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={onClose}
+              disabled={ackLoading}
+            >
               Close
             </Button>
           </div>
@@ -162,21 +150,10 @@ export function FireAlertProvider({ children }) {
   const [isFireAlertOpen, setIsFireAlertOpen] = useState(false);
   const [isAlarmActive, setIsAlarmActive] = useState(false);
   const [isSirenMuted, setIsSirenMuted] = useState(false);
-  const [addressLoading, setAddressLoading] = useState(false);
   const [ackLoading, setAckLoading] = useState(false);
-  const [deviceList, setDeviceList] = useState([]);
   const stopSirenRef = useRef(null);
-  // AppProvider registers list-f loader here so ack can run it before navigation.
-  const onAfterFireAckRef = useRef(null);
-  /** User closed the modal while ack was still running — skip auto-navigate. */
-  const closedDuringAckRef = useRef(false);
-
-  const setOnAfterFireAck = useCallback((fn) => {
-    onAfterFireAckRef.current = typeof fn === "function" ? fn : null;
-  }, []);
 
   const showFireAlert = useCallback(() => {
-    setDeviceList([]);
     setAckLoading(false);
     setIsAlarmActive(true);
     setIsFireAlertOpen(true);
@@ -186,21 +163,12 @@ export function FireAlertProvider({ children }) {
     setIsFireAlertOpen(false);
     setIsAlarmActive(false);
     setIsSirenMuted(false);
-    setAddressLoading(false);
     setAckLoading(false);
-    setDeviceList([]);
   }, []);
 
   const closeFireAlertModal = useCallback(() => {
-    // Always dismiss the dialog UI, even if ack is still in flight.
     setIsFireAlertOpen(false);
-    setAckLoading(false);
   }, []);
-
-  const handleCloseFireAlert = useCallback(() => {
-    closedDuringAckRef.current = true;
-    closeFireAlertModal();
-  }, [closeFireAlertModal]);
 
   const toggleSirenMute = useCallback(() => {
     setIsSirenMuted((prev) => !prev);
@@ -225,29 +193,24 @@ export function FireAlertProvider({ children }) {
       return;
     }
 
-    closedDuringAckRef.current = false;
     setAckLoading(true);
     try {
-      // Send "ack f", then go to Live Fire (list f loads on that page).
-      await withMonitorPausedForPriority(async () => {
-        const result = await sendPanelCommand("ack f");
-        if (!result?.ok) {
-          throw new Error(
-            useFirePanelStore.getState().lastError || "Acknowledge command failed",
-          );
-        }
+      // 1) Block CVAL/list monitoring and serialize other UI commands.
+      // 2) Worker preempts any in-flight list and jumps ack ahead of the queue.
+      // 3) Then send ack f.
+      const result = await withMonitorPausedForPriority(async () => {
+        const cmd = buildPanelAckCommand("Fire");
+        return sendPanelCommand(cmd);
       });
 
-      // User closed while ack was in flight — leave them where they are.
-      if (closedDuringAckRef.current) {
-        return;
+      if (!result?.ok) {
+        throw new Error(useFirePanelStore.getState().lastError || "Acknowledge command failed");
       }
 
       muteSiren();
       closeFireAlertModal();
       router.push(LIVE_FIRE_ROUTE);
     } catch (error) {
-      if (closedDuringAckRef.current) return;
       toast({
         title: "Acknowledge failed",
         description: error?.message || "Could not acknowledge the fire alarm.",
@@ -283,13 +246,8 @@ export function FireAlertProvider({ children }) {
       hideFireAlert,
       closeFireAlertModal,
       toggleSirenMute,
-      addressLoading,
-      deviceList,
-      setAddressLoading,
-      setDeviceList,
       muteSiren,
       unmuteSiren,
-      setOnAfterFireAck,
     }),
     [
       isFireAlertOpen,
@@ -299,11 +257,8 @@ export function FireAlertProvider({ children }) {
       hideFireAlert,
       closeFireAlertModal,
       toggleSirenMute,
-      addressLoading,
-      deviceList,
       muteSiren,
       unmuteSiren,
-      setOnAfterFireAck,
     ],
   );
 
@@ -316,7 +271,7 @@ export function FireAlertProvider({ children }) {
         ackLoading={ackLoading}
         onToggleMute={toggleSirenMute}
         onAcknowledge={() => void handleAcknowledge()}
-        onClose={handleCloseFireAlert}
+        onClose={closeFireAlertModal}
       />
     </FireAlertContext.Provider>
   );

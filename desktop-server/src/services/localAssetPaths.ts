@@ -1,5 +1,6 @@
 import fs from "fs";
-import { safePath, resolveLegacyAppDataPath } from "./storageService";
+import path from "path";
+import { safePath, listVision365AppDataRoots } from "./storageService";
 
 /** Decode /local/... URL path into a relative app-data path. */
 export function relativePathFromLocalUrl(urlOrPath: string): string {
@@ -34,12 +35,19 @@ export function localAssetCandidates(
     candidates.push(safePath(appRoot, "uploads", normalized));
   }
 
-  // Also check legacy %APPDATA%/Vision365 if files were saved there before.
-  const legacyRoot = resolveLegacyAppDataPath();
-  if (legacyRoot && legacyRoot !== appRoot) {
-    candidates.push(safePath(legacyRoot, normalized));
-    if (normalized.startsWith("floor-plans/")) {
-      candidates.push(safePath(legacyRoot, "uploads", normalized));
+  // Also look under Tauri + legacy AppData roots (com.vision365.desktop / Vision365).
+  for (const altRoot of listVision365AppDataRoots()) {
+    if (path.resolve(altRoot) === path.resolve(appRoot)) continue;
+    try {
+      candidates.push(safePath(altRoot, normalized));
+      if (normalized.startsWith("floor-plans/")) {
+        candidates.push(safePath(altRoot, "uploads", normalized));
+      }
+      if (normalized.startsWith("uploads/floor-plans/")) {
+        candidates.push(safePath(altRoot, normalized.replace(/^uploads\//, "")));
+      }
+    } catch {
+      // ignore path traversal / missing roots
     }
   }
 

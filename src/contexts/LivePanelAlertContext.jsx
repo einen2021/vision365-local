@@ -20,8 +20,8 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { LIVE_PANEL_ROUTE_BY_LABEL } from "@/config/live-panel-routes";
+import { apiFetch, parseApiJsonResponse } from "@/lib/apiClient";
 import { buildPanelAckCommand } from "@/lib/firePanelMonitor";
-import { withMonitorPausedForPriority } from "@/lib/firePanelMonitorSession";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 import {
@@ -308,17 +308,15 @@ export function LivePanelAlertProvider({ children }) {
 
     setAckLoading(true);
     try {
-      // Pause monitoring and send ack immediately — do not wait for list t to finish.
-      const result = await withMonitorPausedForPriority(async () => {
-        const cmd = buildPanelAckCommand(openLabel);
-        return useFirePanelStore.getState().sendCommand(cmd);
+      const cmd = buildPanelAckCommand(openLabel);
+      const res = await apiFetch("/api/telnet/fire-panel/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: cmd }),
       });
-
-      if (!result?.ok) {
-        throw new Error(
-          useFirePanelStore.getState().lastError ||
-            "Could not send acknowledge command.",
-        );
+      const data = await parseApiJsonResponse(res);
+      if (!res.ok) {
+        throw new Error(data?.error || "Could not send acknowledge command.");
       }
 
       if (openLabel === "Trouble") {

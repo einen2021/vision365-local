@@ -12,20 +12,19 @@ import { usePageAuth } from "@/hooks/usePageAuth";
 import { useToast } from "@/hooks/use-toast";
 import {
   countListMessages,
+  formatPanelListTime,
   getExpectedListCountForLabel,
-  isListDumpFinished,
+  isListResponseReady,
   parsePanelListResponse,
 } from "@/lib/firePanelMonitor";
-import { formatAlarmFeedTime } from "@/lib/buildingAlarmFeedWrite";
-import { findAssetsForPanelAddresses } from "@/lib/assetsListSimplexStatus";
-import { resolveAssetNavigationUrl } from "@/lib/assetPlacementNavigation";
 import {
   silenceSupervisoryAlertBeep,
   silenceTroubleAlertBeep,
 } from "@/lib/troubleAlertBeep";
 import { cn } from "@/lib/utils";
-import { isPostAckFireListPending } from "@/lib/firePanelMonitorSession";
 import { useLivePanelAlert } from "@/contexts/LivePanelAlertContext";
+import { findAssetsListEntryByPanelAddress } from "@/lib/assetsListSimplexStatus";
+import { resolveAssetNavigationUrl } from "@/lib/assetPlacementNavigation";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
@@ -77,8 +76,8 @@ function statusBadgeClass(status) {
   return STATUS_BADGE_CLASSES[key] || "border-muted bg-muted/40 text-muted-foreground";
 }
 
-// Address | Location | Device type | Status | Fetched (date & time)
-const LIST_GRID = "md:grid-cols-[140px_minmax(0,1fr)_150px_90px_160px]";
+// Time | Address | Location | Device type | Status
+const LIST_GRID = "md:grid-cols-[160px_140px_minmax(0,1fr)_150px_90px]";
 
 function PanelAlarmList({
   rows,
@@ -91,15 +90,10 @@ function PanelAlarmList({
   listComplete = true,
   expectedCount = null,
   listMessageCount = 0,
-  // When this list dump was received from the panel (ISO string or ms).
-  fetchedAt = null,
+  // When this list response was received (date + time).
+  responseTimeLabel = "",
 }) {
   const highlightClass = ROW_HIGHLIGHT_CLASSES[tone] || ROW_HIGHLIGHT_CLASSES.trouble;
-  // Same stamp for every row in this dump — time the list response was fetched.
-  const fetchedLabel =
-    fetchedAt != null && fetchedAt !== ""
-      ? formatAlarmFeedTime(fetchedAt)
-      : "—";
 
   // Keep newly highlighted rows at the top of the list.
   const displayRows = useMemo(() => {
@@ -111,25 +105,35 @@ function PanelAlarmList({
   }, [rows, highlightedAddresses]);
 
   if (!rows.length) {
-    // No full-page loader — show empty state; rows appear one-by-one as they stream.
+    // Prefer "receiving…" over a false empty state while CVAL says points exist
+    // or the panel list is still streaming.
+    if (pending || (expectedCount != null && expectedCount > 0)) {
+      return (
+        <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border">
+          <div
+            className={cn(
+              "hidden shrink-0 md:grid gap-3 border-b bg-muted/50 px-4 py-2 text-xs font-medium text-muted-foreground",
+              LIST_GRID,
+            )}
+          >
+            <span>Time</span>
+            <span>Address</span>
+            <span>Location</span>
+            <span>Device type</span>
+            <span>Status</span>
+          </div>
+          <div className="flex flex-1 items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {expectedCount != null && expectedCount > 0
+              ? `Receiving list — ${listMessageCount}/${expectedCount}`
+              : "Receiving list from panel…"}
+          </div>
+        </div>
+      );
+    }
+
     return (
-      <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border">
-        <div
-          className={cn(
-            "hidden shrink-0 md:grid gap-3 border-b bg-muted/50 px-4 py-2 text-xs font-medium text-muted-foreground",
-            LIST_GRID,
-          )}
-        >
-          <span>Address</span>
-          <span>Location</span>
-          <span>Device type</span>
-          <span>Status</span>
-          <span>Fetched</span>
-        </div>
-        <div className="flex flex-1 items-center justify-center py-10 text-sm text-muted-foreground">
-          {pending ? "Waiting for list messages…" : emptyLabel}
-        </div>
-      </div>
+      <div className="py-10 text-center text-sm text-muted-foreground">{emptyLabel}</div>
     );
   }
 
@@ -141,11 +145,11 @@ function PanelAlarmList({
           LIST_GRID,
         )}
       >
+        <span>Time</span>
         <span>Address</span>
         <span>Location</span>
         <span>Device type</span>
         <span>Status</span>
-        <span>Fetched</span>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -153,6 +157,11 @@ function PanelAlarmList({
           {displayRows.map((row, index) => {
             const isHighlighted = highlightedAddresses.has(row.fullAddress);
             const isAcknowledging = acknowledgingAddress === row.fullAddress;
+            // Prefer the list response received time; fall back to panel clock if present.
+            const timeLabel =
+              responseTimeLabel ||
+              formatPanelListTime(row.panelTimeText) ||
+              "—";
 
             return (
               <li
@@ -180,45 +189,48 @@ function PanelAlarmList({
                 title={
                   onRowAck
                     ? tone === "fire"
-                      ? "Click to acknowledge, then open nested floor plan"
+                      ? "Click to acknowledge and open floor plan"
                       : "Click to acknowledge"
                     : undefined
                 }
               >
                 <div className={cn("grid gap-2 md:items-center md:gap-3", LIST_GRID)}>
                   <div>
-                    <p className="font-mono text-sm font-medium">{row.fullAddress}</p>
-                    <p className="mt-0.5 text-[11px] text-muted-foreground md:hidden">
-                      {row.deviceType || "—"}
+                    <p className="text-xs text-muted-foreground whitespace-nowrap">
+                      {timeLabel}
+                    </p>
+                    <p className="mt-0.5 font-mono text-sm font-medium md:hidden">
+                      {row.fullAddress}
                     </p>
                   </div>
 
-                  <p className="text-sm leading-snug break-words">{row.location || "—"}</p>
-
-                  <p className="hidden text-sm text-muted-foreground md:block">
-                    {row.deviceType || "—"}
-                  </p>
-
-                  <div>
-                    {row.status ? (
-                      <Badge
-                        variant="outline"
-                        className={cn("font-mono text-[11px]", statusBadgeClass(row.status))}
-                      >
-                        {row.status}
-                      </Badge>
-                    ) : (
-                      <span className="text-sm text-muted-foreground">—</span>
-                    )}
+                  <div className="hidden md:block">
+                    <p className="font-mono text-sm font-medium">{row.fullAddress}</p>
                   </div>
 
-                  <p
-                    className="text-xs text-muted-foreground whitespace-nowrap"
-                    title="Time this list response was fetched from the panel"
-                  >
-                    <span className="md:hidden">Fetched: </span>
-                    {fetchedLabel}
-                  </p>
+                  <div className="md:contents">
+                    <p className="text-sm leading-snug break-words">{row.location || "—"}</p>
+
+                    <p className="hidden text-sm text-muted-foreground md:block">
+                      {row.deviceType || "—"}
+                    </p>
+
+                    <div>
+                      {row.status ? (
+                        <Badge
+                          variant="outline"
+                          className={cn("font-mono text-[11px]", statusBadgeClass(row.status))}
+                        >
+                          {row.status}
+                        </Badge>
+                      ) : (
+                        <span className="text-sm text-muted-foreground">—</span>
+                      )}
+                      <p className="mt-0.5 text-[11px] text-muted-foreground md:hidden">
+                        {row.deviceType || "—"}
+                      </p>
+                    </div>
+                  </div>
                 </div>
               </li>
             );
@@ -228,13 +240,11 @@ function PanelAlarmList({
 
       <div className="shrink-0 border-t bg-muted/30 px-4 py-2 text-xs text-muted-foreground">
         {displayRows.length} active {displayRows.length === 1 ? "entry" : "entries"}
-        {fetchedLabel !== "—" ? (
-          <span className="ml-2">· Fetched {fetchedLabel}</span>
-        ) : null}
         {!listComplete ? (
           <span className="ml-2 text-amber-600 dark:text-amber-400">
-            (receiving… {listMessageCount}
-            {expectedCount != null ? `/${expectedCount}` : ""} so far)
+            {expectedCount != null
+              ? `(receiving — ${listMessageCount}/${expectedCount})`
+              : "(receiving list from panel…)"}
           </span>
         ) : null}
       </div>
@@ -253,8 +263,6 @@ export function LivePanelListPage({ label, title, description, tone }) {
     firePanelState,
     fetchFirePanelListResponse,
     acknowledge,
-    tempFireArray,
-    postAckFireListPending,
   } = useFirePanelMonitor();
 
   const {
@@ -277,38 +285,21 @@ export function LivePanelListPage({ label, title, description, tone }) {
   };
 
   const [acknowledgingAddress, setAcknowledgingAddress] = useState(null);
-  const [navigatingAddress, setNavigatingAddress] = useState(null);
   const [ackedAddresses, setAckedAddresses] = useState(() => new Set());
 
   const Icon = PAGE_ICONS[label] || Flame;
   const cached = firePanelListResponses?.[label] ?? null;
-
-  // Fire ack already ran list f into tempFireArray — reuse it (no second list f).
-  const tempFireRows = useMemo(() => {
-    if (label !== "Fire" || !Array.isArray(tempFireArray) || tempFireArray.length === 0) {
-      return null;
-    }
-    // Rows from parsePanelListResponse have fullAddress; plain address strings need wrapping.
-    if (typeof tempFireArray[0] === "string") {
-      return tempFireArray.map((address) => ({
-        fullAddress: address,
-        deviceAddress: address,
-        location: "",
-        deviceType: "",
-        status: "",
-      }));
-    }
-    return tempFireArray;
-  }, [label, tempFireArray]);
-
   // Parse the raw panel list into table rows (address, location, type, status).
-  const parsedRows = useMemo(() => {
-    if (tempFireRows) return tempFireRows;
-    return cached?.response ? parsePanelListResponse(cached.response) : [];
-  }, [cached?.response, tempFireRows]);
-  const listVersion = tempFireRows
-    ? `temp-fire:${tempFireRows.length}`
-    : (cached?.fetchedAt ?? "empty");
+  const parsedRows = useMemo(
+    () => (cached?.response ? parsePanelListResponse(cached.response) : []),
+    [cached?.response],
+  );
+  const listVersion = cached?.fetchedAt ?? "empty";
+  // Date + time when this list response was received from the panel.
+  const responseTimeLabel = useMemo(
+    () => formatPanelListTime(cached?.fetchedAt) || "",
+    [cached?.fetchedAt],
+  );
 
   // Highlight the newest address from the last list parse (address appearance only).
   const highlightedAddresses = useMemo(() => {
@@ -316,18 +307,16 @@ export function LivePanelListPage({ label, title, description, tone }) {
     return newest ? new Set([newest]) : new Set();
   }, [cached?.newestAddress, listVersion]);
 
-  const isStreaming = Boolean(cached?.streaming) && !tempFireRows;
+  const isStreaming = Boolean(cached?.streaming);
   const expectedCount = getExpectedListCountForLabel(label, firePanelState);
-  // Complete when CVAL count is met, or dump ended with "-" / _DNE.
+  // Complete when ~CVAL messages arrived, _DNE, or stream finished with rows.
   const listComplete =
-    Boolean(tempFireRows?.length) ||
-    (!isStreaming &&
-      isListDumpFinished(cached?.response || "", expectedCount));
-  const listMessageCount = tempFireRows?.length
-    ? tempFireRows.length
-    : cached?.response
-      ? countListMessages(cached.response)
-      : 0;
+    !isStreaming &&
+    (isListResponseReady(cached?.response || "", expectedCount) ||
+      Boolean(cached?.response));
+  const listMessageCount = cached?.response
+    ? countListMessages(cached.response)
+    : 0;
 
   const effectiveHighlightedAddresses = useMemo(() => {
     if (!ackedAddresses.size) return highlightedAddresses;
@@ -354,68 +343,12 @@ export function LivePanelListPage({ label, title, description, tone }) {
     });
   }, [listVersion, rowKey]);
 
-  /** Fire rows: ack f {address}, then open the nested floor plan where the asset is placed. */
-  const handleFireRowNavigate = useCallback(
-    async (row) => {
-      if (navigatingAddress) return;
-
-      if (!connected) {
-        toast({
-          title: "Not connected",
-          description: "Connect to the fire panel before acknowledging.",
-          variant: "destructive",
-        });
-        return;
-      }
-
-      setNavigatingAddress(row.fullAddress);
-      try {
-        // Send "ack f {address}" before leaving the live fire list.
-        await acknowledge("Fire", row.fullAddress);
-
-        const lookups = await findAssetsForPanelAddresses([row.fullAddress]);
-        const match = lookups.find((item) => item.found && item.entry);
-        if (!match?.entry) {
-          toast({
-            title: "Acknowledged — asset not found",
-            description: `Ack sent for ${row.fullAddress}, but no AssetsList entry was found.`,
-            variant: "destructive",
-          });
-          return;
-        }
-
-        const asset = {
-          ...(match.entry.data || {}),
-          id: match.entry.id,
-          deviceAddress: match.deviceAddress || row.deviceAddress || row.fullAddress,
-        };
-        const url = await resolveAssetNavigationUrl(asset, match.entry.id);
-        const parsed = new URL(url, window.location.origin);
-        if (match.entry.id) parsed.searchParams.set("assetId", match.entry.id);
-        if (asset.deviceAddress) {
-          parsed.searchParams.set("address", asset.deviceAddress);
-        }
-        router.push(`${parsed.pathname}?${parsed.searchParams.toString()}`);
-      } catch (error) {
-        toast({
-          title: "Acknowledge / navigation failed",
-          description:
-            error?.message || "Could not acknowledge or open the floor plan for this asset.",
-          variant: "destructive",
-        });
-      } finally {
-        setNavigatingAddress(null);
-      }
-    },
-    [acknowledge, connected, navigatingAddress, router, toast],
-  );
-
-  /** Trouble / supervisory rows still acknowledge on click. */
   const handleRowAck = useCallback(
     async (row) => {
       if (!connected || acknowledgingAddress) return;
 
-      setAcknowledgingAddress(row.fullAddress);
+      const address = String(row.fullAddress || row.deviceAddress || "").trim();
+      setAcknowledgingAddress(address || row.fullAddress);
       try {
         if (label === "Trouble") {
           silenceTroubleAlertBeep();
@@ -424,7 +357,7 @@ export function LivePanelListPage({ label, title, description, tone }) {
           silenceSupervisoryAlertBeep();
         }
 
-        await acknowledge(label, row.fullAddress);
+        await acknowledge(label, address || row.fullAddress);
 
         setAckedAddresses((prev) => {
           const next = new Set(prev);
@@ -436,6 +369,28 @@ export function LivePanelListPage({ label, title, description, tone }) {
           title: "Acknowledged",
           description: row.fullAddress,
         });
+
+        // Live Fire: after ack, open the asset via floor-plan deeplink.
+        if (label === "Fire" && address) {
+          const entry = await findAssetsListEntryByPanelAddress(address);
+          if (!entry) {
+            toast({
+              title: "Asset not found",
+              description: `No AssetsList entry for ${address}.`,
+              variant: "destructive",
+            });
+          } else {
+            const asset = { id: entry.id, ...entry.data };
+            // Same deeplink helper as asset search — resolves nested floor placement.
+            const url = await resolveAssetNavigationUrl(asset, entry.id);
+            const parsed = new URL(url, window.location.origin);
+            // Stamp AssetsList id + panel address so the floor view can match the marker.
+            if (entry.id) parsed.searchParams.set("assetId", entry.id);
+            parsed.searchParams.set("address", address);
+            router.push(`${parsed.pathname}?${parsed.searchParams.toString()}`);
+            return;
+          }
+        }
 
         // Refresh list in the background — do not keep the row spinner on a full list dump.
         void fetchFirePanelListResponse(label).catch((error) => {
@@ -457,19 +412,9 @@ export function LivePanelListPage({ label, title, description, tone }) {
       connected,
       fetchFirePanelListResponse,
       label,
+      router,
       toast,
     ],
-  );
-
-  const handleRowClick = useCallback(
-    (row) => {
-      if (label === "Fire") {
-        void handleFireRowNavigate(row);
-        return;
-      }
-      void handleRowAck(row);
-    },
-    [handleFireRowNavigate, handleRowAck, label],
   );
 
   const refreshList = useCallback(async () => {
@@ -503,19 +448,6 @@ export function LivePanelListPage({ label, title, description, tone }) {
     if (!isReady || !connected) return;
     if (initialListLoadedRef.current === label) return;
 
-    // Fire page: post-ack list f is already running (or finished into temp/cache).
-    if (
-      label === "Fire" &&
-      (postAckFireListPending ||
-        isPostAckFireListPending() ||
-        tempFireRows?.length > 0 ||
-        Boolean(cached?.response) ||
-        Boolean(cached?.streaming))
-    ) {
-      initialListLoadedRef.current = label;
-      return;
-    }
-
     initialListLoadedRef.current = label;
     let cancelled = false;
 
@@ -538,7 +470,7 @@ export function LivePanelListPage({ label, title, description, tone }) {
     return () => {
       cancelled = true;
     };
-  }, [isReady, connected, label, tempFireRows, cached?.response, cached?.streaming, postAckFireListPending]);
+  }, [isReady, connected, label]);
 
   if (!isReady) {
     return (
@@ -603,18 +535,28 @@ export function LivePanelListPage({ label, title, description, tone }) {
             </p>
           ) : (
             <div className="min-h-0 flex-1">
+              {isStreaming && parsedRows.length > 0 ? (
+                <p className="mb-2 text-xs text-muted-foreground">
+                  Streaming panel response — {parsedRows.length}
+                  {expectedCount != null ? `/${expectedCount}` : ""} row
+                  {parsedRows.length === 1 ? "" : "s"} so far
+                </p>
+              ) : null}
               <PanelAlarmList
                 rows={parsedRows}
                 emptyLabel={emptyLabel}
-                pending={connected && parsedRows.length === 0 && isStreaming}
+                pending={
+                  isStreaming ||
+                  (connected && expectedCount != null && expectedCount > 0 && parsedRows.length === 0)
+                }
                 tone={tone}
                 highlightedAddresses={effectiveHighlightedAddresses}
-                onRowAck={handleRowClick}
-                acknowledgingAddress={acknowledgingAddress || navigatingAddress}
+                onRowAck={(row) => void handleRowAck(row)}
+                acknowledgingAddress={acknowledgingAddress}
                 listComplete={listComplete}
                 expectedCount={expectedCount}
                 listMessageCount={listMessageCount}
-                fetchedAt={cached?.fetchedAt ?? null}
+                responseTimeLabel={responseTimeLabel}
               />
             </div>
           )}
