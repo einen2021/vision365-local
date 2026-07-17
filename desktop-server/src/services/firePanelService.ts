@@ -1,6 +1,20 @@
+import { createRequire } from "module";
 import path from "path";
 import { Worker } from "worker_threads";
 import { serverLog } from "../log";
+
+/** Local require — works under tsx and packaged CJS. */
+function localRequire() {
+  try {
+    // eslint-disable-next-line no-undef
+    if (typeof __filename === "string") return createRequire(__filename);
+  } catch {
+    // ignore
+  }
+  return createRequire(
+    path.join(process.cwd(), "desktop-server", "src", "services", "firePanelService.ts"),
+  );
+}
 
 type IncomingMessage =
   | { type: "connect"; id: string; host: string; port: number }
@@ -72,63 +86,123 @@ function getServiceDir() {
   return path.join(process.cwd(), "desktop-server", "src", "services");
 }
 
-function ensureWorkers() {
-  if (panelWorker) return;
+function fileExists(filePath: string) {
+  try {
+    const fs = localRequire()("fs") as typeof import("fs");
+    fs.accessSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  // Prefer the TypeScript worker next to this source file in dev (`npm run desktop:dev`).
-  // Packaged builds fall back to compiled firePanelWorker.js beside the server bundle.
-  // Preferring dist/*.js first left a stale worker running (stopped after 1 list row).
-  const fs = require("fs") as typeof import("fs");
+/** Absolute path to tsx so worker `--import` works even when cwd/node_modules differ. */
+function resolveTsxImportPath(): string | null {
+  try {
+    return localRequire().resolve("tsx");
+  } catch {
+    return null;
+  }
+}
 
-  const serviceDir = getServiceDir();
-  const workerPathTs = path.join(serviceDir, "..", "workers", "firePanelWorker.ts");
-  const workerPathJs = getWorkerEntryPath("js");
-  const workerPathCjs = getWorkerEntryPath("cjs");
+/**
+ * Compile the .ts worker to plain CommonJS next to the source.
+ * Avoids "Unknown file extension .ts" when tsx is missing on other machines.
+ */
+function compileTsWorkerToCjs(workerPathTs: string): string {
+  const fs = localRequire()("fs") as typeof import("fs");
+  const outFile = path.join(path.dirname(workerPathTs), "firePanelWorker.runtime.cjs");
 
-  const canUseTsWorker = (() => {
-    try {
-      fs.accessSync(workerPathTs);
-      return true;
-    } catch {
-      return false;
-    }
-  })();
-
-  const hasJs = (() => {
-    try {
-      fs.accessSync(workerPathJs);
-      return true;
-    } catch {
-      return false;
-    }
-  })();
-
-  const hasCjs = (() => {
-    try {
-      fs.accessSync(workerPathCjs);
-      return true;
-    } catch {
-      return false;
-    }
-  })();
-
-  // Dev / tsx: always prefer the live .ts worker so list-dump fixes apply immediately.
-  if (canUseTsWorker) {
-    addLog(`Using TypeScript fire-panel worker: ${workerPathTs}`);
-    panelWorker = new Worker(workerPathTs, {
-      execArgv: ["--import", "tsx"],
-    });
-  } else if (hasJs) {
-    addLog(`Using compiled fire-panel worker: ${workerPathJs}`);
-    panelWorker = new Worker(workerPathJs);
-  } else if (hasCjs) {
-    addLog(`Using compiled fire-panel worker: ${workerPathCjs}`);
-    panelWorker = new Worker(workerPathCjs);
-  } else {
-    throw new Error("firePanelWorker not found (js/cjs/ts)");
+  let esbuild: { buildSync: (opts: Record<string, unknown>) => void };
+  try {
+    esbuild = localRequire()("esbuild");
+  } catch {
+    throw new Error(
+      'Panel worker needs a compiled .cjs file (Unknown file extension ".ts"). Run: npm install && npm run desktop:worker:build',
+    );
   }
 
-  panelWorker.on("message", (msg: OutgoingMessage) => {
+  esbuild.buildSync({
+    entryPoints: [workerPathTs],
+    outfile: outFile,
+    bundle: true,
+    platform: "node",
+    target: "node20",
+    format: "cjs",
+    sourcemap: false,
+    logLevel: "silent",
+  });
+
+  if (!fs.existsSync(outFile)) {
+    throw new Error(`Failed to compile fire panel worker to ${outFile}`);
+  }
+
+  return outFile;
+}
+
+/** Pick a worker entry that Node can load without a TypeScript loader. */
+function resolveWorkerEntry(): { path: string; execArgv?: string[] } {
+  const serviceDir = getServiceDir();
+  const workersDir = path.join(serviceDir, "..", "workers");
+  const workerPathTs = path.join(workersDir, "firePanelWorker.ts");
+  const workerRuntimeCjs = path.join(workersDir, "firePanelWorker.runtime.cjs");
+  const distJs = path.join(process.cwd(), "desktop-server", "dist", "firePanelWorker.js");
+  const packagedJs = getWorkerEntryPath("js");
+  const packagedCjs = getWorkerEntryPath("cjs");
+
+  // 1) Packaged / beside this service bundle (MSI resources, dist).
+  if (fileExists(packagedCjs)) {
+    return { path: packagedCjs };
+  }
+  if (fileExists(packagedJs)) {
+    return { path: packagedJs };
+  }
+
+  // 2) Prebuilt runtime CJS from `npm run desktop:worker:build`.
+  // Rebuild when the .ts source is newer so other PCs / restarts stay in sync.
+  if (fileExists(workerPathTs)) {
+    const fs = localRequire()("fs") as typeof import("fs");
+    const tsStat = fs.statSync(workerPathTs);
+    const runtimeFresh =
+      fileExists(workerRuntimeCjs) &&
+      fs.statSync(workerRuntimeCjs).mtimeMs >= tsStat.mtimeMs;
+    if (runtimeFresh) {
+      return { path: workerRuntimeCjs };
+    }
+    try {
+      const compiled = compileTsWorkerToCjs(workerPathTs);
+      return { path: compiled };
+    } catch (error) {
+      if (fileExists(workerRuntimeCjs)) {
+        addLog(
+          `Worker recompile failed (${(error as Error).message}) — using existing runtime.cjs`,
+        );
+        return { path: workerRuntimeCjs };
+      }
+      // fall through to dist / tsx
+    }
+  } else if (fileExists(workerRuntimeCjs)) {
+    return { path: workerRuntimeCjs };
+  }
+
+  // 3) esbuild dist output.
+  if (fileExists(distJs)) {
+    return { path: distJs };
+  }
+
+  // 4) Live .ts only when tsx is installed and resolvable (absolute --import).
+  const tsxPath = resolveTsxImportPath();
+  if (fileExists(workerPathTs) && tsxPath) {
+    return { path: workerPathTs, execArgv: ["--import", tsxPath] };
+  }
+
+  throw new Error(
+    "firePanelWorker not found. Run: npm install && npm run desktop:worker:build",
+  );
+}
+
+function attachWorkerHandlers(worker: Worker) {
+  worker.on("message", (msg: OutgoingMessage) => {
     if (msg.type === "connected") {
       connected = msg.connected;
       currentHost = msg.host;
@@ -173,17 +247,21 @@ function ensureWorkers() {
     }
   });
 
-  panelWorker.on("error", (err: Error) => {
+  worker.on("error", (err: Error) => {
     connected = false;
-    addLog(`Panel worker error: ${err.message}`);
+    const message = err.message || "unknown worker error";
+    addLog(`Panel worker error: ${message}`);
     // Unblock any waiting connect/command so the HTTP handler can return an error.
+    const friendly = /unknown file extension.*\.ts/i.test(message)
+      ? 'Panel worker failed (Unknown file extension ".ts"). Run npm install && npm run desktop:worker:build, then restart.'
+      : `Panel worker error: ${message}`;
     for (const [id, req] of pending) {
       pending.delete(id);
-      req.reject(new Error(`Panel worker error: ${err.message}`));
+      req.reject(new Error(friendly));
     }
   });
 
-  panelWorker.on("exit", (code) => {
+  worker.on("exit", (code) => {
     connected = false;
     panelWorker = null;
     addLog(`Panel worker exited (code ${code})`);
@@ -192,6 +270,18 @@ function ensureWorkers() {
       req.reject(new Error("Panel worker exited during request"));
     }
   });
+}
+
+function ensureWorkers() {
+  if (panelWorker) return;
+
+  const entry = resolveWorkerEntry();
+  addLog(`Using fire-panel worker: ${entry.path}`);
+  panelWorker = entry.execArgv
+    ? new Worker(entry.path, { execArgv: entry.execArgv })
+    : new Worker(entry.path);
+
+  attachWorkerHandlers(panelWorker);
 }
 
 function request(worker: Worker, msg: IncomingMessage, timeoutMs?: number): Promise<unknown> {

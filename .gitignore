@@ -60,6 +60,7 @@ src/app/_api_web_only/
 
 # desktop server compile output
 desktop-server/dist/
+desktop-server/src/workers/firePanelWorker.runtime.cjs
 
 # windows installers (if copied out of target/)
 *.msi
