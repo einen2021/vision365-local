@@ -8,13 +8,10 @@
  * then seed/restore from JSON backups + floor-plans under AppData.
  */
 
-import { spawn, execFile, type ChildProcess } from "child_process";
-import { promisify } from "util";
+import { spawn, type ChildProcess } from "child_process";
 import fs from "fs";
 import path from "path";
 import net from "net";
-
-const execFileAsync = promisify(execFile);
 
 const DEFAULT_PORT = 47820;
 
@@ -76,10 +73,18 @@ async function ensureBundledMongod(): Promise<string | null> {
       "[mongo] Bundled mongod not found — downloading into src-tauri/resources/mongodb ...",
     );
     try {
-      await execFileAsync(process.execPath, [script], {
-        cwd: process.cwd(),
-        windowsHide: true,
-        maxBuffer: 20 * 1024 * 1024,
+      // inherit stdio so the percent / MB progress bar is visible.
+      await new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [script], {
+          cwd: process.cwd(),
+          windowsHide: true,
+          stdio: "inherit",
+        });
+        child.on("error", reject);
+        child.on("exit", (code) => {
+          if (code === 0) resolve(undefined);
+          else reject(new Error(`download-mongodb.mjs exited with code ${code}`));
+        });
       });
     } catch (error) {
       console.warn(
