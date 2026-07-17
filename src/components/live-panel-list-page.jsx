@@ -23,6 +23,7 @@ import {
 } from "@/lib/troubleAlertBeep";
 import { cn } from "@/lib/utils";
 import { useLivePanelAlert } from "@/contexts/LivePanelAlertContext";
+import { acknowledgeDevice } from "@/lib/acknowledgePanelDevice";
 import { findAssetsListEntryByPanelAddress } from "@/lib/assetsListSimplexStatus";
 import { resolveAssetNavigationUrl } from "@/lib/assetPlacementNavigation";
 import { Label } from "@/components/ui/label";
@@ -262,7 +263,6 @@ export function LivePanelListPage({ label, title, description, tone }) {
     firePanelListResponses,
     firePanelState,
     fetchFirePanelListResponse,
-    acknowledge,
   } = useFirePanelMonitor();
 
   const {
@@ -347,8 +347,18 @@ export function LivePanelListPage({ label, title, description, tone }) {
     async (row) => {
       if (!connected || acknowledgingAddress) return;
 
+      // Panel address from the list row, e.g. "2:M1-2-0".
       const address = String(row.fullAddress || row.deviceAddress || "").trim();
-      setAcknowledgingAddress(address || row.fullAddress);
+      if (!address) {
+        toast({
+          title: "Missing address",
+          description: "This list row has no device address to acknowledge.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      setAcknowledgingAddress(address);
       try {
         if (label === "Trouble") {
           silenceTroubleAlertBeep();
@@ -357,7 +367,8 @@ export function LivePanelListPage({ label, title, description, tone }) {
           silenceSupervisoryAlertBeep();
         }
 
-        await acknowledge(label, address || row.fullAddress);
+        // Device-specific ack: `ack f 2:M1-2-0` (or ack t/s …).
+        await acknowledgeDevice(label, address);
 
         setAckedAddresses((prev) => {
           const next = new Set(prev);
@@ -367,11 +378,11 @@ export function LivePanelListPage({ label, title, description, tone }) {
 
         toast({
           title: "Acknowledged",
-          description: row.fullAddress,
+          description: `ack ${label === "Fire" ? "f" : label === "Trouble" ? "t" : "s"} ${address}`,
         });
 
-        // Live Fire: after ack, open the asset via floor-plan deeplink.
-        if (label === "Fire" && address) {
+        // Live Fire: after device ack, open the nested floor plan for this address.
+        if (label === "Fire") {
           const entry = await findAssetsListEntryByPanelAddress(address);
           if (!entry) {
             toast({
@@ -381,10 +392,9 @@ export function LivePanelListPage({ label, title, description, tone }) {
             });
           } else {
             const asset = { id: entry.id, ...entry.data };
-            // Same deeplink helper as asset search — resolves nested floor placement.
+            // Resolve nested floor / section / subsection placement.
             const url = await resolveAssetNavigationUrl(asset, entry.id);
             const parsed = new URL(url, window.location.origin);
-            // Stamp AssetsList id + panel address so the floor view can match the marker.
             if (entry.id) parsed.searchParams.set("assetId", entry.id);
             parsed.searchParams.set("address", address);
             router.push(`${parsed.pathname}?${parsed.searchParams.toString()}`);
@@ -407,7 +417,6 @@ export function LivePanelListPage({ label, title, description, tone }) {
       }
     },
     [
-      acknowledge,
       acknowledgingAddress,
       connected,
       fetchFirePanelListResponse,

@@ -36,7 +36,6 @@ import {
   parsePanelListResponse,
   readSimplexStatus,
   simplexKeyForCategoryLabel,
-  buildPanelAckCommand,
 } from "@/lib/firePanelMonitor";
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
 import { streamFirePanelListCommand } from "@/lib/firePanelListStream";
@@ -45,8 +44,6 @@ import {
   isFirePanelMonitoringPersisted,
   isMonitorLoopActive,
   isMonitorLoopPaused,
-  pauseMonitorLoop,
-  resumeMonitorLoop,
   setFirePanelMonitoringPersisted,
   setMonitorCycleRunning,
   setMonitorLoopActive,
@@ -280,18 +277,15 @@ export const AppProvider = ({ children }) => {
   }, []);
 
   const acknowledge = useCallback(async (label, deviceAddress = null) => {
-    // Pause polling so a new list does not start; send ack right away so the
-    // worker can preempt any in-flight list dump (do not wait 180s for yield).
-    pauseMonitorLoop();
-    try {
-      const cmd = buildPanelAckCommand(label, deviceAddress);
-      // const response = await sendFirePanelCommand(cmd, 3000);
-      console.log({ response });
-      return response;
-    } finally {
-      resumeMonitorLoop();
+    // Device row → ack f {address}; modal / category → ack f.
+    const { acknowledgeDevice, acknowledgeCategory } = await import(
+      "@/lib/acknowledgePanelDevice"
+    );
+    if (deviceAddress) {
+      return acknowledgeDevice(label, deviceAddress);
     }
-  }, [sendFirePanelCommand]);
+    return acknowledgeCategory(label);
+  }, []);
 
   const storeFirePanelListResponse = useCallback((label, listCmd, response, meta = {}) => {
     const addresses = extractPanelDeviceAddresses(response);

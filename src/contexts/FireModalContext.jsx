@@ -22,9 +22,7 @@ import {
 import { cn } from "@/lib/utils";
 import { LIVE_FIRE_ROUTE } from "@/config/live-panel-routes";
 import { startFireAlertSiren } from "@/lib/fireAlertSiren";
-import { apiFetch } from "@/lib/apiClient";
-import { buildPanelAckCommand } from "@/lib/firePanelMonitor";
-import { withMonitorPausedForPriority } from "@/lib/firePanelMonitorSession";
+import { acknowledgeCategory } from "@/lib/acknowledgePanelDevice";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 
@@ -144,18 +142,6 @@ function FireAlertModalView({
   );
 }
 
-/** Send a priority command directly — bypasses client-side command queue. */
-async function sendPriorityCommand(command, timeoutMs = 5000) {
-  const res = await apiFetch("/api/telnet/fire-panel/command/priority", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ command, timeoutMs }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || "Priority command failed");
-  return data;
-}
-
 export function FireAlertProvider({ children }) {
   const router = useRouter();
   const { toast } = useToast();
@@ -207,11 +193,8 @@ export function FireAlertProvider({ children }) {
 
     setAckLoading(true);
     try {
-      // Pause CVAL monitoring and send ack f via the priority endpoint.
-      // Priority endpoint skips the client-side command chain and jumps ahead
-      // of any queued list/CVAL work in the panel worker.
-      const cmd = buildPanelAckCommand("Fire");
-      await withMonitorPausedForPriority(() => sendPriorityCommand(cmd, 5000));
+      // Category ack: `ack f` (no device address) via priority endpoint.
+      await acknowledgeCategory("Fire");
 
       muteSiren();
       closeFireAlertModal();
