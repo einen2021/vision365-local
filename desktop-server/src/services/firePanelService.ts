@@ -66,19 +66,34 @@ function getWorkerEntryPath(ext: "js" | "cjs") {
   return path.join(baseDir, `firePanelWorker.${ext}`);
 }
 
+/** Resolve paths relative to this service file (works under tsx and packaged builds). */
+function getServiceDir() {
+  // eslint-disable-next-line no-undef
+  if (typeof __dirname === "string") return __dirname;
+  return path.join(process.cwd(), "desktop-server", "src", "services");
+}
+
 function ensureWorkers() {
   if (panelWorker) return;
 
-  // Prefer compiled worker files (desktop:server:build / packaged runtime).
-  // If running via `npx tsx desktop-server/src/index.ts` (desktop:server),
-  // we spin up a TS worker using `--import tsx` so worker threads can run TypeScript too.
+  // Prefer the TypeScript worker next to this source file in dev (`npm run desktop:dev`).
+  // Packaged builds fall back to compiled firePanelWorker.js beside the server bundle.
+  // Preferring dist/*.js first left a stale worker running (stopped after 1 list row).
   const fs = require("fs") as typeof import("fs");
 
+  const serviceDir = getServiceDir();
+  const workerPathTs = path.join(serviceDir, "..", "workers", "firePanelWorker.ts");
   const workerPathJs = getWorkerEntryPath("js");
   const workerPathCjs = getWorkerEntryPath("cjs");
-  const entry = typeof process.argv?.[1] === "string" ? process.argv[1] : "";
-  const baseDir = entry ? path.dirname(entry) : process.cwd();
-  const workerPathTs = path.join(baseDir, "workers", "firePanelWorker.ts");
+
+  const canUseTsWorker = (() => {
+    try {
+      fs.accessSync(workerPathTs);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
 
   const hasJs = (() => {
     try {
@@ -98,23 +113,18 @@ function ensureWorkers() {
     }
   })();
 
-  const canUseTsWorker = (() => {
-    try {
-      fs.accessSync(workerPathTs);
-      return true;
-    } catch {
-      return false;
-    }
-  })();
-
-  if (hasJs) {
-    panelWorker = new Worker(workerPathJs);
-  } else if (hasCjs) {
-    panelWorker = new Worker(workerPathCjs);
-  } else if (canUseTsWorker) {
+  // Dev / tsx: always prefer the live .ts worker so list-dump fixes apply immediately.
+  if (canUseTsWorker) {
+    addLog(`Using TypeScript fire-panel worker: ${workerPathTs}`);
     panelWorker = new Worker(workerPathTs, {
       execArgv: ["--import", "tsx"],
     });
+  } else if (hasJs) {
+    addLog(`Using compiled fire-panel worker: ${workerPathJs}`);
+    panelWorker = new Worker(workerPathJs);
+  } else if (hasCjs) {
+    addLog(`Using compiled fire-panel worker: ${workerPathCjs}`);
+    panelWorker = new Worker(workerPathCjs);
   } else {
     throw new Error("firePanelWorker not found (js/cjs/ts)");
   }

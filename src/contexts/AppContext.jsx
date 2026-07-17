@@ -20,7 +20,6 @@ import { normalizeBuildingName } from "@/lib/buildingNames";
 import { apiFetch, parseApiJsonResponse } from "@/lib/apiClient";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
-import { findAssetsForPanelAddresses } from "@/lib/assetsListSimplexStatus";
 import { db } from "@/config/firebase";
 import {
   CVAL_COMMANDS,
@@ -33,7 +32,7 @@ import {
   getExpectedListCountForLabel,
   getListCmdForLabel,
   isListResponseComplete,
-  isListResponseReady,
+  isValidListCommandResponse,
   parsePanelListResponse,
   readSimplexStatus,
   simplexKeyForCategoryLabel,
@@ -50,12 +49,14 @@ import {
   isFirePanelMonitoringPersisted,
   isMonitorLoopActive,
   isMonitorLoopPaused,
+  markPostAckFireListPending,
   pauseMonitorLoop,
   resumeMonitorLoop,
   setFirePanelMonitoringPersisted,
   setMonitorCycleRunning,
   setMonitorLoopActive,
   withMonitorPaused,
+  withMonitorPausedForPriority,
 } from "@/lib/firePanelMonitorSession";
 import { useFireAlert } from "./FireModalContext";
 import { useDeviceEnabledStore } from "@/stores/deviceEnabledStore";
@@ -95,6 +96,9 @@ export const useFirePanelMonitor = () => {
     acknowledge,
     firePanelListResponses,
     fetchFirePanelListResponse,
+    tempFireArray,
+    runListFireAndSaveToTempFireArray,
+    postAckFireListPending,
     disableDevice,
     enableDevice,
   } = useApp();
@@ -112,6 +116,9 @@ export const useFirePanelMonitor = () => {
     acknowledge,
     firePanelListResponses,
     fetchFirePanelListResponse,
+    tempFireArray,
+    runListFireAndSaveToTempFireArray,
+    postAckFireListPending,
     disableDevice,
     enableDevice,
   };
@@ -158,7 +165,7 @@ export const AppProvider = ({ children }) => {
   const openFireAlertModal = useCallback(() => setIsFireAlertOpen(true), []);
   const closeFireAlertModal = useCallback(() => setIsFireAlertOpen(false), []);
 
-  const { showFireAlert, setAddressLoading, setDeviceList, muteSiren, unmuteSiren } = useFireAlert();
+  const { showFireAlert, muteSiren, unmuteSiren, setOnAfterFireAck } = useFireAlert();
   const { showTroubleAlert, showSupervisoryAlert } = useLivePanelAlert();
 
   // Global fire-panel CVAL monitor (persists across routes and reloads)
@@ -168,6 +175,9 @@ export const AppProvider = ({ children }) => {
   const [firePanelMonitorLogs, setFirePanelMonitorLogs] = useState([]);
   const [firePanelState, setFirePanelState] = useState(null);
   const [firePanelStateLoading, setFirePanelStateLoading] = useState(true);
+  const [tempFireArray, setTempFireArray] = useState([]);
+  /** True while post-ack `list f` is running — Live Fire skips a second list f. */
+  const [postAckFireListPending, setPostAckFireListPending] = useState(false);
   const [firePanelListResponses, setFirePanelListResponses] = useState({
     Fire: null,
     Trouble: null,
@@ -302,17 +312,14 @@ export const AppProvider = ({ children }) => {
   }, []);
 
   const acknowledge = useCallback(async (label, deviceAddress = null) => {
-    // Pause polling so a new list does not start; send ack right away so the
-    // worker can preempt any in-flight list dump (do not wait 180s for yield).
-    pauseMonitorLoop();
-    try {
+    // Pause + exclusive client lock (no 180s yield wait). Worker priority-queues
+    // ack ahead of list/CVAL so acknowledging stays fast in the desktop app.
+    return withMonitorPausedForPriority(async () => {
       const cmd = buildPanelAckCommand(label, deviceAddress);
       const response = await sendFirePanelCommand(cmd, 3000);
       console.log({ response });
       return response;
-    } finally {
-      resumeMonitorLoop();
-    }
+    });
   }, [sendFirePanelCommand]);
 
   const storeFirePanelListResponse = useCallback((label, listCmd, response, meta = {}) => {
@@ -407,23 +414,30 @@ export const AppProvider = ({ children }) => {
   }, [appendFirePanelMonitorLog]);
 
   const updateStreamingListResponse = useCallback((label, listCmd, response, streaming) => {
-    setFirePanelListResponses((prev) => ({
-      ...prev,
-      [label]: {
-        listCmd,
-        response: String(response || ""),
-        fetchedAt: prev[label]?.fetchedAt ?? new Date().toISOString(),
-        streaming: Boolean(streaming),
-        newestAddress: prev[label]?.newestAddress || "",
-      },
-    }));
+    setFirePanelListResponses((prev) => {
+      const prior = prev[label];
+      // New dump started — stamp "fetched at" once (no compare with previous dumps).
+      const isNewFetch = !prior?.streaming;
+      return {
+        ...prev,
+        [label]: {
+          listCmd,
+          response: String(response || ""),
+          fetchedAt: isNewFetch
+            ? new Date().toISOString()
+            : prior?.fetchedAt ?? new Date().toISOString(),
+          streaming: Boolean(streaming),
+          newestAddress: prior?.newestAddress || "",
+        },
+      };
+    });
   }, []);
 
   const sendFirePanelListCommandAndWait = useCallback(
     async (listCmd, label = null, options = {}) => {
       const { onPartial, markNewest = false, expectedCount: expectedOverride } = options;
 
-      // Complete around CVAL totalFire / totalTrouble / totalSupervisory.
+      // Use CVAL total so the worker keeps reading until all ~200+ rows arrive.
       const expectedCount =
         expectedOverride != null && Number.isFinite(Number(expectedOverride))
           ? Number(expectedOverride)
@@ -432,43 +446,59 @@ export const AppProvider = ({ children }) => {
             : null;
 
       appendFirePanelMonitorLog(
-        `>> ${listCmd} (${label ? "streaming" : "waiting for"} dump${
-          expectedCount != null ? `, expect ~${expectedCount} message(s)` : ""
-        }...)`,
+        `>> ${listCmd} — waiting for full list${
+          expectedCount != null ? ` (~${expectedCount} message(s))` : ' (until "-" prompt)'
+        }`,
       );
 
-      const response = label
-        ? await streamFirePanelListCommand(
-            listCmd,
-            LIST_COMMAND_TIMEOUT_MS,
-            (partial, done) => {
-              // Always push partials to UI so Live Trouble/Fire fills while dumping.
-              // Mark streaming done when worker says done OR we already hit CVAL count.
-              const enough =
-                done ||
-                (expectedCount != null &&
-                  isListResponseReady(partial, expectedCount));
-              updateStreamingListResponse(label, listCmd, partial, !done && !enough);
-              onPartial?.(partial, done);
-            },
-            { expectedCount },
-          )
-        : await sendFirePanelCommand(listCmd, LIST_COMMAND_TIMEOUT_MS);
+      // One shot: wait until CVAL count is met (or "-" / _DNE when count unknown).
+      let response = "";
+      try {
+        response = label
+          ? await streamFirePanelListCommand(
+              listCmd,
+              LIST_COMMAND_TIMEOUT_MS,
+              (partial, done) => {
+                updateStreamingListResponse(label, listCmd, partial, !done);
+                onPartial?.(partial, done);
+              },
+              { expectedCount },
+            )
+          : await sendFirePanelCommand(listCmd, LIST_COMMAND_TIMEOUT_MS);
+      } catch (error) {
+        // Ack/silence aborted this list before any message arrived — expected.
+        if (/list preempted/i.test(error?.message || "")) {
+          appendFirePanelMonitorLog(`!! ${listCmd}: preempted by ack/silence`);
+          throw error;
+        }
+        throw error;
+      }
 
       const messageCount = countListMessages(response);
-      if (isListResponseReady(response, expectedCount)) {
+      if (!isValidListCommandResponse(response)) {
         appendFirePanelMonitorLog(
-          `<< ${listCmd} complete (${messageCount}${
-            expectedCount != null ? `/${expectedCount}` : ""
-          } message(s), ${response.length} chars)`,
+          `!! ${listCmd}: no list message line yet (${response.length} chars)`,
         );
-      } else {
-        appendFirePanelMonitorLog(
-          `!! ${listCmd}: best effort — have ${messageCount}${
-            expectedCount != null ? `/${expectedCount}` : ""
-          } message(s)`,
+        throw new Error(
+          `${listCmd} did not return a list message (expected address + location/status line)`,
         );
       }
+
+      if (
+        expectedCount != null &&
+        expectedCount > 0 &&
+        messageCount < expectedCount
+      ) {
+        appendFirePanelMonitorLog(
+          `!! ${listCmd}: partial list ${messageCount}/${expectedCount} — showing what arrived`,
+        );
+      }
+
+      appendFirePanelMonitorLog(
+        `<< ${listCmd} list received (${messageCount}${
+          expectedCount != null ? `/${expectedCount}` : ""
+        } message(s), ${response.length} chars)`,
+      );
 
       if (label) {
         storeFirePanelListResponse(label, listCmd, response, {
@@ -500,7 +530,7 @@ export const AppProvider = ({ children }) => {
         const addressCount = extractPanelDeviceAddresses(response).length;
         appendFirePanelMonitorLog(
           `<< ${listCmd} parsed ${rowCount} row(s), ${addressCount} address(es)${
-            isListResponseComplete(response) ? "" : " (best effort — no _DNE)"
+            isListResponseComplete(response) ? " (_DNE)" : ""
           }`,
         );
 
@@ -569,13 +599,16 @@ export const AppProvider = ({ children }) => {
   }, [appendFirePanelMonitorLog, flushFirePanelMonitorLogs]);
 
   const silenceAlarm = useCallback(async () => {
-    muteSiren()
-    const loginResponse = await sendFirePanelCommand("login 444");
+    muteSiren();
+    const loginResponse = await sendFirePanelCommand("login 333");
     if (!loginResponse.includes("ACCESS GRANTED")) {
       throw new Error("Panel login failed");
     }
-    return sendFirePanelListCommandAndWait("set p217 on");
-  }, []);
+    // "set" is a normal panel command — not a list dump.
+    await sendFirePanelCommand("set 2:p217 on");
+    await sendFirePanelCommand("set 3:p217 on");
+    await sendFirePanelCommand("set 4:p217 on");
+  }, [sendFirePanelCommand]);
 
   const systemReset = useCallback(async () => {
     const loginResponse = await sendFirePanelCommand("login 444");
@@ -583,7 +616,10 @@ export const AppProvider = ({ children }) => {
       throw new Error("Panel login failed");
     }
 
-    await sendFirePanelListCommandAndWait("set p212 on");
+    // "set" is a normal panel command — not a list dump.
+    await sendFirePanelCommand("set 2:p212 on");
+    await sendFirePanelCommand("set 3:p212 on");
+    await sendFirePanelCommand("set 4:p212 on");
 
     // Reflect reset in header badges immediately after the panel accepts the command.
     syncFirePanelCountsToUi({
@@ -642,14 +678,13 @@ export const AppProvider = ({ children }) => {
     appendFirePanelMonitorLog,
     saveFirePanelState,
     sendFirePanelCommand,
-    sendFirePanelListCommandAndWait,
     syncFirePanelCountsToUi,
   ]);
 
 
   const disableDevice = useCallback(async (deviceAddress) => {
     return withMonitorPaused(async () => {
-      const loginResponse = await sendFirePanelCommand("login 444");
+      const loginResponse = await sendFirePanelCommand("login 333");
       if (!loginResponse.includes("ACCESS GRANTED")) {
         throw new Error("Panel login failed");
       }
@@ -661,7 +696,7 @@ export const AppProvider = ({ children }) => {
 
   const enableDevice = useCallback(async (deviceAddress) => {
     return withMonitorPaused(async () => {
-      const loginResponse = await sendFirePanelCommand("login 444");
+      const loginResponse = await sendFirePanelCommand("login 333");
       if (!loginResponse.includes("ACCESS GRANTED")) {
         throw new Error("Panel login failed");
       }
@@ -891,11 +926,9 @@ export const AppProvider = ({ children }) => {
             cycleYielded = true;
             break;
           }
-          const isIncrement = true;
           appendFirePanelMonitorLog(
             `>> ${label} increased (${previous[field]}→${counts[field]}) — ${listCmd}`,
           );
-          const isFireIncrement = label === "Fire";
           try {
             if (label === "Trouble" || label === "Supervisory") {
               const onLivePage =
@@ -910,10 +943,7 @@ export const AppProvider = ({ children }) => {
               }
             }
 
-            if (isFireIncrement) setAddressLoading(true);
-
             const streamPatchedAddresses = new Set();
-            const streamLookedUpAddresses = new Set();
             const statusKey = simplexKeyForCategoryLabel(label);
 
             // List runs inside this cycle already — do not nest pauseMonitorLoop
@@ -935,51 +965,6 @@ export const AppProvider = ({ children }) => {
                 useAssetFireStatusStore
                   .getState()
                   .optimisticallySetFlagForAddresses(freshAddresses, statusKey, 1);
-
-                // Fire: start AssetsList lookup as soon as an address appears.
-                if (isFireIncrement) {
-                  const toLookup = freshAddresses.filter(
-                    (address) => !streamLookedUpAddresses.has(address.toUpperCase()),
-                  );
-                  toLookup.forEach((address) =>
-                    streamLookedUpAddresses.add(address.toUpperCase()),
-                  );
-                  if (toLookup.length > 0) {
-                    void (async () => {
-                      const lookups = await findAssetsForPanelAddresses(toLookup);
-                      const preferredBuilding = selectedBuildingRef.current || "";
-                      const fallbackBuildings = (allBuildingsRef.current || [])
-                        .map((b) => b.name)
-                        .filter(Boolean);
-                      const devices = [];
-                      for (const { deviceAddress, entry, found: hit } of lookups) {
-                        if (!hit || !entry) continue;
-                        const building = resolveBuildingFromAsset(
-                          entry.data,
-                          fallbackBuildings,
-                          preferredBuilding,
-                        );
-                        devices.push({
-                          ...entry.data,
-                          id: entry.id,
-                          buildingName:
-                            building || entry.data?.building || entry.data?.buildingName,
-                          building:
-                            building || entry.data?.building || entry.data?.buildingName,
-                          deviceAddress,
-                        });
-                      }
-                      if (devices.length > 0) {
-                        setDeviceList((prev) => [...prev, ...devices]);
-                        // Stop "Locating…" as soon as we have a match — don't wait for full list f.
-                        setAddressLoading(false);
-                        appendFirePanelMonitorLog(
-                          `<< streamed Fire asset match: ${devices.map((d) => d.deviceAddress).join(", ")}`,
-                        );
-                      }
-                    })();
-                  }
-                }
               },
             });
 
@@ -990,99 +975,6 @@ export const AppProvider = ({ children }) => {
 
             void (async () => {
               try {
-                // Fire: find AssetsList devices from list f for the alert modal.
-                // Newest address first (typical CVAL +1). Do NOT invalidate the
-                // AssetsList cache — a full re-download made locating very slow.
-                if (isFireIncrement && deviceAddresses.length > 0) {
-                  const preferredBuilding = selectedBuildingRef.current || "";
-                  const fallbackBuildings = (allBuildingsRef.current || [])
-                    .map((b) => b.name)
-                    .filter(Boolean);
-
-                  const toDevice = ({ deviceAddress, entry, found: hit }) => {
-                    if (hit && entry) {
-                      const building = resolveBuildingFromAsset(
-                        entry.data,
-                        fallbackBuildings,
-                        preferredBuilding,
-                      );
-                      return {
-                        ...entry.data,
-                        id: entry.id,
-                        buildingName: building || entry.data?.building || entry.data?.buildingName,
-                        building: building || entry.data?.building || entry.data?.buildingName,
-                        deviceAddress,
-                      };
-                    }
-                    const [panelRow] = parsePanelListResponse(
-                      listResponse
-                        .split(/\r?\n/)
-                        .find((line) =>
-                          String(line).toUpperCase().includes(String(deviceAddress).toUpperCase()),
-                        ) || deviceAddress,
-                    );
-                    const building = resolveBuildingFromAsset(
-                      null,
-                      fallbackBuildings,
-                      preferredBuilding,
-                    );
-                    return {
-                      id: `panel:${deviceAddress}`,
-                      buildingName: building,
-                      building,
-                      deviceAddress,
-                      description: panelRow?.location || deviceAddress,
-                      deviceLocation: panelRow?.location || "",
-                      deviceType: panelRow?.deviceType || "Fire",
-                      name: panelRow?.deviceType || "Fire",
-                      fromPanelList: true,
-                    };
-                  };
-
-                  const mergeDevices = (devicesForAlert) => {
-                    setDeviceList((prev) => {
-                      const byAddr = new Map();
-                      for (const device of prev) {
-                        const key = String(device.deviceAddress || "").toUpperCase();
-                        if (key) byAddr.set(key, device);
-                      }
-                      for (const device of devicesForAlert.reverse()) {
-                        const key = String(device.deviceAddress || "").toUpperCase();
-                        if (!key) continue;
-                        const existing = byAddr.get(key);
-                        if (!existing || existing.fromPanelList) {
-                          byAddr.set(key, device);
-                        }
-                      }
-                      return [...byAddr.values()];
-                    });
-                  };
-
-                  // Unlock the modal with the newest address ASAP.
-                  const newest = deviceAddresses[deviceAddresses.length - 1];
-                  const others = deviceAddresses.slice(0, -1);
-                  appendFirePanelMonitorLog(
-                    `>> looking up newest Fire address ${newest} in AssetsList…`,
-                  );
-                  const newestLookups = await findAssetsForPanelAddresses([newest]);
-                  mergeDevices(newestLookups.map(toDevice));
-                  setAddressLoading(false);
-
-                  let lookups = newestLookups;
-                  if (others.length > 0) {
-                    const more = await findAssetsForPanelAddresses(others);
-                    lookups = [...newestLookups, ...more];
-                    mergeDevices(more.map(toDevice));
-                  }
-
-                  const found = lookups.filter((row) => row.found);
-                  appendFirePanelMonitorLog(
-                    `<< Fire AssetsList match: ${found.length}/${deviceAddresses.length}`,
-                  );
-                } else if (isFireIncrement) {
-                  setAddressLoading(false);
-                }
-
                 const { updatedCount, clearedCount } = await syncAssetsListWithPanelList(
                   label,
                   deviceAddresses,
@@ -1093,7 +985,7 @@ export const AppProvider = ({ children }) => {
                     `AssetsList synced ${label} → ${statusKey}=1: ${updatedCount}, cleared: ${clearedCount}`,
                   );
                   useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
-                } else if (deviceAddresses.length > 0 || !isIncrement) {
+                } else if (deviceAddresses.length > 0) {
                   appendFirePanelMonitorLog(
                     `Panel live ${statusKey} flags synced for ${deviceAddresses.length} address(es)`,
                   );
@@ -1101,14 +993,18 @@ export const AppProvider = ({ children }) => {
               } catch (error) {
                 appendFirePanelMonitorLog(`!! ${listCmd} background sync: ${error.message}`);
                 console.error(`[fire-panel monitor] ${listCmd} background sync failed:`, error);
-              } finally {
-                if (isFireIncrement) setAddressLoading(false);
               }
             })();
           } catch (error) {
-            appendFirePanelMonitorLog(`!! ${listCmd} failed: ${error.message}`);
-            console.error(`[fire-panel monitor] ${listCmd} failed:`, error);
-            if (isFireIncrement) setAddressLoading(false);
+            // Fire ack often preempts an in-flight list f — post-ack load will fetch it.
+            if (/list preempted/i.test(error?.message || "")) {
+              appendFirePanelMonitorLog(
+                `!! ${listCmd} preempted by priority command — skipped`,
+              );
+            } else {
+              appendFirePanelMonitorLog(`!! ${listCmd} failed: ${error.message}`);
+              console.error(`[fire-panel monitor] ${listCmd} failed:`, error);
+            }
           }
         }
       }
@@ -1132,6 +1028,30 @@ export const AppProvider = ({ children }) => {
     waitWhileMonitorPaused,
     syncFirePanelFieldToUi,
   ]);
+
+  const runListFireAndSaveToTempFireArray = useCallback(async () => {
+    // Never start list f before ack f — only called after ack has completed.
+    markPostAckFireListPending(true);
+    setPostAckFireListPending(true);
+    try {
+      const listFireResponse = await sendFirePanelListCommandAndWait("list f", "Fire", {
+        markNewest: true,
+      });
+      const rows = parsePanelListResponse(listFireResponse);
+      // Prefer full parsed rows for the Live Fire table; fall back to addresses only.
+      setTempFireArray(rows.length > 0 ? rows : extractPanelDeviceAddresses(listFireResponse));
+      return listFireResponse;
+    } finally {
+      markPostAckFireListPending(false);
+      setPostAckFireListPending(false);
+    }
+  }, [sendFirePanelListCommandAndWait]);
+
+  // Fire alert modal lives above AppProvider — register this so ack can load list f first.
+  useEffect(() => {
+    setOnAfterFireAck(runListFireAndSaveToTempFireArray);
+    return () => setOnAfterFireAck(null);
+  }, [runListFireAndSaveToTempFireArray, setOnAfterFireAck]);
 
   const startFirePanelMonitoring = useCallback(async () => {
     await useFirePanelStore.getState().syncStatus();
@@ -1409,6 +1329,9 @@ export const AppProvider = ({ children }) => {
     acknowledge,
     firePanelListResponses,
     fetchFirePanelListResponse,
+    tempFireArray,
+    runListFireAndSaveToTempFireArray,
+    postAckFireListPending,
     // Global fire alert modal
     isFireAlertOpen,
     openFireAlertModal,

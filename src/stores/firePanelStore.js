@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { apiFetch, parseApiJsonResponse } from "@/lib/apiClient";
+import { LIST_COMMAND_TIMEOUT_MS } from "@/lib/firePanelMonitor";
 
 /** Parse API JSON safely — avoids cryptic errors when HTML error pages are returned */
 async function parseJsonResponse(res) {
@@ -177,7 +178,7 @@ export const useFirePanelStore = create((set, get) => ({
       lower.includes("cshow *") || lower.includes("cshow*")
         ? 60000
         : lower.startsWith("list")
-          ? 120000
+          ? LIST_COMMAND_TIMEOUT_MS
         : lower.startsWith("show")
           ? 8000
           : lower.includes("cval")

@@ -25,7 +25,7 @@ import {
   getPrimaryStatusTone,
   parsePanelShowResponse,
 } from "@/lib/parsePanelShowResponse"
-import { withMonitorPaused, pauseMonitorLoop, resumeMonitorLoop, waitForMonitorYield } from "@/lib/firePanelMonitorSession"
+import { withMonitorPausedForPriority, pauseMonitorLoop, resumeMonitorLoop } from "@/lib/firePanelMonitorSession"
 import { cn } from "@/lib/utils"
 
 /** Small delay between show retries when the panel returns a partial chunk. */
@@ -83,7 +83,8 @@ export function AssetControlModal({
   /** Run `show <address>` and parse PRIMARY STATUS / ENABLED STATE. */
   const runPanelShow = useCallback(
     async (trimmedAddress) => {
-      const result = await withMonitorPaused(async () => {
+      // Do not wait for an in-flight list dump — worker preempts list for show.
+      const result = await withMonitorPausedForPriority(async () => {
         return sendPanelCommand(`show ${trimmedAddress}`)
       })
       if (!result?.ok) {
@@ -177,17 +178,9 @@ export function AssetControlModal({
   useEffect(() => {
     if (!isOpen) return
 
-    let cancelled = false
     pauseMonitorLoop()
 
-    const prepare = async () => {
-      await waitForMonitorYield()
-      if (cancelled) return
-    }
-    void prepare()
-
     return () => {
-      cancelled = true
       resumeMonitorLoop()
     }
   }, [isOpen])
@@ -206,8 +199,7 @@ export function AssetControlModal({
 
     const loadAssetData = async () => {
       try {
-        // Wait until CVAL cycle yields under the held pause before reading Firestore + show.
-        await waitForMonitorYield()
+        // Do not wait out a long list dump here — `show` preempts it in the worker.
         if (cancelled || loadId !== statusRequestIdRef.current) return
 
         const buildingNameWithSuffix = selectedBuilding + "BuildingDB"

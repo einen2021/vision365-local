@@ -2,8 +2,19 @@
 
 export const PANEL_STATE_REFRESH_MS = 5000;
 export const MONITOR_INTERVAL_MS = 500;
-/** Large trouble lists (200+) need well over 15s before the panel sends _DNE. */
-export const LIST_COMMAND_TIMEOUT_MS = 120000;
+/**
+ * Soft wait for list f/t/s: keep listening until a real list message dump ends
+ * with the panel prompt ("\n -") or _DNE. Soft timer resets on each telnet chunk.
+ */
+export const LIST_COMMAND_TIMEOUT_MS = 30000;
+
+/**
+ * A real list f / list t / list s message line, for example:
+ *   1:M1-1-0   SUB BASEMENT CORRIDOR 1           SMOKE DETECTOR       FIRE*
+ *   2:M1-202-0 SUB BS PMP RM WET RSR VA TUB31 SB/L1/202  SUPERVISORY MONITOR  TRBL
+ */
+export const LIST_MESSAGE_LINE_RE =
+  /\b(?:\d+:)?M\d+-\d+(?:-\d+)?\s+\S+/i;
 
 export const CVAL_COMMANDS = [
   { label: "Fire", cmd: "cshow a0 cval", field: "totalFire", listCmd: "list f" },
@@ -16,8 +27,49 @@ export const CVAL_COMMANDS = [
   { label: "Trouble", cmd: "cshow a2 cval", field: "totalTrouble", listCmd: "list t" },
 ];
 
+/**
+ * Panel ends a list dump with a prompt line that is only "-" (after newline),
+ * or with _DNE/_END. Do not treat hyphens inside addresses/locations as the end.
+ */
 export function isListResponseComplete(response) {
-  return /_DNE|_END\b/i.test(String(response || "").replace(/\0/g, " "));
+  const text = String(response || "")
+    .replace(/\0/g, " ")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+  if (/_DNE|_END\b/i.test(text)) return true;
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return false;
+  return lines[lines.length - 1] === "-";
+}
+
+/**
+ * True when we have list message lines, or an empty finished dump (_DNE / "-").
+ * Partial streams with rows are also valid so the UI can show them one by one.
+ */
+export function isValidListCommandResponse(response) {
+  const text = String(response || "").replace(/\0/g, " ");
+  if (!text.trim()) return false;
+  if (LIST_MESSAGE_LINE_RE.test(text) || countListMessages(text) > 0) return true;
+  return isListResponseComplete(text);
+}
+
+/**
+ * Dump is finished when the last line is the "-" prompt / _DNE, or (when
+ * expectedCount is known) we already have that many message rows.
+ */
+export function isListDumpFinished(response, expectedCount = null) {
+  const count = countListMessages(response);
+  if (
+    expectedCount != null &&
+    Number.isFinite(Number(expectedCount)) &&
+    Number(expectedCount) > 0
+  ) {
+    return count >= Number(expectedCount);
+  }
+  return isListResponseComplete(response);
 }
 
 /**
@@ -48,9 +100,11 @@ export function simplexKeyForCategoryLabel(label) {
 
 /** Parse panel list command output into unique device addresses. */
 export function extractPanelDeviceAddresses(response) {
-  const regex = /\b\d+:M\d+-\d+(?:-\d+)?\b/gi;
-  const matches = String(response || "").replace(/\0/g, " ").match(regex) ?? [];
-  return [...new Set(matches.map((value) => value.trim()))];
+  const text = String(response || "").replace(/\0/g, " ");
+  // Accept both "1:M1-2-3" and bare "M1-2-3".
+  const regex = /\b(?:\d+:)?M\d+-\d+(?:-\d+)?\b/gi;
+  const matches = text.match(regex) ?? [];
+  return [...new Set(matches.map((value) => value.trim().toUpperCase()))];
 }
 
 /** Known device type suffixes in panel list output (longest first). */
@@ -68,6 +122,7 @@ const PANEL_DEVICE_TYPES = [
   "RELAY MODULE",
   "HORN STROBE",
   "SPEAKER STROBE",
+  "ALARM RELAY",
   "HEAT DETECTOR",
   "TAMPER SWITCH",
   "GATE VALVE",
@@ -95,16 +150,18 @@ function parsePanelListLine(line) {
   const trimmed = stripListCommandEcho(line);
   if (!trimmed) return null;
   if (/_DNE|_END\b/i.test(trimmed)) return null;
+  if (trimmed === "-") return null;
   if (/^list\s/i.test(trimmed)) return null;
 
-  // Address may be followed by spaces OR leftover padding after NUL→space cleanup.
-  const match = trimmed.match(/^(?:(\d+):)?(M\d+-\d+(?:-\d+)?)\s+(.+)$/i);
+  // Address may stand alone, or be followed by location / type / status text.
+  // Trailing spaces from NUL padding are fine — do not require extra fields.
+  const match = trimmed.match(/^(?:(\d+):)?(M\d+-\d+(?:-\d+)?)(?:\s+(.*))?$/i);
   if (!match) return null;
 
   const node = match[1] || "";
   const deviceAddress = match[2].toUpperCase();
   const fullAddress = node ? `${node}:${deviceAddress}` : deviceAddress;
-  let remainder = match[3].trim();
+  let remainder = String(match[3] || "").trim();
   let panelTimeText = "";
 
   const leadingDateTime = remainder.match(
@@ -199,15 +256,40 @@ export function formatPanelListTime(value) {
 /** Parse panel `list f|t|s` text into display rows. */
 export function parsePanelListResponse(text) {
   const entries = [];
-  // Normalize NULs before splitting so a padded "line" stays one logical row.
-  const normalized = String(text || "").replace(/\0/g, " ");
-
-  for (const line of normalized.split(/\r?\n/)) {
+  for (const line of splitPanelListLines(text)) {
     const parsed = parsePanelListLine(line);
     if (parsed) entries.push(parsed);
   }
-
   return entries;
+}
+
+/**
+ * Split a list dump into raw message lines.
+ * Simplex often uses CR and/or fixed-width NUL padding with no clean newlines,
+ * so we also break before every panel address (N:M#-#-#).
+ */
+export function splitPanelListLines(text) {
+  const normalized = String(text || "")
+    .replace(/\0/g, " ")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+
+  // Force a line break before each device address so multi-row dumps parse fully.
+  const broken = normalized.replace(
+    /((?:\d+:)?M\d+-\d+(?:-\d+)?\s+)/gi,
+    "\n$1",
+  );
+
+  return broken
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => {
+      if (!line) return false;
+      if (line === "-") return false;
+      if (/_DNE|_END\b/i.test(line)) return false;
+      if (/^list\s+[fts]\b/i.test(line)) return false;
+      return true;
+    });
 }
 
 /** How many list messages (device rows) are in a list f/t/s dump. */

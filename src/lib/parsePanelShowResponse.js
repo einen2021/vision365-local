@@ -16,12 +16,12 @@ function normalizeShowText(text = "") {
   return sanitizePanelShowText(text);
 }
 
-/** Match `LABEL: value` or space-padded `LABEL          value` lines. */
+/** Match `LABEL: value` or space-separated `LABEL value` lines. */
 function matchShowField(raw, label) {
   const escaped = String(label).replace(/\s+/g, "\\s+");
-  // Prefer colon form, then column-aligned form (panel uses padded spaces).
+  // Prefer colon form, then any whitespace-separated value on the same line.
   const withColon = new RegExp(`${escaped}\\s*:\\s*(\\S[^\\n]*)`, "i");
-  const spaced = new RegExp(`${escaped}\\s{2,}(\\S[^\\n]*)`, "i");
+  const spaced = new RegExp(`${escaped}\\s+(\\S[^\\n]*)`, "i");
   const match = raw.match(withColon) || raw.match(spaced);
   return match ? match[1].trim() : "";
 }

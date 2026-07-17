@@ -5,8 +5,8 @@ import { LIST_COMMAND_TIMEOUT_MS } from "@/lib/firePanelMonitor";
  * Stream a panel list command (list f/t/s) and receive partial telnet output as it arrives.
  * Falls back to the regular command endpoint when streaming is unavailable.
  *
- * Pass expectedCount (from totalFire / totalTrouble / totalSupervisory) so the
- * worker keeps waiting until that many list messages arrive.
+ * Streams rows to the UI as they arrive. Completes when CVAL row count is met
+ * (e.g. 200+ troubles), or when the dump ends with a "-" prompt / _DNE.
  */
 export async function streamFirePanelListCommand(
   command,
@@ -70,7 +70,11 @@ export async function streamFirePanelListCommand(
           throw new Error(payload.error);
         }
 
-        finalResponse = String(payload.response || "");
+        const chunkResponse = String(payload.response || "");
+        // Never let an empty done/error-adjacent chunk wipe a good response.
+        if (chunkResponse || !finalResponse) {
+          finalResponse = chunkResponse || finalResponse;
+        }
         onChunk?.(finalResponse, Boolean(payload.done));
       }
     }

@@ -90,9 +90,14 @@ export function createFirePanelRoutes() {
     }
 
     const timeoutMs = Number(body.timeoutMs) || undefined;
-    const expectedCount = Number.isFinite(Number(body.expectedCount))
-      ? Number(body.expectedCount)
-      : undefined;
+    // Number(null)===0 — only accept positive CVAL counts.
+    const expectedRaw = body.expectedCount;
+    const expectedCount =
+      expectedRaw == null || expectedRaw === ""
+        ? undefined
+        : Number.isFinite(Number(expectedRaw)) && Number(expectedRaw) > 0
+          ? Number(expectedRaw)
+          : undefined;
 
     try {
       const result = await sendFirePanelCommand(command, timeoutMs, expectedCount);
@@ -111,9 +116,14 @@ export function createFirePanelRoutes() {
     }
 
     const timeoutMs = Number(body.timeoutMs) || undefined;
-    const expectedCount = Number.isFinite(Number(body.expectedCount))
-      ? Number(body.expectedCount)
-      : undefined;
+    // Number(null)===0 — only accept positive CVAL counts.
+    const expectedRaw = body.expectedCount;
+    const expectedCount =
+      expectedRaw == null || expectedRaw === ""
+        ? undefined
+        : Number.isFinite(Number(expectedRaw)) && Number(expectedRaw) > 0
+          ? Number(expectedRaw)
+          : undefined;
     const encoder = new TextEncoder();
 
     // Shared so cancel() and late worker chunks cannot crash the process

@@ -15,6 +15,7 @@ function getSessionState() {
       cycleRunning: false,
       pauseDepth: 0,
       exclusiveCommandChain: Promise.resolve(),
+      postAckFireListPending: false,
     };
   }
   return g.__vision365FirePanelMonitor;
@@ -115,6 +116,31 @@ export async function withMonitorPaused(fn) {
   return run;
 }
 
+/**
+ * Pause the monitor and serialize client ops WITHOUT waiting for an in-flight
+ * list dump. Use for ack/silence — the worker preempts lists and priority-queues ack.
+ * Do not use for Asset Control `show` (that still needs withMonitorPaused).
+ */
+export async function withMonitorPausedForPriority(fn) {
+  const state = getSessionState();
+
+  const run = state.exclusiveCommandChain.then(async () => {
+    pauseMonitorLoop();
+    try {
+      return await fn();
+    } finally {
+      resumeMonitorLoop();
+    }
+  });
+
+  state.exclusiveCommandChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+
+  return run;
+}
+
 export function setMonitorLoopActive(active) {
   const state = getSessionState();
   state.loopActive = Boolean(active);
@@ -123,4 +149,13 @@ export function setMonitorLoopActive(active) {
     state.cycleRunning = false;
     state.pauseDepth = 0;
   }
+}
+
+/** Sync flag: post-ack list f is in flight (Live Fire must not start a second list f). */
+export function markPostAckFireListPending(pending = true) {
+  getSessionState().postAckFireListPending = Boolean(pending);
+}
+
+export function isPostAckFireListPending() {
+  return Boolean(getSessionState().postAckFireListPending);
 }
