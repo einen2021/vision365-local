@@ -57,6 +57,7 @@ export function parseFloorPlanViewSearchParams(searchParams) {
   const assetId = searchParams?.get("assetId") || "";
   const address = searchParams?.get("address") || "";
   const highlight = searchParams?.get("highlight") === "1";
+  const nav = searchParams?.get("nav") || "";
 
   if (!building || !floorId || !sectionId) return null;
 
@@ -68,7 +69,43 @@ export function parseFloorPlanViewSearchParams(searchParams) {
     assetId,
     address,
     highlight,
+    nav,
   };
+}
+
+/** True when a floor-plan URL already includes building + floor + section. */
+export function floorPlanUrlHasPlacement(url = "") {
+  try {
+    const parsed = new URL(String(url || ""), "http://local");
+    return Boolean(
+      parsed.searchParams.get("building") &&
+        parsed.searchParams.get("floor") &&
+        parsed.searchParams.get("section"),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stamp asset search keys onto a floor-plan URL.
+ * Always sets a fresh `nav` token so Graphics View re-applies the deep link.
+ */
+export function stampFloorPlanNavigationParams(
+  url = "",
+  { assetId = "", address = "", highlight = false } = {},
+) {
+  const parsed = new URL(
+    String(url || FLOOR_PLAN_VIEW_PATH),
+    typeof window !== "undefined" ? window.location.origin : "http://local",
+  );
+  if (assetId) parsed.searchParams.set("assetId", assetId);
+  if (address) parsed.searchParams.set("address", address);
+  if (highlight) parsed.searchParams.set("highlight", "1");
+  else parsed.searchParams.delete("highlight");
+  // Unique token so repeating the same search still triggers navigation effects.
+  parsed.searchParams.set("nav", `${Date.now()}`);
+  return `${parsed.pathname}?${parsed.searchParams.toString()}`;
 }
 
 /** Find the community id that contains the given building name. */

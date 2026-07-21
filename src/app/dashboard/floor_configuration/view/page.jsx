@@ -48,6 +48,7 @@ import {
   findHighlightMappingAsync,
   resolveMappingDeviceFields,
 } from "@/lib/floorMapAssets";
+import { registerPlacedMappingsInAddressFloorIndex } from "@/lib/assetAddressFloorIndex";
 import { db } from "@/config/firebase";
 
 /**
@@ -138,6 +139,38 @@ export default function ViewNestedFloorPlansPage() {
     setAssetMappings(enriched);
     return enriched;
   }, []);
+
+  // Keep address → floor Map in sync with markers on the open plan.
+  // Covers assets placed in assetMappings even when AssetsList lacks floorId/sectionId.
+  useEffect(() => {
+    if (!selectedBuilding || !floor?.id || !section?.id) return;
+
+    const isSubsection = level === NAV_LEVELS.SUBSECTION && subsection?.id;
+    const mappings = isSubsection ? assetMappings : sectionAssetMappings;
+    if (!mappings?.length) return;
+
+    registerPlacedMappingsInAddressFloorIndex({
+      building: selectedBuilding,
+      floorId: floor.id,
+      floorName: floor.name || floor.id,
+      sectionId: section.id,
+      sectionName: section.name || section.id,
+      subsectionId: isSubsection ? subsection.id : "",
+      subsectionName: isSubsection ? subsection.name || subsection.id : "",
+      mappings,
+    });
+  }, [
+    assetMappings,
+    floor?.id,
+    floor?.name,
+    level,
+    section?.id,
+    section?.name,
+    sectionAssetMappings,
+    selectedBuilding,
+    subsection?.id,
+    subsection?.name,
+  ]);
 
   // One-shot enrichment for the already-open plan so F/T colors can match addresses.
   useEffect(() => {
@@ -430,47 +463,59 @@ export default function ViewNestedFloorPlansPage() {
       if (!selectedBuilding || !floorId || !sectionId) return;
 
       const requestId = ++navRequestRef.current;
-
-      const [fullFloor, fullSection, subs] = await Promise.all([
-        FirestoreService.getNestedFloor(selectedBuilding, floorId),
-        FirestoreService.getNestedSection(selectedBuilding, floorId, sectionId),
-        FirestoreService.getNestedSubsections(selectedBuilding, floorId, sectionId),
-      ]);
-      if (requestId !== navRequestRef.current || !fullFloor || !fullSection) return;
-
-      setFloor(fullFloor);
-      setSection(fullSection);
-      let mappings = await applySectionMappings(fullSection?.assetMappings || []);
-      setSubsections(subs);
-      void prefetchPlanImageUrls(subs.map((sub) => sub.imageUrl));
-
-      if (subsectionId) {
-        const fullSubsection = await FirestoreService.getNestedSubsection(
-          selectedBuilding,
-          floorId,
-          sectionId,
-          subsectionId,
-        );
-        if (requestId !== navRequestRef.current) return;
-        if (fullSubsection) {
-          subsectionCacheRef.current.set(subsectionId, fullSubsection);
-        }
-        setSubsection(fullSubsection);
-        mappings = await applyAssetMappings(fullSubsection?.assetMappings || []);
-        setLevel(NAV_LEVELS.SUBSECTION);
-      } else {
-        subsectionCacheRef.current.clear();
-        subs.forEach((sub) => {
-          void prefetchSubsection(sub.id, sectionId);
-        });
-
-        setSubsection(null);
-        setAssetMappings([]);
-        setLevel(NAV_LEVELS.SECTION);
-      }
-
       const targetAssetId = String(assetId || "").trim();
       const targetAddress = String(address || "").trim();
+      const targetSubsectionId = String(subsectionId || "").trim();
+
+      // Already viewing this plan — skip Firestore reloads and only highlight.
+      const alreadyOnPlan =
+        floor?.id === floorId &&
+        section?.id === sectionId &&
+        String(subsection?.id || "") === targetSubsectionId &&
+        (level === NAV_LEVELS.SECTION || level === NAV_LEVELS.SUBSECTION);
+
+      let mappings = targetSubsectionId ? assetMappings : sectionAssetMappings;
+
+      if (!alreadyOnPlan) {
+        const [fullFloor, fullSection, subs] = await Promise.all([
+          FirestoreService.getNestedFloor(selectedBuilding, floorId),
+          FirestoreService.getNestedSection(selectedBuilding, floorId, sectionId),
+          FirestoreService.getNestedSubsections(selectedBuilding, floorId, sectionId),
+        ]);
+        if (requestId !== navRequestRef.current || !fullFloor || !fullSection) return;
+
+        setFloor(fullFloor);
+        setSection(fullSection);
+        mappings = await applySectionMappings(fullSection?.assetMappings || []);
+        setSubsections(subs);
+        void prefetchPlanImageUrls(subs.map((sub) => sub.imageUrl));
+
+        if (targetSubsectionId) {
+          const fullSubsection = await FirestoreService.getNestedSubsection(
+            selectedBuilding,
+            floorId,
+            sectionId,
+            targetSubsectionId,
+          );
+          if (requestId !== navRequestRef.current) return;
+          if (fullSubsection) {
+            subsectionCacheRef.current.set(targetSubsectionId, fullSubsection);
+          }
+          setSubsection(fullSubsection);
+          mappings = await applyAssetMappings(fullSubsection?.assetMappings || []);
+          setLevel(NAV_LEVELS.SUBSECTION);
+        } else {
+          subsectionCacheRef.current.clear();
+          subs.forEach((sub) => {
+            void prefetchSubsection(sub.id, sectionId);
+          });
+
+          setSubsection(null);
+          setAssetMappings([]);
+          setLevel(NAV_LEVELS.SECTION);
+        }
+      }
+
       if (!targetAssetId && !targetAddress) return;
 
       // Match for address enrichment (fire status) and optional search highlight.
@@ -504,7 +549,7 @@ export default function ViewNestedFloorPlansPage() {
       };
 
       // Enrich displayed markers so F/T live colors can resolve by deviceAddress.
-      if (subsectionId) {
+      if (targetSubsectionId) {
         setAssetMappings((prev) =>
           prev.map((m) =>
             m.id === enrichedMatch.id ? { ...m, ...enrichedMatch } : m,
@@ -538,7 +583,20 @@ export default function ViewNestedFloorPlansPage() {
         description: "Look for the orange Found frame on the plan.",
       });
     },
-    [prefetchSubsection, selectedBuilding, startAssetHighlight, toast, applySectionMappings, applyAssetMappings],
+    [
+      assetMappings,
+      applyAssetMappings,
+      applySectionMappings,
+      floor?.id,
+      level,
+      prefetchSubsection,
+      section?.id,
+      sectionAssetMappings,
+      selectedBuilding,
+      startAssetHighlight,
+      subsection?.id,
+      toast,
+    ],
   );
 
   // Stable key so in-page search / alarm navigation re-applies when only query params change.
@@ -553,6 +611,8 @@ export default function ViewNestedFloorPlansPage() {
       parsed.assetId || "",
       parsed.address || "",
       parsed.highlight ? "1" : "0",
+      // Fresh nav token from search so the same asset can be re-opened.
+      parsed.nav || "",
     ].join("|");
   }, [searchParams]);
 

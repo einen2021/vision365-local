@@ -2,69 +2,78 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { collection, getDocs } from "firebase/firestore";
 import { Loader2, MapPin, Search } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import { db } from "@/config/firebase";
+import { useToast } from "@/hooks/use-toast";
 import { searchAssetsByDeviceAddress } from "@/lib/assetDeviceSearch";
 import {
-  formatPlacementTargetLabel,
-  resolveAssetNavigationTarget,
-  resolveAssetNavigationUrl,
-} from "@/lib/assetPlacementNavigation";
-import { buildFloorPlanViewUrl } from "@/lib/fireAlertFloorNavigation";
+  getAddressFloorDetailsIndex,
+  resolveFloorDetailsFromCache,
+  warmAddressFloorDetailsIndex,
+} from "@/lib/assetAddressFloorIndex";
+import { resolveAssetNavigationUrl } from "@/lib/assetPlacementNavigation";
+import {
+  buildFloorPlanViewUrl,
+  floorPlanUrlHasPlacement,
+  stampFloorPlanNavigationParams,
+} from "@/lib/fireAlertFloorNavigation";
+import { normalizeBuildingName } from "@/lib/buildingNames";
+import { readGraphicsViewSelection } from "@/lib/graphicsViewSelection";
 
-const SEARCH_DEBOUNCE_MS = 300;
+const SEARCH_DEBOUNCE_MS = 200;
 const MIN_QUERY_LENGTH = 2;
 
-let assetsListCache = null;
-let assetsListCachePromise = null;
+/** When already on Graphics View, reuse the open building if the asset row has none. */
+function getBuildingHintFromLocation() {
+  if (typeof window === "undefined") return "";
+  const fromUrl = normalizeBuildingName(
+    new URLSearchParams(window.location.search).get("building") || "",
+  );
+  if (fromUrl) return fromUrl;
+  return normalizeBuildingName(readGraphicsViewSelection()?.building || "");
+}
 
-async function loadAssetsListRows() {
-  if (assetsListCache) return assetsListCache;
-  if (assetsListCachePromise) return assetsListCachePromise;
-
-  assetsListCachePromise = getDocs(collection(db, "AssetsList")).then((snapshot) => {
-    const rows = snapshot.docs.map((docSnap) => ({
-      id: docSnap.id,
-      data: docSnap.data(),
-    }));
-    assetsListCache = rows;
-    assetsListCachePromise = null;
-    return rows;
-  });
-
-  return assetsListCachePromise;
+/** Merge AssetsList row with an optional building hint for placement lookup. */
+function withBuildingHint(asset = {}, buildingHint = "") {
+  const existing = normalizeBuildingName(asset.buildingName || asset.building || "");
+  const hint = normalizeBuildingName(buildingHint);
+  if (existing || !hint) return asset;
+  return { ...asset, buildingName: hint, building: hint };
 }
 
 /** Fixed search strip — find assets by device address and jump to floor plan. */
 export function AssetDeviceSearchBar({ className }) {
   const router = useRouter();
+  const { toast } = useToast();
   const containerRef = useRef(null);
+  const floorIndexRef = useRef(null);
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [indexReady, setIndexReady] = useState(false);
   const [rows, setRows] = useState([]);
   const [navigatingId, setNavigatingId] = useState("");
 
-  async function enrichSearchResults(results) {
-    return Promise.all(
-      results.map(async (result) => {
-        if (result.locationSummary.includes("Section:")) return result;
-
-        const target = await resolveAssetNavigationTarget(result.raw, result.id);
-        if (!target?.floorId || !target?.sectionId) return result;
-
-        return {
-          ...result,
-          locationSummary: formatPlacementTargetLabel(target),
-          navigationUrl: buildFloorPlanViewUrl(target),
-        };
-      }),
-    );
-  }
+  // Warm address → floor details Map once on mount (shared AssetsList snapshot).
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      await warmAddressFloorDetailsIndex();
+      if (cancelled) return;
+      try {
+        floorIndexRef.current = await getAddressFloorDetailsIndex();
+        setIndexReady(true);
+      } catch (error) {
+        console.warn("[asset search] index warm failed:", error);
+        setIndexReady(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(query.trim()), SEARCH_DEBOUNCE_MS);
@@ -83,12 +92,18 @@ export function AssetDeviceSearchBar({ className }) {
 
       setLoading(true);
       try {
-        const assets = await loadAssetsListRows();
+        // Always refresh from the module index so live open-plan markers are included.
+        const floorIndex = await getAddressFloorDetailsIndex();
+        floorIndexRef.current = floorIndex;
         if (cancelled) return;
-        const matches = searchAssetsByDeviceAddress(assets, debouncedQuery);
-        setRows(matches);
-        const enriched = await enrichSearchResults(matches);
-        if (!cancelled) setRows(enriched);
+
+        const buildingHint = getBuildingHintFromLocation();
+        // Search + attach Building/Floor/Section from the in-memory Map.
+        const matches = searchAssetsByDeviceAddress(floorIndex.rows, debouncedQuery, {
+          floorIndex,
+          buildingHint,
+        });
+        if (!cancelled) setRows(matches);
       } catch (error) {
         console.error("[asset search] failed:", error);
         if (!cancelled) setRows([]);
@@ -101,7 +116,7 @@ export function AssetDeviceSearchBar({ className }) {
     return () => {
       cancelled = true;
     };
-  }, [debouncedQuery]);
+  }, [debouncedQuery, indexReady]);
 
   useEffect(() => {
     function handlePointerDown(event) {
@@ -121,44 +136,85 @@ export function AssetDeviceSearchBar({ className }) {
       setOpen(false);
       setQuery(result.deviceAddress || "");
       setNavigatingId(result.id);
+
       try {
-        const url = await resolveAssetNavigationUrl(result.raw, result.id);
-        // Always stamp the searched deviceAddress + AssetsList doc id into the URL.
-        // Floor-plan marker ids often differ from asset.assetId, so address is the reliable key.
-        const parsed = new URL(url, window.location.origin);
-        if (result.id) parsed.searchParams.set("assetId", result.id);
-        if (result.deviceAddress) {
-          parsed.searchParams.set("address", result.deviceAddress);
+        const buildingHint = getBuildingHintFromLocation();
+
+        // 1) Prefer URL already built from the address → floor Map (instant).
+        if (floorPlanUrlHasPlacement(result.navigationUrl)) {
+          router.push(
+            stampFloorPlanNavigationParams(result.navigationUrl, {
+              assetId: result.id,
+              address: result.deviceAddress,
+              highlight: true,
+            }),
+          );
+          return;
         }
-        // Search-only: show the orange Found frame (not used for fire-ack navigation).
-        parsed.searchParams.set("highlight", "1");
-        router.push(`${parsed.pathname}?${parsed.searchParams.toString()}`);
+
+        // 2) Re-check the Map (includes markers registered from the open plan).
+        const floorIndex =
+          floorIndexRef.current || (await getAddressFloorDetailsIndex());
+        floorIndexRef.current = floorIndex;
+        const details = resolveFloorDetailsFromCache(
+          floorIndex,
+          result.raw,
+          result.id,
+          buildingHint,
+        );
+
+        if (details?.building && details?.floorId && details?.sectionId) {
+          router.push(
+            stampFloorPlanNavigationParams(buildFloorPlanViewUrl(details), {
+              assetId: result.id,
+              address: result.deviceAddress,
+              highlight: true,
+            }),
+          );
+          return;
+        }
+
+        // 3) Fallback: scan nested floor mappings for this building (asset may
+        //    be placed only in assetMappings, not denormalized on AssetsList).
+        const url = await resolveAssetNavigationUrl(
+          withBuildingHint(result.raw, buildingHint),
+          result.id,
+        );
+        if (floorPlanUrlHasPlacement(url)) {
+          router.push(
+            stampFloorPlanNavigationParams(url, {
+              assetId: result.id,
+              address: result.deviceAddress,
+              highlight: true,
+            }),
+          );
+          return;
+        }
+
+        toast({
+          title: "Asset not on a nested floor plan",
+          description: `${result.deviceAddress || "This asset"} is not placed on a floor/section yet.`,
+        });
       } catch (error) {
         console.error("[asset search] navigation failed:", error);
-        const fallback = new URL(
-          result.navigationUrl || "/dashboard/floor_configuration/view",
-          window.location.origin,
-        );
-        if (result.id) fallback.searchParams.set("assetId", result.id);
-        if (result.deviceAddress) {
-          fallback.searchParams.set("address", result.deviceAddress);
-        }
-        fallback.searchParams.set("highlight", "1");
-        router.push(`${fallback.pathname}?${fallback.searchParams.toString()}`);
+        toast({
+          title: "Could not open floor plan",
+          description: error?.message || "Placement lookup failed for this asset.",
+        });
       } finally {
         setNavigatingId("");
       }
     },
-    [router],
+    [router, toast],
   );
 
   const emptyMessage = useMemo(() => {
-    if (loading) return "Searching assets...";
+    if (loading || !indexReady) return "Searching assets...";
     if (debouncedQuery.length < MIN_QUERY_LENGTH) {
       return "Type at least 2 characters";
     }
     return `No assets found for "${debouncedQuery}"`;
-  }, [debouncedQuery, loading]);
+  }, [debouncedQuery, indexReady, loading]);
 
   return (
     <div
@@ -182,7 +238,7 @@ export function AssetDeviceSearchBar({ className }) {
           aria-label="Search asset by device address"
           autoComplete="off"
         />
-        {loading ? (
+        {loading || !indexReady ? (
           <Loader2 className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted-foreground" />
         ) : null}
       </div>

@@ -38,9 +38,12 @@ export function invalidateAssetsListSnapshotCache() {
   assetsListSnapshotCache = null
   assetsListSnapshotFetchedAt = 0
   assetsListSnapshotPromise = null
-  // Lazy import avoids a circular dependency with assetsListSimplexStatus.
+  // Lazy import avoids circular deps with address indexes.
   void import("@/lib/assetsListSimplexStatus")
     .then((mod) => mod.clearAssetsListAddressIndex?.())
+    .catch(() => {})
+  void import("@/lib/assetAddressFloorIndex")
+    .then((mod) => mod.clearAddressFloorDetailsIndex?.())
     .catch(() => {})
 }
 
@@ -146,12 +149,24 @@ export function buildClearAssetPlacementPayload(now = new Date().toISOString()) 
 }
 
 export function getAssetsListIdFromMapping(mapping) {
-  return (
+  const direct =
     mapping?.assetsListId ||
     mapping?.details?.assetsListId ||
     mapping?.details?.id ||
     null
-  )
+  if (direct) return String(direct)
+
+  const id = String(mapping?.id || "").trim()
+  if (!id) return null
+
+  // Nested mapping docs are saved as m_<index>_<assetsListId>.
+  const prefixed = id.match(/^m_\d+_(.+)$/)
+  if (prefixed?.[1]) return prefixed[1]
+
+  // When mapping.data.id is the AssetsList id (overwrites Firestore doc id on load).
+  if (!id.startsWith("m_")) return id
+
+  return null
 }
 
 /** Resolve device fields from a floor-map mapping (flat or nested under details). */
@@ -339,7 +354,13 @@ function buildNestedAssetMappingFromDoc(docSnap, buildingName, {
   placementLevel = "section",
 }) {
   const data = docSnap.data()
-  if (!buildingsMatch(data.building, buildingName)) return null
+  // Placement sync writes both `building` and `buildingName` — accept either.
+  if (
+    !buildingsMatch(data.building, buildingName) &&
+    !buildingsMatch(data.buildingName, buildingName)
+  ) {
+    return null
+  }
   if (String(data.floorId || "") !== String(floorId || "")) return null
   if (String(data.sectionId || "") !== String(sectionId || "")) return null
 
