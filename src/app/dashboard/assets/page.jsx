@@ -786,6 +786,9 @@ export default function AssetsPage() {
   const [selectedAssetKeys, setSelectedAssetKeys] = useState([])
   const [isBulkDeleting, setIsBulkDeleting] = useState(false)
   const [bulkDeleteProgress, setBulkDeleteProgress] = useState({ total: 0, processed: 0 })
+  /** Paginate large asset tables so the page stays responsive after load. */
+  const ASSETS_PAGE_SIZE = 50
+  const [assetsPage, setAssetsPage] = useState(0)
   const [editAssetDialog, setEditAssetDialog] = useState({
     open: false,
     asset: null,
@@ -803,6 +806,7 @@ export default function AssetsPage() {
     description: "",
     model: "",
     partNumber: "",
+    deviceAddress: "",
   })
   const [singleAssetTechnicalProps, setSingleAssetTechnicalProps] = useState({})
   const [singleSystemSelect, setSingleSystemSelect] = useState("")
@@ -1110,6 +1114,7 @@ export default function AssetsPage() {
       description: "",
       model: "",
       partNumber: "",
+      deviceAddress: "",
     })
     setSingleSystemSelect("")
     setSingleCategorySelect("")
@@ -1172,20 +1177,39 @@ export default function AssetsPage() {
     }
   }
 
-  // Get unique values for filters
-  const getUniqueValues = (field) => {
+  // Get unique values for filters (memoized — scanning all assets every render is slow).
+  const uniqueBrandOptions = useMemo(() => {
     const values = new Set()
     existingAssets.forEach((asset) => {
-      const value = asset[field]
-      if (value && value.trim() !== "" && value !== "-") {
-        values.add(value)
-      }
+      const value = asset.brand
+      if (value && String(value).trim() !== "" && value !== "-") values.add(value)
     })
     return Array.from(values).sort()
-  }
+  }, [existingAssets])
+
+  const uniqueCategoryOptions = useMemo(() => {
+    const values = new Set()
+    existingAssets.forEach((asset) => {
+      const value = asset.category
+      if (value && String(value).trim() !== "" && value !== "-") values.add(value)
+    })
+    return Array.from(values).sort()
+  }, [existingAssets])
+
+  const uniqueSystemOptions = useMemo(() => {
+    const values = new Set()
+    existingAssets.forEach((asset) => {
+      const value = asset.system
+      if (value && String(value).trim() !== "" && value !== "-") values.add(value)
+    })
+    return Array.from(values).sort()
+  }, [existingAssets])
 
   // Are the loaded assets stored under building collection (have buildingAssetId)?
-  const isBuildingAsset = existingAssets.some((a) => !!a.buildingAssetId)
+  const isBuildingAsset = useMemo(
+    () => existingAssets.some((a) => !!a.buildingAssetId),
+    [existingAssets],
+  )
   const singleCategoryOptions = SINGLE_ASSET_HIERARCHY.categories
   const singleSystemOptions = useMemo(() => {
     return getSystemOptionsForSingleAsset
@@ -1221,9 +1245,8 @@ export default function AssetsPage() {
   const getAssetRowKey = (asset) =>
     `${asset.id || asset.assetId || asset.buildingAssetId || "unknown"}::${asset.categoryKey || "global"}`
 
-  const getFilteredAssets = () => {
+  const filteredAssets = useMemo(() => {
     return existingAssets.filter((asset) => {
-      // Search filter
       if (searchTerm) {
         const searchLower = searchTerm.toLowerCase()
         const matchesSearch =
@@ -1239,35 +1262,40 @@ export default function AssetsPage() {
         if (!matchesSearch) return false
       }
 
-      // Brand filter
-      if (filterBrand !== "all" && asset.brand !== filterBrand) {
-        return false
-      }
-
-      // Category filter
-      if (filterCategory !== "all" && asset.category !== filterCategory) {
-        return false
-      }
-
-      // System filter
-      if (filterSystem !== "all" && asset.system !== filterSystem) {
-        return false
-      }
+      if (filterBrand !== "all" && asset.brand !== filterBrand) return false
+      if (filterCategory !== "all" && asset.category !== filterCategory) return false
+      if (filterSystem !== "all" && asset.system !== filterSystem) return false
 
       return true
     })
-  }
+  }, [existingAssets, searchTerm, filterBrand, filterCategory, filterSystem])
 
-  const filteredAssets = useMemo(
-    () => getFilteredAssets(),
-    [existingAssets, searchTerm, filterBrand, filterCategory, filterSystem],
-  )
+  // Keep selection lookups O(1) while rendering large tables.
+  const selectedAssetKeySet = useMemo(() => new Set(selectedAssetKeys), [selectedAssetKeys])
 
   const selectedCount = selectedAssetKeys.length
   const allFilteredSelected =
     filteredAssets.length > 0 &&
-    filteredAssets.every((asset) => selectedAssetKeys.includes(getAssetRowKey(asset)))
+    filteredAssets.every((asset) => selectedAssetKeySet.has(getAssetRowKey(asset)))
 
+  // Paginate the assets table — rendering thousands of rows freezes typing/selects.
+  const totalAssetPages = Math.max(1, Math.ceil(filteredAssets.length / ASSETS_PAGE_SIZE))
+
+  useEffect(() => {
+    // Reset to first page when filters/search change or list shrinks.
+    setAssetsPage(0)
+  }, [searchTerm, filterBrand, filterCategory, filterSystem, existingAssets.length])
+
+  useEffect(() => {
+    if (assetsPage > totalAssetPages - 1) {
+      setAssetsPage(Math.max(0, totalAssetPages - 1))
+    }
+  }, [assetsPage, totalAssetPages])
+
+  const pagedAssets = useMemo(() => {
+    const start = assetsPage * ASSETS_PAGE_SIZE
+    return filteredAssets.slice(start, start + ASSETS_PAGE_SIZE)
+  }, [filteredAssets, assetsPage])
   const toggleAssetSelection = (asset, checked) => {
     const key = getAssetRowKey(asset)
     setSelectedAssetKeys((prev) => {
@@ -2295,17 +2323,19 @@ export default function AssetsPage() {
 
     try {
       const assetsCollection = collection(db, "AssetsList")
-      const existingAssetsSnapshot = await getDocs(assetsCollection)
-      const existingAssetCount = existingAssetsSnapshot.size
-      const assetId = generateAssetId(brand, system, itemType, existingAssetCount + 1)
-
-      const existingAssetIds = new Set()
-      existingAssetsSnapshot.forEach((docSnap) => {
-        const data = docSnap.data()
-        if (data.assetId) {
-          existingAssetIds.add(data.assetId.toLowerCase())
-        }
-      })
+      // Use already-loaded assets for id generation (avoid a full Firestore re-read).
+      const existingAssetIds = new Set(
+        existingAssets
+          .map((asset) => String(asset.assetId || "").trim().toLowerCase())
+          .filter(Boolean),
+      )
+      let sequence = existingAssets.length + 1
+      let assetId = generateAssetId(brand, system, itemType, sequence)
+      // Bump sequence if this generated id already exists in memory.
+      while (existingAssetIds.has(assetId.toLowerCase()) && sequence < existingAssets.length + 1000) {
+        sequence += 1
+        assetId = generateAssetId(brand, system, itemType, sequence)
+      }
 
       if (existingAssetIds.has(assetId.toLowerCase())) {
         toast({
@@ -2321,6 +2351,7 @@ export default function AssetsPage() {
       const cleanedTechnicalValues = Object.fromEntries(
         Object.entries(singleAssetTechnicalProps).filter(([, value]) => String(value || "").trim() !== ""),
       )
+      const deviceAddress = singleAssetForm.deviceAddress.trim()
       const payload = {
         assetId,
         brand,
@@ -2333,6 +2364,7 @@ export default function AssetsPage() {
         description: singleAssetForm.description.trim(),
         model: singleAssetForm.model.trim(),
         partNumber: singleAssetForm.partNumber.trim(),
+        deviceAddress,
         technicalProperties: {
           templateId: selectedTechnicalTemplateId || "",
           templateName: selectedTechnicalTemplate?.label || "",
@@ -2742,6 +2774,16 @@ export default function AssetsPage() {
                           className="h-9 text-xs"
                         />
                       </div>
+                      <div>
+                        <Label htmlFor="single-device-address" className="text-xs">Device Address</Label>
+                        <Input
+                          id="single-device-address"
+                          value={singleAssetForm.deviceAddress}
+                          onChange={(e) => handleSingleAssetFieldChange("deviceAddress", e.target.value)}
+                          placeholder="e.g. 2:M1-1-0 or M1-1-0"
+                          className="h-9 text-xs"
+                        />
+                      </div>
                     </div>
                     <div>
                       <Label htmlFor="single-description" className="text-xs">Description</Label>
@@ -3053,7 +3095,7 @@ export default function AssetsPage() {
                           </SelectTrigger>
                           <SelectContent>
                             <SelectItem value="all">All Brands</SelectItem>
-                            {getUniqueValues("brand").map((brand) => (
+                            {uniqueBrandOptions.map((brand) => (
                               <SelectItem key={brand} value={brand}>
                                 {brand}
                               </SelectItem>
@@ -3071,7 +3113,7 @@ export default function AssetsPage() {
                           </SelectTrigger>
                           <SelectContent>
                             <SelectItem value="all">All Categories</SelectItem>
-                            {getUniqueValues("category").map((category) => (
+                            {uniqueCategoryOptions.map((category) => (
                               <SelectItem key={category} value={category}>
                                 {category}
                               </SelectItem>
@@ -3089,7 +3131,7 @@ export default function AssetsPage() {
                           </SelectTrigger>
                           <SelectContent>
                             <SelectItem value="all">All Systems</SelectItem>
-                            {getUniqueValues("system").map((system) => (
+                            {uniqueSystemOptions.map((system) => (
                               <SelectItem key={system} value={system}>
                                 {system}
                               </SelectItem>
@@ -3102,7 +3144,18 @@ export default function AssetsPage() {
                     {/* Results count and clear filters */}
                     <div className="flex items-center justify-between text-xs text-muted-foreground">
                       <span>
-                        Showing {filteredAssets.length} of {existingAssets.length} assets
+                        Showing{" "}
+                        {filteredAssets.length === 0
+                          ? 0
+                          : `${assetsPage * ASSETS_PAGE_SIZE + 1}-${Math.min(
+                              (assetsPage + 1) * ASSETS_PAGE_SIZE,
+                              filteredAssets.length,
+                            )}`}{" "}
+                        of {filteredAssets.length} filtered
+                        {existingAssets.length !== filteredAssets.length
+                          ? ` (${existingAssets.length} total)`
+                          : ""}{" "}
+                        assets
                       </span>
                       {(searchTerm || filterBrand !== "all" || filterCategory !== "all" || filterSystem !== "all") && (
                         <Button
@@ -3194,6 +3247,7 @@ export default function AssetsPage() {
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Brand</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">System</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Category</TableHead>
+                              <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Device Address</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Part Number</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Description</TableHead>
                               <TableHead className="px-2 py-1.5 text-right w-10">
@@ -3206,14 +3260,14 @@ export default function AssetsPage() {
                       <TableBody>
                         {filteredAssets.length === 0 ? (
                           <TableRow>
-                            <TableCell colSpan={isBuildingAsset ? 9 : 8} className="text-center py-8 text-muted-foreground">
+                            <TableCell colSpan={isBuildingAsset ? 9 : 9} className="text-center py-8 text-muted-foreground">
                               No assets found matching your filters
                             </TableCell>
                           </TableRow>
                         ) : (
-                          filteredAssets.map((asset) => {
+                          pagedAssets.map((asset) => {
                             const rowKey = getAssetRowKey(asset)
-                            const isSelected = selectedAssetKeys.includes(rowKey)
+                            const isSelected = selectedAssetKeySet.has(rowKey)
                             return (
                             <TableRow
                               key={rowKey}
@@ -3389,6 +3443,12 @@ export default function AssetsPage() {
                                   <TableCell className="px-2 py-1.5 max-w-[120px] truncate" title={asset.category || ""}>
                                     {asset.category || "-"}
                                   </TableCell>
+                                  <TableCell
+                                    className="px-2 py-1.5 max-w-[140px] truncate font-mono"
+                                    title={resolveAssetDeviceAddress(asset) || asset.deviceAddress || ""}
+                                  >
+                                    {resolveAssetDeviceAddress(asset) || asset.deviceAddress || "-"}
+                                  </TableCell>
                                   <TableCell className="px-2 py-1.5 max-w-[140px] truncate" title={asset.partNumber || ""}>
                                     {asset.partNumber || "-"}
                                   </TableCell>
@@ -3522,6 +3582,38 @@ export default function AssetsPage() {
                       </TableBody>
                     </Table>
                   </div>
+
+                  {filteredAssets.length > ASSETS_PAGE_SIZE ? (
+                    <div className="mt-3 flex items-center justify-between gap-2">
+                      <p className="text-[11px] text-muted-foreground">
+                        Page {assetsPage + 1} of {totalAssetPages}
+                      </p>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          disabled={assetsPage <= 0}
+                          onClick={() => setAssetsPage((page) => Math.max(0, page - 1))}
+                        >
+                          Previous
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          disabled={assetsPage >= totalAssetPages - 1}
+                          onClick={() =>
+                            setAssetsPage((page) => Math.min(totalAssetPages - 1, page + 1))
+                          }
+                        >
+                          Next
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
 
                   <Dialog
                     open={editAssetDialog.open}

@@ -51,6 +51,7 @@ export function FirePanelAckButtons() {
   const { toast } = useToast();
   const [loadingLabel, setLoadingLabel] = useState(null);
 
+  // Returns true when ack was sent successfully.
   const handleAck = async (label, title) => {
     if (!connected) {
       toast({
@@ -58,7 +59,7 @@ export function FirePanelAckButtons() {
         description: "Connect to the fire panel before sending acknowledge commands.",
         variant: "destructive",
       });
-      return;
+      return false;
     }
 
     setLoadingLabel(label);
@@ -68,12 +69,14 @@ export function FirePanelAckButtons() {
         title: `${title} sent`,
         description: "Acknowledge command sent to the fire panel.",
       });
+      return true;
     } catch (error) {
       toast({
         title: `${title} failed`,
         description: error?.message || "Could not send acknowledge command.",
         variant: "destructive",
       });
+      return false;
     } finally {
       setLoadingLabel(null);
     }
@@ -81,6 +84,8 @@ export function FirePanelAckButtons() {
 
   const handleButtonClick = (label, title) => {
     const route = LIVE_PANEL_ROUTE_BY_LABEL[label];
+
+    // Already on this category's live list page → just acknowledge.
     if (route && pathname === route) {
       if (label === "Trouble") {
         silenceTroubleAlertBeep();
@@ -91,6 +96,21 @@ export function FirePanelAckButtons() {
       void handleAck(label, title);
       return;
     }
+
+    // Trouble Ack only: send `ack t` first, then open live-trouble.
+    // Navigating first would mount the page and run `list t` before `ack t`.
+    if (label === "Trouble" && route) {
+      silenceTroubleAlertBeep();
+      void (async () => {
+        const ok = await handleAck(label, title);
+        if (ok) {
+          router.push(route);
+        }
+      })();
+      return;
+    }
+
+    // Fire / Supervisory: open the live list page (unchanged).
     if (route) {
       router.push(route);
       return;
@@ -120,7 +140,9 @@ export function FirePanelAckButtons() {
             title={
               onLivePage
                 ? `${title} on this page`
-                : `Open ${title.replace(" Ack", "")} list page`
+                : label === "Trouble"
+                  ? "Send ack t, then open Live Trouble"
+                  : `Open ${title.replace(" Ack", "")} list page`
             }
             onClick={() => handleButtonClick(label, title)}
           >

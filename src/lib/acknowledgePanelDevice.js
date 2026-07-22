@@ -61,6 +61,7 @@ export async function acknowledgeCategory(label) {
   }
 
   const cmd = buildPanelAckCommand(label);
+  console.log("cmd", cmd);
   return withMonitorPausedForPriority(() =>
     sendPriorityPanelCommand(cmd, 5000),
   );
