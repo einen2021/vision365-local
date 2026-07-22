@@ -1594,13 +1594,19 @@ class FirestoreService {
     return mergeNestedAssetMappings(mappings, fromAssetsList);
   }
 
-  static async _deleteMatchingNestedMappingDocs(mappingsRef, asset) {
+  static async _deleteMatchingNestedMappingDocs(mappingsRef, assetOrAssets) {
+    // Accept one asset or a list so bulk delete can clean many markers in one pass.
+    const assets = Array.isArray(assetOrAssets)
+      ? assetOrAssets.filter(Boolean)
+      : [assetOrAssets].filter(Boolean);
+    if (assets.length === 0) return 0;
+
     const snap = await getDocs(mappingsRef);
     const deleteOps = [];
 
     snap.forEach((docSnap) => {
       const mapping = { ...docSnap.data(), id: docSnap.data().id || docSnap.id };
-      if (pickerAssetMatchesMapping(asset, mapping)) {
+      if (assets.some((asset) => pickerAssetMatchesMapping(asset, mapping))) {
         deleteOps.push(deleteDoc(docSnap.ref));
       }
     });
@@ -1610,6 +1616,190 @@ class FirestoreService {
     }
 
     return deleteOps.length;
+  }
+
+  /**
+   * Build a match object used by pickerAssetMatchesMapping for floor-plan cleanup.
+   * Upload Assets (AssetsList) use general mode; building copies use building mode.
+   */
+  static _toFloorPlanMatchAsset(asset = {}) {
+    const isBuildingAsset =
+      asset.assetMode === "building" ||
+      Boolean(asset.buildingAssetId) ||
+      Boolean(asset.categoryKey);
+
+    if (isBuildingAsset) {
+      return {
+        assetMode: "building",
+        id: asset.id,
+        category: asset.category || asset.categoryKey || "",
+        buildingAssetId: asset.buildingAssetId || asset.id,
+      };
+    }
+
+    return {
+      assetMode: "general",
+      assetsListId: asset.assetsListId || asset.id,
+      id: asset.id,
+    };
+  }
+
+  /**
+   * Collect building short names to scan when removing deleted assets from floor plans.
+   * Uses hints on the assets, optional caller list, communities, and collection ids.
+   */
+  static async _resolveBuildingsForAssetCleanup(assets = [], extraBuildingNames = []) {
+    const names = new Set();
+
+    const addName = (value) => {
+      if (!value) return;
+      const short = String(value)
+        .trim()
+        .replace(/BuildingDB$/i, "");
+      if (short) names.add(short);
+    };
+
+    (extraBuildingNames || []).forEach(addName);
+
+    (assets || []).forEach((asset) => {
+      addName(asset?.building);
+      addName(asset?.buildingName);
+    });
+
+    // Communities always know which buildings exist in this local app.
+    try {
+      const communitiesSnap = await getDocs(collection(db, "communities"));
+      communitiesSnap.forEach((docSnap) => {
+        const buildings = docSnap.data()?.buildings || [];
+        buildings.forEach(addName);
+      });
+    } catch (error) {
+      console.warn("Could not load communities for floor-plan cleanup:", error);
+    }
+
+    try {
+      const ids = await this._safeListCollectionIds();
+      (ids || []).forEach((id) => {
+        if (String(id).endsWith("BuildingDB") || id === "areej5") {
+          addName(id);
+        }
+      });
+    } catch {
+      // Client mock may not support listCollections — communities/extra names are enough.
+    }
+
+    return Array.from(names);
+  }
+
+  /**
+   * Delete matching assetMappings under one building (nested + legacy flat plans).
+   */
+  static async _removeMatchingMappingsFromBuilding(buildingName, matchAssets = []) {
+    if (!buildingName || matchAssets.length === 0) return 0;
+
+    let removedCount = 0;
+    const coll = buildingCollectionName(buildingName);
+
+    try {
+      const floors = await this.getNestedFloors(buildingName);
+
+      for (const floor of floors) {
+        // Legacy flat mapping path: floorMaps/floors/{floorId}/assetMappings
+        const legacyMappingsRef = collection(
+          db,
+          coll,
+          "floorMaps",
+          "floors",
+          floor.id,
+          "assetMappings",
+        );
+        removedCount += await this._deleteMatchingNestedMappingDocs(
+          legacyMappingsRef,
+          matchAssets,
+        );
+
+        const sections = await this.getNestedSections(buildingName, floor.id);
+        for (const section of sections) {
+          const sectionMappingsRef = collection(
+            db,
+            coll,
+            "floorMaps",
+            "floors",
+            floor.id,
+            "sections",
+            section.id,
+            "assetMappings",
+          );
+          removedCount += await this._deleteMatchingNestedMappingDocs(
+            sectionMappingsRef,
+            matchAssets,
+          );
+
+          const subsections = await this.getNestedSubsections(
+            buildingName,
+            floor.id,
+            section.id,
+          );
+          for (const subsection of subsections) {
+            const subsectionMappingsRef = collection(
+              db,
+              coll,
+              "floorMaps",
+              "floors",
+              floor.id,
+              "sections",
+              section.id,
+              "subsections",
+              subsection.id,
+              "assetMappings",
+            );
+            removedCount += await this._deleteMatchingNestedMappingDocs(
+              subsectionMappingsRef,
+              matchAssets,
+            );
+          }
+        }
+      }
+    } catch (error) {
+      console.warn(
+        `Floor-plan mapping cleanup failed for building ${buildingName}:`,
+        error,
+      );
+    }
+
+    return removedCount;
+  }
+
+  /**
+   * When Upload Assets (or building assets) are deleted, also remove their markers
+   * from every floor plan that still references them.
+   *
+   * Does NOT update/delete the source AssetsList / building asset docs — the caller
+   * is responsible for deleting those records.
+   *
+   * @param {Array<object>} assets - Asset rows being deleted
+   * @param {{ buildingNames?: string[] }} options - Optional known building names
+   * @returns {Promise<{ removedCount: number }>}
+   */
+  static async removeAssetsFromFloorPlans(assets = [], options = {}) {
+    const list = Array.isArray(assets) ? assets.filter(Boolean) : [];
+    if (list.length === 0) return { removedCount: 0 };
+
+    const matchAssets = list.map((asset) => this._toFloorPlanMatchAsset(asset));
+    const buildingNames = await this._resolveBuildingsForAssetCleanup(
+      list,
+      options.buildingNames || [],
+    );
+
+    let removedCount = 0;
+    for (const buildingName of buildingNames) {
+      removedCount += await this._removeMatchingMappingsFromBuilding(
+        buildingName,
+        matchAssets,
+      );
+    }
+
+    return { removedCount };
   }
 
   /**

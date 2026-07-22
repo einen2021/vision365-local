@@ -55,6 +55,10 @@ import { useFirePanelStore } from "@/stores/firePanelStore"
 import { apiFetch } from "@/lib/apiClient"
 import { parseSimplexFile } from "@/lib/parseSimplexFile"
 import { resolveAssetDeviceAddress, resolveSimplexDeviceAddress } from "@/lib/simplexDeviceAddress"
+import FirestoreService from "@/services/firestoreService"
+import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets"
+import { clearAssetPlacementCache } from "@/lib/assetPlacementNavigation"
+import { normalizeBuildingName } from "@/lib/buildingNames"
 
 const normalizeMatchValue = (value) => String(value || "").toLowerCase().trim()
 
@@ -1335,16 +1339,65 @@ export default function AssetsPage() {
     }
   }
 
+  // Buildings we know about from the UI — used to find floor-plan markers to remove.
+  const getKnownBuildingNames = () => {
+    const names = new Set()
+
+    communities.forEach((community) => {
+      ;(community.buildings || []).forEach((building) => {
+        const short = normalizeBuildingName(building)
+        if (short) names.add(short)
+      })
+    })
+
+    buildings.forEach((building) => {
+      const short = normalizeBuildingName(building?.id || building?.name || building)
+      if (short) names.add(short)
+    })
+
+    if (selectedBuildingName) {
+      const short = normalizeBuildingName(selectedBuildingName)
+      if (short) names.add(short)
+    }
+
+    return Array.from(names)
+  }
+
+  // Remove markers from floor plans before deleting the asset record itself.
+  const removeAssetsFromFloorPlans = async (assets) => {
+    try {
+      await FirestoreService.removeAssetsFromFloorPlans(assets, {
+        buildingNames: getKnownBuildingNames(),
+      })
+    } catch (error) {
+      // Still delete the asset even if floor-plan cleanup fails.
+      console.warn("Failed to remove asset(s) from floor plans:", error)
+    }
+  }
+
   const deleteAssetRecord = async (asset) => {
+    // 1) Clear floor-plan markers that point at this upload asset
+    await removeAssetsFromFloorPlans([asset])
+
+    // 2) Delete the AssetsList / building asset document
     const docRef = getAssetDocRef(asset)
     await deleteDoc(docRef)
+
+    // 3) Delete linked PDF files from storage
     await deleteAssetStorageFiles([asset])
+
+    // 4) Drop cached lists so viewers don't keep the deleted id
+    invalidateAssetsListSnapshotCache()
+    clearAssetPlacementCache()
   }
 
   const deleteAssetRecordsBatch = async (assets, onProgress) => {
     const BATCH_SIZE = 500
     const deletedAssets = []
     let failedCount = 0
+
+    // Clean floor plans once for the whole selection (more efficient than per-asset).
+    await removeAssetsFromFloorPlans(assets)
 
     for (let i = 0; i < assets.length; i += BATCH_SIZE) {
       const chunk = assets.slice(i, i + BATCH_SIZE)
@@ -1365,6 +1418,8 @@ export default function AssetsPage() {
 
     if (deletedAssets.length > 0) {
       await deleteAssetStorageFiles(deletedAssets)
+      invalidateAssetsListSnapshotCache()
+      clearAssetPlacementCache()
     }
 
     return { deletedAssets, failedCount }
