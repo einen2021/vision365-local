@@ -58,7 +58,6 @@ import { resolveAssetDeviceAddress, resolveSimplexDeviceAddress } from "@/lib/si
 import FirestoreService from "@/services/firestoreService"
 import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets"
 import { clearAssetPlacementCache } from "@/lib/assetPlacementNavigation"
-import { normalizeBuildingName } from "@/lib/buildingNames"
 
 const normalizeMatchValue = (value) => String(value || "").toLowerCase().trim()
 
@@ -1339,36 +1338,11 @@ export default function AssetsPage() {
     }
   }
 
-  // Buildings we know about from the UI — used to find floor-plan markers to remove.
-  const getKnownBuildingNames = () => {
-    const names = new Set()
-
-    communities.forEach((community) => {
-      ;(community.buildings || []).forEach((building) => {
-        const short = normalizeBuildingName(building)
-        if (short) names.add(short)
-      })
-    })
-
-    buildings.forEach((building) => {
-      const short = normalizeBuildingName(building?.id || building?.name || building)
-      if (short) names.add(short)
-    })
-
-    if (selectedBuildingName) {
-      const short = normalizeBuildingName(selectedBuildingName)
-      if (short) names.add(short)
-    }
-
-    return Array.from(names)
-  }
-
   // Remove markers from floor plans before deleting the asset record itself.
+  // Uses each asset's saved building/floor/section fields (fast path — no full scan).
   const removeAssetsFromFloorPlans = async (assets) => {
     try {
-      await FirestoreService.removeAssetsFromFloorPlans(assets, {
-        buildingNames: getKnownBuildingNames(),
-      })
+      await FirestoreService.removeAssetsFromFloorPlans(assets)
     } catch (error) {
       // Still delete the asset even if floor-plan cleanup fails.
       console.warn("Failed to remove asset(s) from floor plans:", error)

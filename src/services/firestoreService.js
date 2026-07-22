@@ -29,6 +29,7 @@ import {
   buildClearNestedFloorMapPositionPayload,
   buildClearAssetPlacementPayload,
   buildNestedFloorMapAssetsListUpdate,
+  getAssetsListIdFromMapping,
   pickerAssetMatchesMapping,
   getFloorMapName,
   hasFloorPosition,
@@ -1602,11 +1603,42 @@ class FirestoreService {
     if (assets.length === 0) return 0;
 
     const snap = await getDocs(mappingsRef);
+    if (snap.empty) return 0;
+
+    // Fast id set for Upload Assets (general mode) — avoids repeated matcher work.
+    const generalIds = new Set(
+      assets
+        .filter((asset) => (asset.assetMode || "general") === "general")
+        .map((asset) => String(asset.assetsListId || asset.id || "").trim())
+        .filter(Boolean),
+    );
+    const buildingAssets = assets.filter(
+      (asset) =>
+        asset.assetMode === "building" ||
+        asset.buildingAssetId ||
+        generalIds.size === 0,
+    );
+
     const deleteOps = [];
 
     snap.forEach((docSnap) => {
-      const mapping = { ...docSnap.data(), id: docSnap.data().id || docSnap.id };
-      if (assets.some((asset) => pickerAssetMatchesMapping(asset, mapping))) {
+      const data = docSnap.data() || {};
+      const mapping = { ...data, id: data.id || docSnap.id };
+
+      let matches = false;
+      if (generalIds.size > 0) {
+        const listId = getAssetsListIdFromMapping(mapping);
+        if (listId && generalIds.has(String(listId))) {
+          matches = true;
+        }
+      }
+      if (!matches && buildingAssets.length > 0) {
+        matches = buildingAssets.some((asset) =>
+          pickerAssetMatchesMapping(asset, mapping),
+        );
+      }
+
+      if (matches) {
         deleteOps.push(deleteDoc(docSnap.ref));
       }
     });
@@ -1644,55 +1676,69 @@ class FirestoreService {
     };
   }
 
-  /**
-   * Collect building short names to scan when removing deleted assets from floor plans.
-   * Uses hints on the assets, optional caller list, communities, and collection ids.
-   */
-  static async _resolveBuildingsForAssetCleanup(assets = [], extraBuildingNames = []) {
-    const names = new Set();
+  /** Short building name from an asset's placement fields. */
+  static _getAssetPlacementBuilding(asset = {}) {
+    const raw = asset.building || asset.buildingName || "";
+    const short = String(raw).trim().replace(/BuildingDB$/i, "");
+    return short || "";
+  }
 
-    const addName = (value) => {
-      if (!value) return;
-      const short = String(value)
-        .trim()
-        .replace(/BuildingDB$/i, "");
-      if (short) names.add(short);
+  /** Placement path saved on the asset when it was put on a floor plan. */
+  static _getAssetPlacementPath(asset = {}) {
+    const buildingName = this._getAssetPlacementBuilding(asset);
+    const floorId = asset.floorId || asset.floorDetails?.id || "";
+    const sectionId = asset.sectionId || asset.sectionDetails?.id || "";
+    const subsectionId = asset.subsectionId || asset.subsectionDetails?.id || "";
+    const placementLevel =
+      asset.placementLevel || (subsectionId ? "subsection" : "section");
+
+    if (!buildingName || !floorId || !sectionId) {
+      return null;
+    }
+
+    return {
+      buildingName,
+      floorId: String(floorId),
+      sectionId: String(sectionId),
+      subsectionId: String(subsectionId || ""),
+      placementLevel,
     };
+  }
 
-    (extraBuildingNames || []).forEach(addName);
+  /** Direct mappings collection for a known nested (or legacy flat) placement. */
+  static _mappingsRefForPlacementPath(path) {
+    const coll = buildingCollectionName(path.buildingName);
 
-    (assets || []).forEach((asset) => {
-      addName(asset?.building);
-      addName(asset?.buildingName);
-    });
-
-    // Communities always know which buildings exist in this local app.
-    try {
-      const communitiesSnap = await getDocs(collection(db, "communities"));
-      communitiesSnap.forEach((docSnap) => {
-        const buildings = docSnap.data()?.buildings || [];
-        buildings.forEach(addName);
-      });
-    } catch (error) {
-      console.warn("Could not load communities for floor-plan cleanup:", error);
+    if (path.placementLevel === "subsection" && path.subsectionId) {
+      return collection(
+        db,
+        coll,
+        "floorMaps",
+        "floors",
+        path.floorId,
+        "sections",
+        path.sectionId,
+        "subsections",
+        path.subsectionId,
+        "assetMappings",
+      );
     }
 
-    try {
-      const ids = await this._safeListCollectionIds();
-      (ids || []).forEach((id) => {
-        if (String(id).endsWith("BuildingDB") || id === "areej5") {
-          addName(id);
-        }
-      });
-    } catch {
-      // Client mock may not support listCollections — communities/extra names are enough.
-    }
-
-    return Array.from(names);
+    return collection(
+      db,
+      coll,
+      "floorMaps",
+      "floors",
+      path.floorId,
+      "sections",
+      path.sectionId,
+      "assetMappings",
+    );
   }
 
   /**
    * Delete matching assetMappings under one building (nested + legacy flat plans).
+   * Used only as a fallback when an asset has a building but no floor/section ids.
    */
   static async _removeMatchingMappingsFromBuilding(buildingName, matchAssets = []) {
     if (!buildingName || matchAssets.length === 0) return 0;
@@ -1703,63 +1749,78 @@ class FirestoreService {
     try {
       const floors = await this.getNestedFloors(buildingName);
 
-      for (const floor of floors) {
-        // Legacy flat mapping path: floorMaps/floors/{floorId}/assetMappings
-        const legacyMappingsRef = collection(
-          db,
-          coll,
-          "floorMaps",
-          "floors",
-          floor.id,
-          "assetMappings",
-        );
-        removedCount += await this._deleteMatchingNestedMappingDocs(
-          legacyMappingsRef,
-          matchAssets,
-        );
-
-        const sections = await this.getNestedSections(buildingName, floor.id);
-        for (const section of sections) {
-          const sectionMappingsRef = collection(
+      // Process floors in parallel for speed.
+      const floorResults = await Promise.all(
+        floors.map(async (floor) => {
+          let count = 0;
+          const legacyMappingsRef = collection(
             db,
             coll,
             "floorMaps",
             "floors",
             floor.id,
-            "sections",
-            section.id,
             "assetMappings",
           );
-          removedCount += await this._deleteMatchingNestedMappingDocs(
-            sectionMappingsRef,
+          count += await this._deleteMatchingNestedMappingDocs(
+            legacyMappingsRef,
             matchAssets,
           );
 
-          const subsections = await this.getNestedSubsections(
-            buildingName,
-            floor.id,
-            section.id,
+          const sections = await this.getNestedSections(buildingName, floor.id);
+          const sectionResults = await Promise.all(
+            sections.map(async (section) => {
+              let sectionCount = 0;
+              const sectionMappingsRef = collection(
+                db,
+                coll,
+                "floorMaps",
+                "floors",
+                floor.id,
+                "sections",
+                section.id,
+                "assetMappings",
+              );
+              sectionCount += await this._deleteMatchingNestedMappingDocs(
+                sectionMappingsRef,
+                matchAssets,
+              );
+
+              const subsections = await this.getNestedSubsections(
+                buildingName,
+                floor.id,
+                section.id,
+              );
+              const subCounts = await Promise.all(
+                subsections.map(async (subsection) => {
+                  const subsectionMappingsRef = collection(
+                    db,
+                    coll,
+                    "floorMaps",
+                    "floors",
+                    floor.id,
+                    "sections",
+                    section.id,
+                    "subsections",
+                    subsection.id,
+                    "assetMappings",
+                  );
+                  return this._deleteMatchingNestedMappingDocs(
+                    subsectionMappingsRef,
+                    matchAssets,
+                  );
+                }),
+              );
+              sectionCount += subCounts.reduce((sum, n) => sum + n, 0);
+              return sectionCount;
+            }),
           );
-          for (const subsection of subsections) {
-            const subsectionMappingsRef = collection(
-              db,
-              coll,
-              "floorMaps",
-              "floors",
-              floor.id,
-              "sections",
-              section.id,
-              "subsections",
-              subsection.id,
-              "assetMappings",
-            );
-            removedCount += await this._deleteMatchingNestedMappingDocs(
-              subsectionMappingsRef,
-              matchAssets,
-            );
-          }
-        }
-      }
+
+          count += sectionResults.reduce((sum, n) => sum + n, 0);
+          return count;
+        }),
+      );
+
+      removedCount = floorResults.reduce((sum, n) => sum + n, 0);
     } catch (error) {
       console.warn(
         `Floor-plan mapping cleanup failed for building ${buildingName}:`,
@@ -1772,32 +1833,68 @@ class FirestoreService {
 
   /**
    * When Upload Assets (or building assets) are deleted, also remove their markers
-   * from every floor plan that still references them.
+   * from floor plans.
+   *
+   * Fast path: use each asset's saved building/floor/section placement and delete
+   * only in those collections (no full building tree scan).
    *
    * Does NOT update/delete the source AssetsList / building asset docs — the caller
    * is responsible for deleting those records.
    *
    * @param {Array<object>} assets - Asset rows being deleted
-   * @param {{ buildingNames?: string[] }} options - Optional known building names
+   * @param {{ buildingNames?: string[] }} options - unused; kept for call-site compatibility
    * @returns {Promise<{ removedCount: number }>}
    */
   static async removeAssetsFromFloorPlans(assets = [], options = {}) {
     const list = Array.isArray(assets) ? assets.filter(Boolean) : [];
     if (list.length === 0) return { removedCount: 0 };
 
-    const matchAssets = list.map((asset) => this._toFloorPlanMatchAsset(asset));
-    const buildingNames = await this._resolveBuildingsForAssetCleanup(
-      list,
-      options.buildingNames || [],
+    // Group assets by exact placement path so each mappings collection is read once.
+    const byPath = new Map();
+    // Assets that only know their building (rare) — fall back to one-building scan.
+    const byBuildingOnly = new Map();
+
+    for (const asset of list) {
+      const matchAsset = this._toFloorPlanMatchAsset(asset);
+      const path = this._getAssetPlacementPath(asset);
+
+      if (path) {
+        const key = [
+          path.buildingName,
+          path.floorId,
+          path.sectionId,
+          path.subsectionId || "",
+          path.placementLevel,
+        ].join("|");
+        if (!byPath.has(key)) {
+          byPath.set(key, { path, matchAssets: [] });
+        }
+        byPath.get(key).matchAssets.push(matchAsset);
+        continue;
+      }
+
+      const buildingName = this._getAssetPlacementBuilding(asset);
+      if (buildingName) {
+        if (!byBuildingOnly.has(buildingName)) {
+          byBuildingOnly.set(buildingName, []);
+        }
+        byBuildingOnly.get(buildingName).push(matchAsset);
+      }
+      // No building / floor info → asset was never placed (or fields cleared). Skip.
+    }
+
+    const directJobs = Array.from(byPath.values()).map(async ({ path, matchAssets }) => {
+      const mappingsRef = this._mappingsRefForPlacementPath(path);
+      return this._deleteMatchingNestedMappingDocs(mappingsRef, matchAssets);
+    });
+
+    const buildingJobs = Array.from(byBuildingOnly.entries()).map(
+      ([buildingName, matchAssets]) =>
+        this._removeMatchingMappingsFromBuilding(buildingName, matchAssets),
     );
 
-    let removedCount = 0;
-    for (const buildingName of buildingNames) {
-      removedCount += await this._removeMatchingMappingsFromBuilding(
-        buildingName,
-        matchAssets,
-      );
-    }
+    const counts = await Promise.all([...directJobs, ...buildingJobs]);
+    const removedCount = counts.reduce((sum, n) => sum + n, 0);
 
     return { removedCount };
   }
