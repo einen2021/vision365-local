@@ -1859,21 +1859,55 @@ function CommunityOverviewContent() {
         asset={selectedAsset}
         selectedBuilding={selectedAsset?.targetBuilding || selectedBuildingForFloor || selectedBuilding}
         userRole={userRole}
-        onDeviceStatusChange={({ assetId, enabled }) => {
+        onDeviceStatusChange={({ assetId, enabled, deviceAddress, deviceDescription }) => {
           setCurrentFloorMap((prev) => {
             if (!prev?.assetMappings) return prev;
             return {
               ...prev,
               assetMappings: prev.assetMappings.map((mapping) =>
                 mapping.id === assetId || mapping.buildingAssetId === assetId
-                  ? { ...mapping, enabled }
+                  ? {
+                      ...mapping,
+                      ...(enabled !== undefined ? { enabled } : {}),
+                      ...(deviceAddress !== undefined
+                        ? {
+                            deviceAddress,
+                            details: mapping.details
+                              ? { ...mapping.details, deviceAddress }
+                              : mapping.details,
+                          }
+                        : {}),
+                      ...(deviceDescription !== undefined
+                        ? {
+                            deviceDescription,
+                            description: deviceDescription,
+                          }
+                        : {}),
+                    }
                   : mapping,
               ),
             };
           });
           setSelectedAsset((prev) =>
             prev && (prev.id === assetId || prev.buildingAssetId === assetId)
-              ? { ...prev, enabled }
+              ? {
+                  ...prev,
+                  ...(enabled !== undefined ? { enabled } : {}),
+                  ...(deviceAddress !== undefined
+                    ? {
+                        deviceAddress,
+                        details: prev.details
+                          ? { ...prev.details, deviceAddress }
+                          : prev.details,
+                      }
+                    : {}),
+                  ...(deviceDescription !== undefined
+                    ? {
+                        deviceDescription,
+                        description: deviceDescription,
+                      }
+                    : {}),
+                }
               : prev,
           );
         }}

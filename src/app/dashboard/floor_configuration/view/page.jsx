@@ -897,18 +897,52 @@ export default function ViewNestedFloorPlansPage() {
           asset={selectedAsset}
           userRole={effectiveRole || ""}
           selectedBuilding={selectedBuilding}
-          onDeviceStatusChange={({ assetId, enabled }) => {
+          onDeviceStatusChange={({ assetId, enabled, deviceAddress, deviceDescription }) => {
             const patchList = (list) =>
               list.map((mapping) =>
                 mapping.id === assetId || mapping.buildingAssetId === assetId
-                  ? { ...mapping, enabled }
+                  ? {
+                      ...mapping,
+                      ...(enabled !== undefined ? { enabled } : {}),
+                      ...(deviceAddress !== undefined
+                        ? {
+                            deviceAddress,
+                            details: mapping.details
+                              ? { ...mapping.details, deviceAddress }
+                              : mapping.details,
+                          }
+                        : {}),
+                      ...(deviceDescription !== undefined
+                        ? {
+                            deviceDescription,
+                            description: deviceDescription,
+                          }
+                        : {}),
+                    }
                   : mapping,
               );
             setAssetMappings(patchList);
             setSectionAssetMappings(patchList);
             setSelectedAsset((prev) =>
               prev && (prev.id === assetId || prev.buildingAssetId === assetId)
-                ? { ...prev, enabled }
+                ? {
+                    ...prev,
+                    ...(enabled !== undefined ? { enabled } : {}),
+                    ...(deviceAddress !== undefined
+                      ? {
+                          deviceAddress,
+                          details: prev.details
+                            ? { ...prev.details, deviceAddress }
+                            : prev.details,
+                        }
+                      : {}),
+                    ...(deviceDescription !== undefined
+                      ? {
+                          deviceDescription,
+                          description: deviceDescription,
+                        }
+                      : {}),
+                  }
                 : prev,
             );
           }}

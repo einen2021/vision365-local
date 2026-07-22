@@ -8,6 +8,7 @@ import { useFirePanelMonitor } from "@/contexts/AppContext"
 import { useFirePanelStore } from "@/stores/firePanelStore"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import {
   Dialog,
@@ -18,10 +19,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Loader2, Edit, MapPin, CheckCircle, XCircle, RefreshCcw } from "lucide-react"
+import { Loader2, Edit, MapPin, CheckCircle, XCircle, RefreshCcw, Hash, FileText, Save } from "lucide-react"
 import { resolveAssetsListDocId } from "@/lib/assetsListSimplexStatus"
 import { useDeviceEnabledStore } from "@/stores/deviceEnabledStore"
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
+import { useShallow } from "zustand/react/shallow"
 import {
   getPrimaryStatusTone,
   parsePanelShowResponse,
@@ -135,6 +137,8 @@ export function AssetControlModal({
   const statusRequestIdRef = useRef(0)
   const prevConnectedRef = useRef(panelConnected)
   const fetchPanelShowStatusRef = useRef(null)
+  // Keep admin edits while the modal stays open (load can otherwise overwrite with stale mapping props).
+  const savedFieldsRef = useRef({ address: null, description: null, location: null })
 
   /** Run `show <address>` and parse PRIMARY STATUS / ENABLED STATE. */
   const runPanelShow = useCallback(
@@ -246,6 +250,19 @@ export function AssetControlModal({
 
   // Stable key so parent re-renders with a new asset object do not re-trigger load.
   const assetKey = asset?.buildingAssetId || asset?.id || ""
+  const prevAssetKeyRef = useRef(assetKey)
+
+  // Drop in-session saved edits when switching to a different asset (or closing).
+  useEffect(() => {
+    if (!isOpen) {
+      prevAssetKeyRef.current = ""
+      return
+    }
+    if (prevAssetKeyRef.current !== assetKey) {
+      savedFieldsRef.current = { address: null, description: null, location: null }
+      prevAssetKeyRef.current = assetKey
+    }
+  }, [isOpen, assetKey])
 
   // Hold monitor pause for the whole time this modal is open.
   // Otherwise CVAL polling resumes between show attempts and corrupts the telnet reply.
@@ -294,10 +311,10 @@ export function AssetControlModal({
 
         const assetData = assetDoc.exists() ? assetDoc.data() : {}
 
-        // Prefer mapping address, then building DB — AssetsList fills gaps below.
+        // Prefer Firestore (building DB) over floor-mapping props — mapping can be stale after admin edits.
         let address =
-          asset.deviceAddress ||
           assetData.deviceAddress ||
+          asset.deviceAddress ||
           asset.details?.deviceAddress ||
           ""
         let description =
@@ -320,21 +337,35 @@ export function AssetControlModal({
           if (cancelled || loadId !== statusRequestIdRef.current) return
           if (listSnap.exists()) {
             const listData = listSnap.data()
-            if (!description) {
-              description = listData.deviceDescription || listData.description || ""
-            }
-            // Only use explicit deviceLocation from AssetsList — never description.
-            if (!location) {
-              location = String(listData.deviceLocation || "").trim()
-            }
-            // Without an address, `show` never runs and Current Device Status stays empty.
+            // Fill gaps only — do not overwrite fresher building-DB values with older list data.
             if (!String(address || "").trim()) {
               address =
                 listData.deviceAddress ||
                 listData.partNumber ||
                 ""
             }
+            if (!String(description || "").trim()) {
+              description =
+                listData.deviceDescription ||
+                listData.description ||
+                ""
+            }
+            // Only use explicit deviceLocation from AssetsList — never description.
+            if (!location && listData.deviceLocation) {
+              location = String(listData.deviceLocation || "").trim()
+            }
           }
+        }
+
+        // Re-apply values saved in this open session (beats any stale mapping / racey reload).
+        if (savedFieldsRef.current.address != null) {
+          address = savedFieldsRef.current.address
+        }
+        if (savedFieldsRef.current.description != null) {
+          description = savedFieldsRef.current.description
+        }
+        if (savedFieldsRef.current.location != null) {
+          location = savedFieldsRef.current.location
         }
 
         const enabledStatus = assetData.enabled !== undefined ? assetData.enabled : true
@@ -351,6 +382,7 @@ export function AssetControlModal({
           buildingAssetId: assetId,
           assetCategory: categoryKey,
           deviceAddress: address || asset.deviceAddress || "",
+          deviceDescription: description || "",
           assetsListId: assetsListId || asset.assetsListId || "",
         }
 
@@ -399,6 +431,7 @@ export function AssetControlModal({
     if (!isOpen) {
       // Invalidate any in-flight show / Firestore load.
       statusRequestIdRef.current += 1
+      savedFieldsRef.current = { address: null, description: null, location: null }
       setDeviceLocation("")
       setDeviceAddress("")
       setDeviceDescription("")
@@ -520,47 +553,150 @@ export function AssetControlModal({
     }
   }
 
-  const handleUpdateLocation = async () => {
+
+
+  /** Shared path to the building asset document currently open in this modal. */
+  const getBuildingAssetDocRef = () => {
+    const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
+    return doc(
+      db,
+      buildingNameWithSuffix,
+      "asset",
+      selectedAsset.assetCategory,
+      selectedAsset.buildingAssetId,
+    )
+  }
+
+  /**
+   * Also write to AssetsList when this asset is linked there.
+   * Address / description are often read from AssetsList as a fallback.
+   */
+  const updateLinkedAssetsList = async (fields) => {
+    const listId = selectedAsset?.assetsListId
+    if (!listId) return
+    await updateDoc(doc(db, "AssetsList", listId), {
+      ...fields,
+      updatedAt: new Date().toISOString(),
+    })
+  }
+
+  /** Save address, description, and location in one write (admin only). */
+  const handleSaveDeviceDetails = async () => {
     if (!selectedAsset || !selectedBuilding || userRole !== "admin") {
       toast({
         title: "Unauthorized",
-        description: "Only admins can update device location",
+        description: "Only admins can update device details",
         variant: "destructive",
       })
       return
     }
 
+    const nextAddress = deviceAddress.trim()
+    if (!nextAddress) {
+      toast({
+        title: "Missing Address",
+        description: "Device address cannot be empty",
+        variant: "destructive",
+      })
+      return
+    }
+
+    const nextDescription = deviceDescription.trim()
+    const nextLocation = deviceLocation.trim()
+    const previousAddress = String(selectedAsset.deviceAddress || "").trim()
+
     setIsUpdatingAsset(true)
     try {
-      const buildingNameWithSuffix = selectedBuilding + "BuildingDB"
-      const assetDocRef = doc(
-        db,
-        buildingNameWithSuffix,
-        "asset",
-        selectedAsset.assetCategory,
-        selectedAsset.buildingAssetId,
-      )
+      const now = new Date().toISOString()
+      // One Firestore write for all three editable fields.
+      await updateDoc(getBuildingAssetDocRef(), {
+        deviceAddress: nextAddress,
+        deviceDescription: nextDescription,
+        description: nextDescription,
+        deviceLocation: nextLocation,
+        updatedAt: now,
+      })
+      await updateLinkedAssetsList({
+        deviceAddress: nextAddress,
+        deviceDescription: nextDescription,
+        description: nextDescription,
+        deviceLocation: nextLocation,
+      })
 
-      await updateDoc(assetDocRef, {
-        deviceLocation: deviceLocation.trim(),
-        updatedAt: new Date().toISOString(),
+      // Remember edits so a background reload cannot restore stale mapping values.
+      savedFieldsRef.current = {
+        address: nextAddress,
+        description: nextDescription,
+        location: nextLocation,
+      }
+
+      const nextSelectedAsset = {
+        ...selectedAsset,
+        deviceAddress: nextAddress,
+        deviceDescription: nextDescription,
+        description: nextDescription,
+        deviceLocation: nextLocation,
+        details: selectedAsset.details
+          ? { ...selectedAsset.details, deviceAddress: nextAddress }
+          : selectedAsset.details,
+      }
+      setSelectedAsset(nextSelectedAsset)
+      setDeviceAddress(nextAddress)
+      setDeviceDescription(nextDescription)
+      setDeviceLocation(nextLocation)
+
+      onDeviceStatusChange?.({
+        assetId: selectedAsset.buildingAssetId,
+        deviceAddress: nextAddress,
+        deviceDescription: nextDescription,
+        enabled,
       })
 
       toast({
         title: "Success",
-        description: "Device location updated successfully",
+        description: "Device details saved successfully",
       })
+
+      // Only re-run panel show when the address actually changed.
+      if (nextAddress !== previousAddress) {
+        void fetchPanelShowStatus(nextAddress, nextSelectedAsset)
+      }
     } catch (error) {
-      console.error("Error updating device location:", error)
+      console.error("Error saving device details:", error)
       toast({
         title: "Error",
-        description: "Failed to update device location",
+        description: error.message || "Failed to save device details",
         variant: "destructive",
       })
     } finally {
       setIsUpdatingAsset(false)
     }
   }
+
+  // Resolve F/T/S the same way floor markers do (AssetsList + live panel).
+  const assetIdForStatus =
+    selectedAsset?.buildingAssetId ||
+    selectedAsset?.assetsListId ||
+    selectedAsset?.id ||
+    asset?.buildingAssetId ||
+    asset?.id ||
+    ""
+  const addressForStatus = String(deviceAddress || "").trim()
+
+  // Re-read when cache maps change so values stay live while the modal is open.
+  const simplexFTS = useAssetFireStatusStore(
+    useShallow((s) => {
+      void s.byDeviceAddress
+      void s.byAssetId
+      void s.panelLiveByAddress
+      const status = s.getSimplexStatus(assetIdForStatus, addressForStatus)
+      return {
+        F: Number(status?.F ?? 0),
+        T: Number(status?.T ?? 0),
+        S: Number(status?.S ?? 0),
+      }
+    }),
+  )
 
   if (!asset) return null
 
@@ -577,6 +713,13 @@ export function AssetControlModal({
           : statusTone === "normal"
             ? "border-green-500/40 bg-green-500/10 text-green-700 dark:text-green-300"
             : "border-muted bg-muted/40 text-muted-foreground"
+
+  // Highlight each flag when it is active (1).
+  const ftsBadgeClass = (active, activeClass) =>
+    cn(
+      "flex flex-1 flex-col items-center gap-0.5 rounded-lg border px-3 py-2",
+      active ? activeClass : "border-muted bg-muted/40 text-muted-foreground",
+    )
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -596,18 +739,34 @@ export function AssetControlModal({
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
           {userRole === "admin" ? (
             <div className="space-y-5">
-              <div className="space-y-1.5">
-                <Label className="text-sm font-semibold">Device Address</Label>
-                <p className="rounded-lg border bg-muted/40 px-3 py-2 text-sm font-mono">
-                  {deviceAddress || "Not set"}
-                </p>
+              <div className="space-y-2">
+                <Label htmlFor="deviceAddress" className="text-sm font-semibold flex items-center gap-2">
+                  <Hash className="h-4 w-4" />
+                  Device Address
+                </Label>
+                <Input
+                  id="deviceAddress"
+                  value={deviceAddress}
+                  onChange={(e) => setDeviceAddress(e.target.value)}
+                  placeholder="Enter device address (e.g. M1-2-0)"
+                  disabled={isUpdatingAsset}
+                  className="font-mono"
+                />
               </div>
 
-              <div className="space-y-1.5">
-                <Label className="text-sm font-semibold">Device Description</Label>
-                <p className="rounded-lg border bg-muted/40 px-3 py-2 text-sm">
-                  {deviceDescription || "No description available"}
-                </p>
+              <div className="space-y-2">
+                <Label htmlFor="deviceDescription" className="text-sm font-semibold flex items-center gap-2">
+                  <FileText className="h-4 w-4" />
+                  Device Description
+                </Label>
+                <Textarea
+                  id="deviceDescription"
+                  value={deviceDescription}
+                  onChange={(e) => setDeviceDescription(e.target.value)}
+                  placeholder="Enter device description"
+                  disabled={isUpdatingAsset}
+                  rows={3}
+                />
               </div>
 
               <div className="space-y-1.5">
@@ -643,6 +802,52 @@ export function AssetControlModal({
                     Panel ENABLED STATE: {enabledState}
                   </p>
                 ) : null}
+              </div>
+
+              {/* Asset simplex flags from AssetsList / live panel monitor */}
+              <div className="space-y-1.5">
+                <Label className="text-sm font-semibold">Asset Status (F / T / S)</Label>
+                <div className="flex gap-2">
+                  <div
+                    className={ftsBadgeClass(
+                      Number(simplexFTS.F) === 1,
+                      "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300",
+                    )}
+                  >
+                    <span className="text-[11px] font-semibold uppercase tracking-wide opacity-80">
+                      F
+                    </span>
+                    <span className="font-mono text-lg font-semibold tabular-nums leading-none">
+                      {Number(simplexFTS.F) || 0}
+                    </span>
+                  </div>
+                  <div
+                    className={ftsBadgeClass(
+                      Number(simplexFTS.T) === 1,
+                      "border-yellow-500/40 bg-yellow-500/10 text-yellow-700 dark:text-yellow-300",
+                    )}
+                  >
+                    <span className="text-[11px] font-semibold uppercase tracking-wide opacity-80">
+                      T
+                    </span>
+                    <span className="font-mono text-lg font-semibold tabular-nums leading-none">
+                      {Number(simplexFTS.T) || 0}
+                    </span>
+                  </div>
+                  <div
+                    className={ftsBadgeClass(
+                      Number(simplexFTS.S) === 1,
+                      "border-purple-500/40 bg-purple-500/10 text-purple-700 dark:text-purple-300",
+                    )}
+                  >
+                    <span className="text-[11px] font-semibold uppercase tracking-wide opacity-80">
+                      S
+                    </span>
+                    <span className="font-mono text-lg font-semibold tabular-nums leading-none">
+                      {Number(simplexFTS.S) || 0}
+                    </span>
+                  </div>
+                </div>
               </div>
 
               <div className="space-y-2">
@@ -706,23 +911,6 @@ export function AssetControlModal({
                   placeholder="Enter device location"
                   disabled={isUpdatingAsset}
                 />
-                <Button
-                  onClick={handleUpdateLocation}
-                  disabled={isUpdatingAsset}
-                  className="w-full"
-                >
-                  {isUpdatingAsset ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Updating...
-                    </>
-                  ) : (
-                    <>
-                      <MapPin className="mr-2 h-4 w-4" />
-                      Update Location
-                    </>
-                  )}
-                </Button>
               </div>
             </div>
           ) : (
@@ -736,9 +924,27 @@ export function AssetControlModal({
         </div>
 
         <DialogFooter className="shrink-0 border-t px-6 py-4">
-          <Button variant="outline" onClick={onClose}>
+          <Button variant="outline" onClick={onClose} disabled={isUpdatingAsset}>
             Close
           </Button>
+          {userRole === "admin" ? (
+            <Button
+              onClick={handleSaveDeviceDetails}
+              disabled={isUpdatingAsset || !deviceAddress.trim()}
+            >
+              {isUpdatingAsset ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Saving...
+                </>
+              ) : (
+                <>
+                  <Save className="mr-2 h-4 w-4" />
+                  Save
+                </>
+              )}
+            </Button>
+          ) : null}
         </DialogFooter>
       </DialogContent>
     </Dialog>
