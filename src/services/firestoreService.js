@@ -1,7 +1,6 @@
 import { db, storage } from "@/config/firebase";
 import {
   collection,
-  collectionGroup,
   doc,
   getDoc,
   getDocs,
@@ -24,6 +23,11 @@ import {
 } from "firebase/storage";
 import { uploadFloorPlanImage, uploadNestedPlanImage } from "@/lib/floorPlanStorage";
 import { sanitizeFloorPlanId, buildingCollectionName } from "@/lib/nestedFloorPlan";
+import {
+  getAddressFloorDetailsIndex,
+  resolveFloorDetailsFromCache,
+  removeAssetsFromAddressFloorIndex,
+} from "@/lib/assetAddressFloorIndex";
 import {
   buildingsMatch,
   buildClearFloorMapPositionPayload,
@@ -1325,7 +1329,10 @@ class FirestoreService {
   static _dedupeSyncOperations(operations = []) {
     const byRef = new Map();
     operations.forEach((operation) => {
-      byRef.set(operation.ref.path, operation);
+      const key = Array.isArray(operation.ref?._path)
+        ? operation.ref._path.join("/")
+        : String(operation.ref?.path || operation.ref?.id || "");
+      byRef.set(key, operation);
     });
     return Array.from(byRef.values());
   }
@@ -1700,91 +1707,103 @@ class FirestoreService {
   }
 
   /**
-   * Delete floor-plan assetMappings docs for assets that were removed from Upload Assets.
-   * Groups by placement path so each assetMappings collection is read once (fast).
-   * Falls back to a collectionGroup query by assetsListId when placement fields are missing.
+   * Fill building/floor/section ids from the address → floor details Map (O(1) lookup).
+   * This avoids slow collectionGroup scans when AssetsList rows lack placement fields.
+   */
+  static async _enrichAssetsWithFloorIndex(assets = []) {
+    let index = null;
+    try {
+      index = await getAddressFloorDetailsIndex();
+    } catch (error) {
+      console.warn("address→floor index unavailable for delete cleanup:", error);
+    }
+
+    return assets.map((asset) => {
+      const base = this._toFloorMappingMatchAsset(asset);
+      const details = resolveFloorDetailsFromCache(
+        index,
+        base,
+        base.assetsListId || base.id || "",
+      );
+      if (!details?.floorId || !details?.sectionId) return base;
+
+      return {
+        ...base,
+        buildingName: base.buildingName || base.building || details.building || "",
+        building: base.building || details.building || "",
+        floorId: base.floorId || details.floorId || "",
+        sectionId: base.sectionId || details.sectionId || "",
+        subsectionId: base.subsectionId || details.subsectionId || "",
+        placementLevel:
+          base.placementLevel ||
+          (details.subsectionId ? "subsection" : "section"),
+        nestedPath: base.nestedPath || details.nestedPath || "",
+      };
+    });
+  }
+
+  /**
+   * Collect delete ops for one known assetMappings collection.
+   * The address → floor Map already narrowed us to this path, so a single
+   * collection read + match is enough (no global collectionGroup scan).
+   */
+  static async _collectDeleteOpsForMappingsGroup(mappingsRef, group = []) {
+    if (!group.length) return [];
+
+    const snap = await getDocs(mappingsRef);
+    const deleteOperations = [];
+
+    snap.forEach((docSnap) => {
+      const data = docSnap.data() || {};
+      const mapping = { ...data, id: data.id || docSnap.id };
+      if (!group.some((asset) => pickerAssetMatchesMapping(asset, mapping))) return;
+      deleteOperations.push({ type: "delete", ref: docSnap.ref });
+    });
+
+    return deleteOperations;
+  }
+
+  /**
+   * Delete floor-plan assetMappings docs for assets removed from Upload Assets.
+   * Uses address → floor details Map to jump straight to the correct collection.
    */
   static async _removeDeletedAssetsFromFloorMappingsInternal(assets = []) {
     if (!assets?.length) return 0;
 
-    const matchAssets = assets.map((asset) =>
-      this._toFloorMappingMatchAsset(asset),
-    );
+    const matchAssets = await this._enrichAssetsWithFloorIndex(assets);
     const byPath = new Map();
-    const withoutPath = [];
 
     matchAssets.forEach((asset) => {
       const resolved = this._resolveAssetMappingCollectionRef(asset);
-      if (!resolved) {
-        withoutPath.push(asset);
-        return;
-      }
+      // No cached/known placement → nothing to remove (skip slow global scans).
+      if (!resolved) return;
       if (!byPath.has(resolved.key)) {
         byPath.set(resolved.key, { ref: resolved.ref, assets: [] });
       }
       byPath.get(resolved.key).assets.push(asset);
     });
 
-    const deleteOperations = [];
-
-    // Fast path: use floorId/sectionId already stored on the asset.
-    await Promise.all(
-      [...byPath.values()].map(async ({ ref: mappingsRef, assets: group }) => {
-        const snap = await getDocs(mappingsRef);
-        snap.forEach((docSnap) => {
-          const data = docSnap.data() || {};
-          const mapping = { ...data, id: data.id || docSnap.id };
-          if (group.some((asset) => pickerAssetMatchesMapping(asset, mapping))) {
-            deleteOperations.push({ type: "delete", ref: docSnap.ref });
-          }
-        });
-      }),
-    );
-
-    // Fallback for AssetsList assets that have no placement fields on the doc.
-    const generalIds = [
-      ...new Set(
-        withoutPath
-          .filter((asset) => (asset.assetMode || "general") === "general")
-          .map((asset) => asset.assetsListId || asset.id)
-          .filter(Boolean)
-          .map(String),
-      ),
-    ];
-
-    if (generalIds.length > 0) {
-      try {
-        // Firestore "in" queries support up to 30 values.
-        for (let i = 0; i < generalIds.length; i += 30) {
-          const chunk = generalIds.slice(i, i + 30);
-          const snap = await getDocs(
-            query(
-              collectionGroup(db, "assetMappings"),
-              where("assetsListId", "in", chunk),
-            ),
-          );
-          snap.forEach((docSnap) => {
-            deleteOperations.push({ type: "delete", ref: docSnap.ref });
-          });
-        }
-      } catch (error) {
-        // Missing collection-group index should not block asset deletion.
-        console.warn(
-          "collectionGroup assetMappings cleanup skipped:",
-          error?.message || error,
-        );
-      }
+    if (byPath.size === 0) {
+      removeAssetsFromAddressFloorIndex(assets);
+      return 0;
     }
 
+    const groupResults = await Promise.all(
+      [...byPath.values()].map(({ ref: mappingsRef, assets: group }) =>
+        this._collectDeleteOpsForMappingsGroup(mappingsRef, group),
+      ),
+    );
+
+    const deleteOperations = groupResults.flat();
     const uniqueOperations = this._dedupeSyncOperations(deleteOperations);
     await this._commitWriteBatches(uniqueOperations);
+    removeAssetsFromAddressFloorIndex(assets);
     return uniqueOperations.length;
   }
 
   /**
    * Remove deleted upload assets from floor-plan assetMappings.
-   * Waits up to `timeoutMs` (default 5s) so the UI stays responsive; cleanup
-   * may continue in the background if it needs a little longer.
+   * Path lookup uses the address → floor Map so cleanup stays under a few seconds.
    *
    * @param {Array<object>} assets - Deleted AssetsList / building assets
    * @param {{ timeoutMs?: number }} [options]

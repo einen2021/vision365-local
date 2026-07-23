@@ -120,6 +120,25 @@ export function clearAddressFloorDetailsIndex() {
 }
 
 /**
+ * Drop deleted assets from the in-memory address → floor Map (O(keys)).
+ * Keeps Location / placement lookups accurate without a full rebuild.
+ */
+export function removeAssetsFromAddressFloorIndex(assets = []) {
+  if (!floorIndexRef?.byAddress && !floorIndexRef?.byAssetId) return;
+
+  for (const asset of assets || []) {
+    const docId = String(asset?.id || asset?.assetsListId || "").trim();
+    if (docId && floorIndexRef.byAssetId?.has(docId)) {
+      floorIndexRef.byAssetId.delete(docId);
+    }
+
+    for (const key of collectAssetAddressMatchKeys(asset || {}, docId)) {
+      floorIndexRef.byAddress?.delete(key);
+    }
+  }
+}
+
+/**
  * Pull nested floor-plan fields from an AssetsList row.
  * Returns null when the asset is not placed on a floor/section.
  */

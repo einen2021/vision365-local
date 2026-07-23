@@ -57,6 +57,7 @@ import { parseSimplexFile } from "@/lib/parseSimplexFile"
 import { resolveAssetDeviceAddress, resolveSimplexDeviceAddress } from "@/lib/simplexDeviceAddress"
 import FirestoreService from "@/services/firestoreService"
 import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets"
+import { warmAddressFloorDetailsIndex } from "@/lib/assetAddressFloorIndex"
 
 const normalizeMatchValue = (value) => String(value || "").toLowerCase().trim()
 
@@ -1315,6 +1316,10 @@ export default function AssetsPage() {
       }
 
       setExistingAssets(assets)
+      // Warm address → floor Map in the background so deletes can jump to the right assetMappings path.
+      if (!buildingName) {
+        void warmAddressFloorDetailsIndex()
+      }
     } catch (error) {
       console.error("Error fetching existing assets:", error)
       toast({
@@ -1488,7 +1493,7 @@ export default function AssetsPage() {
     }
   }
 
-  // Remove matching markers from floor-plan assetMappings (waits up to 5 seconds).
+  // Remove floor-plan markers via address→floor Map (exact collection, no global scan).
   const removeFloorMappingsForDeletedAssets = async (assets) => {
     if (!assets?.length) return
     try {
@@ -1502,12 +1507,13 @@ export default function AssetsPage() {
   }
 
   const deleteAssetRecord = async (asset) => {
-    // Clear floor-plan markers first so the map updates within ~5 seconds.
-    await removeFloorMappingsForDeletedAssets([asset])
-
+    // Mapping cleanup uses address→floor Map (fast). Run in parallel with the AssetsList delete.
+    const cleanupPromise = removeFloorMappingsForDeletedAssets([asset])
     const docRef = getAssetDocRef(asset)
-    await deleteDoc(docRef)
-    await deleteAssetStorageFiles([asset])
+    await Promise.all([
+      cleanupPromise,
+      deleteDoc(docRef).then(() => deleteAssetStorageFiles([asset])),
+    ])
     invalidateAssetsListSnapshotCache()
   }
 
@@ -1516,8 +1522,8 @@ export default function AssetsPage() {
     const deletedAssets = []
     let failedCount = 0
 
-    // One cleanup pass for the whole selection (groups by floor path for speed).
-    await removeFloorMappingsForDeletedAssets(assets)
+    // Start mapping cleanup immediately (address→floor Map → exact collection).
+    const cleanupPromise = removeFloorMappingsForDeletedAssets(assets)
 
     for (let i = 0; i < assets.length; i += BATCH_SIZE) {
       const chunk = assets.slice(i, i + BATCH_SIZE)
@@ -1537,8 +1543,13 @@ export default function AssetsPage() {
     }
 
     if (deletedAssets.length > 0) {
-      await deleteAssetStorageFiles(deletedAssets)
+      await Promise.all([
+        deleteAssetStorageFiles(deletedAssets),
+        cleanupPromise,
+      ])
       invalidateAssetsListSnapshotCache()
+    } else {
+      await cleanupPromise
     }
 
     return { deletedAssets, failedCount }
