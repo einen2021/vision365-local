@@ -57,7 +57,6 @@ import { parseSimplexFile } from "@/lib/parseSimplexFile"
 import { resolveAssetDeviceAddress, resolveSimplexDeviceAddress } from "@/lib/simplexDeviceAddress"
 import FirestoreService from "@/services/firestoreService"
 import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets"
-import { clearAssetPlacementCache } from "@/lib/assetPlacementNavigation"
 
 const normalizeMatchValue = (value) => String(value || "").toLowerCase().trim()
 
@@ -640,24 +639,137 @@ function simplexDeviceToAsset(device, assetId) {
   }
 }
 
-/** Save parsed Simplex M-devices to AssetsList (shared by panel collect + TXT import). */
+/** True when two field values should be treated as the same. */
+function simplexFieldValuesEqual(left, right) {
+  if (left === right) return true
+  if (left == null && right == null) return true
+  if (typeof left === "object" || typeof right === "object") {
+    try {
+      return JSON.stringify(left ?? null) === JSON.stringify(right ?? null)
+    } catch {
+      return false
+    }
+  }
+  return String(left) === String(right)
+}
+
+/**
+ * Build a merge payload for an existing AssetsList row.
+ * Only includes fields that changed to a new non-empty panel value.
+ * Placement, images, documents, and createdAt are left alone.
+ */
+function buildSimplexAssetUpdatePayload(existing = {}, incoming = {}) {
+  const payload = {}
+
+  // Flat fields that come from the panel export.
+  const comparableFields = [
+    "description",
+    "deviceLocation",
+    "deviceAddress",
+    "panelAddress",
+    "panel",
+    "loopNumber",
+    "deviceNumber",
+    "subAdd",
+    "pointType",
+    "deviceType",
+    "ban",
+    "model",
+    "itemType",
+    "partNumber",
+    "cval",
+    "peak",
+  ]
+
+  comparableFields.forEach((field) => {
+    if (!(field in incoming)) return
+    const nextVal = incoming[field]
+    // Do not wipe an existing value with a blank import value.
+    if (nextVal === "" || nextVal === null || nextVal === undefined) return
+    if (!simplexFieldValuesEqual(existing[field], nextVal)) {
+      payload[field] = nextVal
+    }
+  })
+
+  // Merge F/T/S/D status when any flag changed.
+  if (incoming.simplexStatus && typeof incoming.simplexStatus === "object") {
+    const prevStatus = existing.simplexStatus || {}
+    const nextStatus = incoming.simplexStatus
+    const statusChanged = ["F", "T", "S", "D"].some(
+      (key) => !simplexFieldValuesEqual(prevStatus[key], nextStatus[key]),
+    )
+    if (statusChanged) {
+      payload.simplexStatus = { ...prevStatus, ...nextStatus }
+    }
+  }
+
+  // Update technical property values that are new, keep template metadata.
+  const incomingValues = incoming.technicalProperties?.values
+  if (incomingValues && typeof incomingValues === "object") {
+    const prevProps = existing.technicalProperties || {}
+    const prevValues = prevProps.values || {}
+    const mergedValues = { ...prevValues }
+    let valuesChanged = false
+
+    Object.entries(incomingValues).forEach(([key, nextVal]) => {
+      if (nextVal === "" || nextVal === null || nextVal === undefined) return
+      if (!simplexFieldValuesEqual(prevValues[key], nextVal)) {
+        mergedValues[key] = nextVal
+        valuesChanged = true
+      }
+    })
+
+    if (valuesChanged) {
+      payload.technicalProperties = {
+        ...prevProps,
+        values: mergedValues,
+      }
+    }
+  }
+
+  if (Object.keys(payload).length === 0) return null
+
+  payload.updatedAt = new Date().toISOString()
+  if (!existing.source) payload.source = "simplex-panel"
+  return payload
+}
+
+/** Save parsed Simplex M-devices to AssetsList (shared by panel collect + TXT import).
+ * - New device address → create asset
+ * - Existing address with new field values → update asset
+ * - Existing address with no changes → skip
+ */
 async function importSimplexDevicesToAssetsList(devices, onProgress) {
   const assetsCollection = collection(db, "AssetsList")
   const existingAssetsSnapshot = await getDocs(assetsCollection)
   const existingAssetCount = existingAssetsSnapshot.size
 
-  const existingDocIds = new Set()
-  const existingDeviceAddresses = new Set()
+  // Map normalized device address → { id, data } for fast duplicate checks.
+  const existingByAddress = new Map()
 
   existingAssetsSnapshot.forEach((docSnap) => {
-    const row = docSnap.data()
-    existingDocIds.add(docSnap.id.toLowerCase())
+    const row = docSnap.data() || {}
+    const entry = { id: docSnap.id, data: row }
+
+    const idKey = String(docSnap.id || "").trim().toLowerCase()
+    if (idKey && !existingByAddress.has(idKey)) {
+      existingByAddress.set(idKey, entry)
+    }
+
     const addr = resolveAssetDeviceAddress(row)
-    if (addr) existingDeviceAddresses.add(addr.toLowerCase())
+    if (addr) {
+      const addrKey = String(addr).trim().toLowerCase()
+      if (addrKey && !existingByAddress.has(addrKey)) {
+        existingByAddress.set(addrKey, entry)
+      }
+    }
   })
 
   const newAssets = []
+  const updateAssets = []
   let skippedCount = 0
+  // Track addresses seen in this import so duplicates inside one file are skipped.
+  const seenInImport = new Set()
 
   devices.forEach((device) => {
     const address = resolveSimplexDeviceAddress({
@@ -674,14 +786,30 @@ async function importSimplexDevicesToAssetsList(devices, onProgress) {
     }
 
     const normalizedAddress = address.toLowerCase()
-    if (
-      existingDocIds.has(normalizedAddress) ||
-      existingDeviceAddresses.has(normalizedAddress)
-    ) {
+    if (seenInImport.has(normalizedAddress)) {
       skippedCount++
       return
     }
+    seenInImport.add(normalizedAddress)
 
+    const existing = existingByAddress.get(normalizedAddress)
+    if (existing) {
+      // Address already exists — update only when panel fields have new values.
+      const candidate = simplexDeviceToAsset(device, existing.data.assetId || existing.id)
+      const updatePayload = buildSimplexAssetUpdatePayload(existing.data, candidate)
+      if (!updatePayload) {
+        skippedCount++
+        return
+      }
+      updateAssets.push({
+        id: existing.id,
+        data: updatePayload,
+        merge: true,
+      })
+      return
+    }
+
+    // Brand-new address — create a new AssetsList document.
     const assetId = generateAssetId(
       SIMPLEX_COLLECT_BRAND,
       SIMPLEX_COLLECT_SYSTEM,
@@ -689,17 +817,22 @@ async function importSimplexDevicesToAssetsList(devices, onProgress) {
       existingAssetCount + newAssets.length + 1,
     )
 
-    existingDeviceAddresses.add(normalizedAddress)
-    existingDocIds.add(normalizedAddress)
+    existingByAddress.set(normalizedAddress, {
+      id: address,
+      data: { deviceAddress: address },
+    })
     newAssets.push({
       id: address,
       data: simplexDeviceToAsset(device, assetId),
     })
   })
 
-  if (newAssets.length === 0) {
+  const writeItems = [...newAssets, ...updateAssets]
+  if (writeItems.length === 0) {
     return {
       successCount: 0,
+      createdCount: 0,
+      updatedCount: 0,
       skippedCount,
       errorCount: 0,
       parsedCount: devices.length,
@@ -707,7 +840,8 @@ async function importSimplexDevicesToAssetsList(devices, onProgress) {
     }
   }
 
-  let successCount = 0
+  let createdCount = 0
+  let updatedCount = 0
   let errorCount = 0
   const batchSize = 25
 
@@ -728,22 +862,29 @@ async function importSimplexDevicesToAssetsList(devices, onProgress) {
     return false
   }
 
-  for (let i = 0; i < newAssets.length; i += batchSize) {
-    const batch = newAssets.slice(i, i + batchSize)
+  for (let i = 0; i < writeItems.length; i += batchSize) {
+    const batch = writeItems.slice(i, i + batchSize)
     const saved = await saveBatchWithRetry(batch)
     if (saved) {
-      successCount += batch.length
+      batch.forEach((item) => {
+        if (item.merge) updatedCount++
+        else createdCount++
+      })
     } else {
       errorCount += batch.length
     }
     onProgress?.({
-      total: newAssets.length,
-      processed: Math.min(i + batchSize, newAssets.length),
+      total: writeItems.length,
+      processed: Math.min(i + batchSize, writeItems.length),
     })
   }
 
+  invalidateAssetsListSnapshotCache()
+
   return {
-    successCount,
+    successCount: createdCount + updatedCount,
+    createdCount,
+    updatedCount,
     skippedCount,
     errorCount,
     parsedCount: devices.length,
@@ -764,7 +905,13 @@ export default function AssetsPage() {
   const [selectedCommunityId, setSelectedCommunityId] = useState("")
   const [selectedBuildingName, setSelectedBuildingName] = useState("")
   const [uploadProgress, setUploadProgress] = useState({ total: 0, processed: 0 })
-  const [uploadSummary, setUploadSummary] = useState({ success: 0, skipped: 0, errors: 0 })
+  const [uploadSummary, setUploadSummary] = useState({
+    success: 0,
+    created: 0,
+    updated: 0,
+    skipped: 0,
+    errors: 0,
+  })
   const [sheetNames, setSheetNames] = useState([])
   const [selectedSheet, setSelectedSheet] = useState("")
   const [workbook, setWorkbook] = useState(null)
@@ -1316,6 +1463,9 @@ export default function AssetsPage() {
     setSelectedAssetKeys((prev) => [...new Set([...prev, ...filteredKeys])])
   }
 
+  // Floor-plan markers should disappear quickly after an upload-asset delete.
+  const FLOOR_MAPPING_CLEANUP_MS = 5000
+
   const deleteAssetStorageFiles = async (assets) => {
     const storagePaths = assets.flatMap((asset) =>
       Object.values(DOC_TYPE_DEFS)
@@ -1338,31 +1488,27 @@ export default function AssetsPage() {
     }
   }
 
-  // Remove markers from floor plans before deleting the asset record itself.
-  // Uses each asset's saved building/floor/section fields (fast path — no full scan).
-  const removeAssetsFromFloorPlans = async (assets) => {
+  // Remove matching markers from floor-plan assetMappings (waits up to 5 seconds).
+  const removeFloorMappingsForDeletedAssets = async (assets) => {
+    if (!assets?.length) return
     try {
-      await FirestoreService.removeAssetsFromFloorPlans(assets)
-    } catch (error) {
-      // Still delete the asset even if floor-plan cleanup fails.
-      console.warn("Failed to remove asset(s) from floor plans:", error)
+      await FirestoreService.removeDeletedAssetsFromFloorMappings(assets, {
+        timeoutMs: FLOOR_MAPPING_CLEANUP_MS,
+      })
+    } catch (err) {
+      // Asset delete should still continue even if mapping cleanup fails.
+      console.error("Failed to remove floor plan mappings for deleted assets:", err)
     }
   }
 
   const deleteAssetRecord = async (asset) => {
-    // 1) Clear floor-plan markers that point at this upload asset
-    await removeAssetsFromFloorPlans([asset])
+    // Clear floor-plan markers first so the map updates within ~5 seconds.
+    await removeFloorMappingsForDeletedAssets([asset])
 
-    // 2) Delete the AssetsList / building asset document
     const docRef = getAssetDocRef(asset)
     await deleteDoc(docRef)
-
-    // 3) Delete linked PDF files from storage
     await deleteAssetStorageFiles([asset])
-
-    // 4) Drop cached lists so viewers don't keep the deleted id
     invalidateAssetsListSnapshotCache()
-    clearAssetPlacementCache()
   }
 
   const deleteAssetRecordsBatch = async (assets, onProgress) => {
@@ -1370,8 +1516,8 @@ export default function AssetsPage() {
     const deletedAssets = []
     let failedCount = 0
 
-    // Clean floor plans once for the whole selection (more efficient than per-asset).
-    await removeAssetsFromFloorPlans(assets)
+    // One cleanup pass for the whole selection (groups by floor path for speed).
+    await removeFloorMappingsForDeletedAssets(assets)
 
     for (let i = 0; i < assets.length; i += BATCH_SIZE) {
       const chunk = assets.slice(i, i + BATCH_SIZE)
@@ -1393,7 +1539,6 @@ export default function AssetsPage() {
     if (deletedAssets.length > 0) {
       await deleteAssetStorageFiles(deletedAssets)
       invalidateAssetsListSnapshotCache()
-      clearAssetPlacementCache()
     }
 
     return { deletedAssets, failedCount }
@@ -2144,7 +2289,13 @@ export default function AssetsPage() {
         setUploadProgress({ total: newAssets.length, processed: Math.min(i + batchSize, newAssets.length) })
       }
 
-      setUploadSummary({ success: successCount, skipped: skippedCount, errors: errorCount })
+      setUploadSummary({
+        success: successCount,
+        created: successCount,
+        updated: 0,
+        skipped: skippedCount,
+        errors: errorCount,
+      })
       setUploadSuccess(true)
       const message = `Successfully uploaded ${successCount} new assets from sheet "${selectedSheet}"${skippedCount > 0 ? `, skipped ${skippedCount} duplicates` : ""}${errorCount > 0 ? ` (${errorCount} errors)` : ""}.`
       toast({
@@ -2164,7 +2315,7 @@ export default function AssetsPage() {
           setSelectedSheet("")
           setWorkbook(null)
           setAssetImages({}) // Clear uploaded images
-          setUploadSummary({ success: 0, skipped: 0, errors: 0 })
+          setUploadSummary({ success: 0, created: 0, updated: 0, skipped: 0, errors: 0 })
           
           // Refresh existing assets list
           fetchExistingAssets()
@@ -2258,8 +2409,8 @@ export default function AssetsPage() {
 
     if (result.empty) {
       toast({
-        title: "No new assets",
-        description: `Parsed ${result.parsedCount} devices but all were skipped (duplicates or missing address).`,
+        title: "No changes",
+        description: `Parsed ${result.parsedCount} devices but none were new or changed (unchanged duplicates or missing address).`,
       })
       setIsLoading(false)
       setUploadProgress({ total: 0, processed: 0 })
@@ -2268,6 +2419,8 @@ export default function AssetsPage() {
 
     setUploadSummary({
       success: result.successCount,
+      created: result.createdCount || 0,
+      updated: result.updatedCount || 0,
       skipped: result.skippedCount,
       errors: result.errorCount,
     })
@@ -2281,9 +2434,15 @@ export default function AssetsPage() {
           ? "pasted text"
           : simplexTxtFileName || "TXT file"
 
+    const parts = []
+    if (result.createdCount > 0) parts.push(`added ${result.createdCount}`)
+    if (result.updatedCount > 0) parts.push(`updated ${result.updatedCount}`)
+    if (result.skippedCount > 0) parts.push(`skipped ${result.skippedCount} unchanged`)
+    if (result.errorCount > 0) parts.push(`${result.errorCount} errors`)
+
     toast({
       title: "Import complete",
-      description: `Added ${result.successCount} assets from ${sourceName}${result.skippedCount > 0 ? `, skipped ${result.skippedCount}` : ""}${result.errorCount > 0 ? ` (${result.errorCount} errors)` : ""}.`,
+      description: `Import from ${sourceName}: ${parts.join(", ") || "done"}.`,
     })
 
     setIsLoading(false)
@@ -2408,7 +2567,7 @@ export default function AssetsPage() {
 
       await addDoc(assetsCollection, payload)
 
-      setUploadSummary({ success: 1, skipped: 0, errors: 0 })
+      setUploadSummary({ success: 1, created: 1, updated: 0, skipped: 0, errors: 0 })
       setUploadSuccess(true)
       resetSingleAssetForm()
       fetchExistingAssets()
@@ -2522,7 +2681,8 @@ export default function AssetsPage() {
                       <DialogTitle>Paste Simplex panel export</DialogTitle>
                       <DialogDescription>
                         Paste the full output of <span className="font-mono">cshow *</span> (same format as
-                        devices.txt). M-address devices are added to AssetsList; duplicates are skipped.
+                        devices.txt). M-address devices are added to AssetsList; existing addresses are
+                        updated when field values change.
                       </DialogDescription>
                     </DialogHeader>
                     <Textarea
@@ -2882,9 +3042,25 @@ export default function AssetsPage() {
                     <AlertTitle className="text-green-600 dark:text-green-400 text-xs mb-1">Upload Complete</AlertTitle>
                     <AlertDescription className="text-green-600 dark:text-green-400">
                       <div className="space-y-0.5 text-[11px]">
-                        <p>Successfully uploaded <strong>{uploadSummary.success}</strong> new assets to AssetsList.</p>
+                        <p>
+                          Successfully processed <strong>{uploadSummary.success}</strong> assets in AssetsList.
+                        </p>
+                        {(uploadSummary.created > 0 || uploadSummary.updated > 0) && (
+                          <p className="text-[10px]">
+                            {uploadSummary.created > 0 && (
+                              <>Added <strong>{uploadSummary.created}</strong> new</>
+                            )}
+                            {uploadSummary.created > 0 && uploadSummary.updated > 0 && ", "}
+                            {uploadSummary.updated > 0 && (
+                              <>updated <strong>{uploadSummary.updated}</strong> existing</>
+                            )}
+                            .
+                          </p>
+                        )}
                         {uploadSummary.skipped > 0 && (
-                          <p className="text-[10px]">Skipped <strong>{uploadSummary.skipped}</strong> duplicate assets.</p>
+                          <p className="text-[10px]">
+                            Skipped <strong>{uploadSummary.skipped}</strong> unchanged or invalid assets.
+                          </p>
                         )}
                         {uploadSummary.errors > 0 && (
                           <p className="text-[10px] text-amber-600 dark:text-amber-400">Encountered <strong>{uploadSummary.errors}</strong> errors.</p>

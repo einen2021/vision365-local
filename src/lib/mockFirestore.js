@@ -229,21 +229,27 @@ export async function addDocsBatch(collectionRef, items) {
   return items.length;
 }
 
-/** Set many documents with explicit IDs in one request */
+/** Set many documents with explicit IDs in one request.
+ * Pass `merge: true` on an item to update fields without wiping the rest of the doc.
+ */
 export async function setDocsBatch(collectionRef, items) {
   if (!items.length) return 0;
 
   const now = new Date().toISOString();
-  const operations = items.map(({ id, data }) => ({
-    type: "set",
-    path: [...collectionRef._path, String(id)],
-    data: {
-      ...data,
-      createdAt: data.createdAt || now,
-      updatedAt: data.updatedAt || now,
-    },
-    options: {},
-  }));
+  const operations = items.map(({ id, data, merge }) => {
+    const useMerge = merge === true;
+    return {
+      type: "set",
+      path: [...collectionRef._path, String(id)],
+      data: {
+        ...data,
+        // Keep createdAt on full creates; leave it alone on merge updates.
+        ...(useMerge ? {} : { createdAt: data.createdAt || now }),
+        updatedAt: data.updatedAt || now,
+      },
+      options: useMerge ? { merge: true } : {},
+    };
+  });
 
   await apiCall({ op: "batch", operations });
   return items.length;
