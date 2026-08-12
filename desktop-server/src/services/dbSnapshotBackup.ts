@@ -1,6 +1,6 @@
 /**
- * Automatic JSON backups of the Firestore-style db_snapshot.
- * Survives Mongo wipes / empty reseeds and can restore communities + assets.
+ * Automatic JSON backups of the SQLite document store.
+ * Survives empty reseeds and can restore communities + assets into SQLite.
  */
 
 import fs from "fs";
@@ -18,6 +18,11 @@ function snapshotsDir(appDataPath = resolveAppDataPath()): string {
   const dir = path.join(paths.backups, "db-snapshots");
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** Read-only snapshot folder path — does not create directories. */
+function snapshotsDirReadOnly(appDataPath: string): string {
+  return path.join(appDataPath, "backups", "db-snapshots");
 }
 
 /** Rough “does this look like real building / asset data?” check. */
@@ -128,7 +133,7 @@ export function saveDbSnapshotBackup(
   return latestPath;
 }
 
-/** Async variant used by the write-path queue so Mongo updates stay responsive. */
+/** Async variant used by the write-path queue so SQLite updates stay responsive. */
 export async function saveDbSnapshotBackupAsync(
   data: DbRecord,
   appDataPath = resolveAppDataPath(),
@@ -197,29 +202,33 @@ export function findBestDbSnapshotBackup(
   const candidates: string[] = [];
 
   for (const root of searchRoots) {
-    const dir = snapshotsDir(root);
+    if (!fs.existsSync(root)) continue;
+
+    const dir = snapshotsDirReadOnly(root);
     const latest = path.join(dir, LATEST_NAME);
     if (fs.existsSync(latest)) candidates.push(latest);
 
     try {
-      for (const name of fs.readdirSync(dir)) {
-        if (!name.endsWith(".json")) continue;
-        const full = path.join(dir, name);
-        if (full === latest) continue;
-        candidates.push(full);
+      if (fs.existsSync(dir)) {
+        for (const name of fs.readdirSync(dir)) {
+          if (!name.endsWith(".json")) continue;
+          const full = path.join(dir, name);
+          if (full === latest) continue;
+          candidates.push(full);
+        }
       }
     } catch {
       // ignore missing dirs
     }
 
     // Also accept a manually placed recovery file in backups/.
-    const paths = initAppDirectories(root);
+    const backupsRoot = path.join(root, "backups");
     for (const name of [
       "recovered_snapshot.json",
       "db_snapshot_latest.json",
       "manual_restore.json",
     ]) {
-      const full = path.join(paths.backups, name);
+      const full = path.join(backupsRoot, name);
       if (fs.existsSync(full)) candidates.push(full);
     }
   }

@@ -1,53 +1,7 @@
-import { getCollection } from "./mongoClient";
-
-const SNAPSHOT_ID = 1;
-const COLLECTION = "db_snapshot";
-
-let dbLock = Promise.resolve();
-
-async function withLock(fn) {
-  let release;
-  const gate = new Promise((resolve) => {
-    release = resolve;
-  });
-  const prev = dbLock;
-  dbLock = gate;
-  await prev;
-  try {
-    return await fn();
-  } finally {
-    release();
-  }
-}
-
-/** Read the full document database from MongoDB */
-export async function readDb() {
-  const collection = await getCollection(COLLECTION);
-  const doc = await collection.findOne({ _id: SNAPSHOT_ID });
-  if (!doc?.data || typeof doc.data !== "object") return {};
-  return doc.data;
-}
-
-/** Write the full document database to MongoDB */
-export async function writeDb(data) {
-  const collection = await getCollection(COLLECTION);
-  const now = new Date().toISOString();
-  await collection.updateOne(
-    { _id: SNAPSHOT_ID },
-    { $set: { data, updated_at: now } },
-    { upsert: true }
-  );
-}
-
-/** One transactional read → mutate → write */
-export async function mutateDb(mutator) {
-  return withLock(async () => {
-    const snapshot = await readDb();
-    const result = await mutator(snapshot);
-    await writeDb(snapshot);
-    return result;
-  });
-}
+/**
+ * Pure in-memory document path helpers (no database connection).
+ * Desktop/server persistence lives in desktop-server SQLite documentStore.
+ */
 
 function resolveCollection(db, segments) {
   if (!segments || segments.length === 0) return null;
@@ -136,7 +90,6 @@ export function getDocument(db, segments) {
 export function setDocument(db, segments, data, merge = false) {
   const { parent, lastKey } = getParent(db, segments);
   if (merge) {
-    // Honor deleteField() / __deleteField instead of storing the marker object.
     const existing =
       parent[lastKey] && typeof parent[lastKey] === "object" && !Array.isArray(parent[lastKey])
         ? { ...parent[lastKey] }

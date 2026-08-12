@@ -1,6 +1,6 @@
 import fs from "fs";
 import { type AppPaths } from "./storageService";
-import { getCollection } from "../db/client";
+import { upsertSetting } from "../db/repos";
 
 export interface AppSettings {
   theme: "light" | "dark" | "system";
@@ -58,13 +58,7 @@ export async function saveSettings(
   const merged = { ...current, ...settings };
   fs.writeFileSync(paths.settingsFile, JSON.stringify(merged, null, 2), "utf-8");
 
-  const collection = getCollection("settings");
-  const now = new Date().toISOString();
-  await collection.updateOne(
-    { key: "app_settings" },
-    { $set: { key: "app_settings", value: JSON.stringify(merged), updated_at: now } },
-    { upsert: true }
-  );
+  upsertSetting("app_settings", JSON.stringify(merged));
 
   return merged;
 }

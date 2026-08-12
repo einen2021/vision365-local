@@ -81,6 +81,13 @@ function applyPlanMappingsToMaps(byAddress, byAssetId, plan) {
       deviceLocation: String(
         mapping.deviceLocation || mapping.details?.deviceLocation || "",
       ).trim(),
+      deviceDescription: String(
+        mapping.deviceDescription ||
+          mapping.description ||
+          mapping.details?.deviceDescription ||
+          mapping.details?.description ||
+          "",
+      ).trim(),
       placed: true,
       fromLivePlan: true,
     };
@@ -173,9 +180,55 @@ export function extractFloorDetailsFromAsset(asset = {}, docId = "") {
     subsectionName:
       asset.subsectionName || asset.subsectionDetails?.name || subsectionId || "",
     nestedPath: asset.nestedPath || "",
-    deviceLocation: String(asset.deviceLocation || "").trim(),
+    deviceLocation: String(asset.deviceLocation || asset.details?.deviceLocation || "").trim(),
+    deviceDescription: String(
+      asset.deviceDescription ||
+        asset.description ||
+        asset.details?.deviceDescription ||
+        asset.details?.description ||
+        "",
+    ).trim(),
     placed,
   };
+}
+
+/**
+ * Update an asset's location or description in the address → floor details cache in-place.
+ */
+export function updateAssetInAddressFloorIndex({
+  assetId = "",
+  deviceAddress = "",
+  deviceLocation,
+  deviceDescription,
+} = {}) {
+  if (!floorIndexRef) return;
+  const id = String(assetId || "").trim();
+  const address = String(deviceAddress || "").trim();
+
+  const updateDetailsObj = (details) => {
+    if (!details) return;
+    if (deviceLocation !== undefined) {
+      details.deviceLocation = String(deviceLocation || "").trim();
+    }
+    if (deviceDescription !== undefined) {
+      details.deviceDescription = String(deviceDescription || "").trim();
+    }
+    if (address) {
+      details.address = address;
+    }
+  };
+
+  if (id && floorIndexRef.byAssetId?.has(id)) {
+    updateDetailsObj(floorIndexRef.byAssetId.get(id));
+  }
+
+  const dummyAsset = { deviceAddress: address, id };
+  const keys = collectAssetAddressMatchKeys(dummyAsset, id);
+  for (const key of keys) {
+    if (floorIndexRef.byAddress?.has(key)) {
+      updateDetailsObj(floorIndexRef.byAddress.get(key));
+    }
+  }
 }
 
 /** Apply an optional building hint when the AssetsList row omitted building. */
@@ -300,6 +353,7 @@ export function resolveFloorDetailsFromCache(
         sectionName: fromMap.sectionName || fromRow?.sectionName || "",
         subsectionName: fromMap.subsectionName || fromRow?.subsectionName || "",
         deviceLocation: fromMap.deviceLocation || fromRow?.deviceLocation || "",
+        deviceDescription: fromMap.deviceDescription || fromRow?.deviceDescription || "",
         building: fromMap.building || fromRow?.building || "",
       }
     : fromRow;

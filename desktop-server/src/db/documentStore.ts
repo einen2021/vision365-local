@@ -1,23 +1,25 @@
 /**
- * Firestore-compatible document store backed by MongoDB db_snapshot collection.
- * Logic mirrors src/lib/serverDb.js for zero functionality loss.
+ * Document store backed by SQLite `documents` table.
+ * Each top-level key is its own row (path + JSON data).
+ * Keeps the same read/mutate/write API used by /api/db routes.
  */
 
-import { getCollection } from "./client";
+import { getSqlite, withTransaction } from "./client";
 import {
   countProductiveData,
   queueDbSnapshotBackup,
   saveDbSnapshotBackup,
 } from "../services/dbSnapshotBackup";
 
-type DbRecord = Record<string, unknown>;
+export type DbRecord = Record<string, unknown>;
 
-const SNAPSHOT_ID = 1;
-const COLLECTION = "db_snapshot";
+/** In-memory cache so repeated reads during one request stay fast. */
+let cache: DbRecord | null = null;
+let cacheRevision = -1;
 
 let dbLock: Promise<void> = Promise.resolve();
 
-async function withLock<T>(fn: () => Promise<T>): Promise<T> {
+async function withLock<T>(fn: () => Promise<T> | T): Promise<T> {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
@@ -32,23 +34,57 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-export async function readDb(): Promise<DbRecord> {
-  const collection = getCollection(COLLECTION);
-  const doc = await collection.findOne({ _id: SNAPSHOT_ID });
-  if (!doc?.data || typeof doc.data !== "object") return {};
-  return doc.data as DbRecord;
+/** Current change revision (for realtime polling). */
+export function getDbRevision(): number {
+  const row = getSqlite()
+    .prepare("SELECT value FROM meta WHERE key = ?")
+    .get("revision") as { value: string } | undefined;
+  return Number(row?.value || 0);
 }
 
-export async function writeDb(data: DbRecord): Promise<void> {
-  const collection = getCollection(COLLECTION);
-  const existing = await collection.findOne({ _id: SNAPSHOT_ID });
-  const existingData =
-    existing?.data && typeof existing.data === "object"
-      ? (existing.data as DbRecord)
-      : {};
+function bumpRevision(): number {
+  const db = getSqlite();
+  const next = getDbRevision() + 1;
+  db.prepare(
+    "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  ).run("revision", String(next));
+  return next;
+}
 
+/** Load all document rows into one object (same shape the API already expects). */
+export function readDb(): DbRecord {
+  const rev = getDbRevision();
+  if (cache && cacheRevision === rev) {
+    // Return a shallow copy so callers can mutate safely inside withDb.
+    return { ...cache };
+  }
+
+  const rows = getSqlite()
+    .prepare("SELECT path, data FROM documents")
+    .all() as { path: string; data: string }[];
+
+  const result: DbRecord = {};
+  for (const row of rows) {
+    try {
+      result[row.path] = JSON.parse(row.data);
+    } catch {
+      result[row.path] = {};
+    }
+  }
+
+  cache = result;
+  cacheRevision = rev;
+  return { ...result };
+}
+
+/**
+ * Replace document rows from a full snapshot object.
+ * Each Object.keys(data) becomes one SQLite row.
+ */
+export function writeDb(data: DbRecord): void {
+  const existing = readDb();
   const nextScore = countProductiveData(data).score;
-  const prevScore = countProductiveData(existingData).score;
+  const prevScore = countProductiveData(existing).score;
 
   // Never replace a full database with an empty seed-shaped payload.
   if (prevScore > 0 && nextScore === 0) {
@@ -56,9 +92,8 @@ export async function writeDb(data: DbRecord): Promise<void> {
       "[db] Refusing to overwrite productive database with empty snapshot " +
         `(had communities/assets/building data score=${prevScore})`,
     );
-    // Keep a backup of what we still have before abandoning the wipe.
     try {
-      saveDbSnapshotBackup(existingData);
+      saveDbSnapshotBackup(existing);
     } catch (error) {
       console.warn("[db] backup before refused wipe failed:", (error as Error).message);
     }
@@ -66,16 +101,45 @@ export async function writeDb(data: DbRecord): Promise<void> {
   }
 
   const now = new Date().toISOString();
-  await collection.updateOne(
-    { _id: SNAPSHOT_ID },
-    { $set: { data, updated_at: now } },
-    { upsert: true },
-  );
+  const nextKeys = new Set(Object.keys(data));
 
-  // Auto-backup off the request path (throttled) — do not block writes.
+  withTransaction(() => {
+    const db = getSqlite();
+    const upsert = db.prepare(
+      `INSERT INTO documents (path, data, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(path) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`,
+    );
+    const del = db.prepare("DELETE FROM documents WHERE path = ?");
+
+    // Update / insert every top-level key.
+    for (const key of nextKeys) {
+      upsert.run(key, JSON.stringify(data[key] ?? null), now);
+    }
+
+    // Remove keys that no longer exist.
+    for (const key of Object.keys(existing)) {
+      if (!nextKeys.has(key)) {
+        del.run(key);
+      }
+    }
+
+    bumpRevision();
+  });
+
+  cache = { ...data };
+  cacheRevision = getDbRevision();
+
   if (nextScore > 0) {
     queueDbSnapshotBackup(data);
   }
+}
+
+/** True when the documents table has no rows yet. */
+export function isDocumentsEmpty(): boolean {
+  const row = getSqlite()
+    .prepare("SELECT COUNT(*) AS count FROM documents")
+    .get() as { count: number };
+  return !row || row.count === 0;
 }
 
 function resolveCollection(db: DbRecord, segments: string[]): DbRecord | null {
@@ -162,11 +226,10 @@ export function setDocument(
   db: DbRecord,
   segments: string[],
   data: unknown,
-  merge = false
+  merge = false,
 ): void {
   const { parent, lastKey } = getParent(db, segments);
   if (merge) {
-    // Merge must honor deleteField() / __deleteField markers (not shallow-spread them in).
     const existing =
       parent[lastKey] && typeof parent[lastKey] === "object" && !Array.isArray(parent[lastKey])
         ? { ...(parent[lastKey] as DbRecord) }
@@ -198,7 +261,14 @@ export function listCollection(db: DbRecord, segments: string[]) {
 
 export function applyConstraints(
   docs: { id: string; data: DbRecord }[],
-  constraints: { type: string; field?: string; op?: string; value?: unknown; direction?: string; count?: number }[] = []
+  constraints: {
+    type: string;
+    field?: string;
+    op?: string;
+    value?: unknown;
+    direction?: string;
+    count?: number;
+  }[] = [],
 ) {
   let result = [...docs];
 
@@ -254,29 +324,26 @@ export function generateId(): string {
 /** Transactional read-modify-write */
 export async function withDb<T>(fn: (db: DbRecord) => T | Promise<T>): Promise<T> {
   return withLock(async () => {
-    const db = await readDb();
-    const result = await fn(db);
-    await writeDb(db);
+    const snapshot = readDb();
+    const result = await fn(snapshot);
+    writeDb(snapshot);
     return result;
   });
 }
 
 /** Read-modify-write that only persists when markDirty() was called */
 export async function withDbMutate<T>(
-  fn: (
-    db: DbRecord,
-    ctx: { markDirty: () => void }
-  ) => T | Promise<T>
+  fn: (db: DbRecord, ctx: { markDirty: () => void }) => T | Promise<T>,
 ): Promise<T> {
   return withLock(async () => {
-    const db = await readDb();
+    const snapshot = readDb();
     let dirty = false;
-    const result = await fn(db, {
+    const result = await fn(snapshot, {
       markDirty: () => {
         dirty = true;
       },
     });
-    if (dirty) await writeDb(db);
+    if (dirty) writeDb(snapshot);
     return result;
   });
 }

@@ -252,9 +252,18 @@ export function AssetPickerPanel({
                   size="sm"
                   className="h-7 w-7 shrink-0 p-0 text-destructive hover:bg-destructive/10 hover:text-destructive"
                   title="Remove marker"
-                  onClick={() => onRemovePlaced?.(mapping.id)}
+                  disabled={
+                    deletingPlacementKey ===
+                    `${mapping.assetMode || assetMode}-${mapping.buildingAssetId || mapping.assetsListId || mapping.id}`
+                  }
+                  onClick={() => onRemovePlaced?.(mapping)}
                 >
-                  <Trash2 className="h-3.5 w-3.5" />
+                  {deletingPlacementKey ===
+                  `${mapping.assetMode || assetMode}-${mapping.buildingAssetId || mapping.assetsListId || mapping.id}` ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5" />
+                  )}
                 </Button>
               </div>
             ))}

@@ -1,7 +1,15 @@
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
-import { getCollection } from "../db/client";
 import { readDb } from "../db/documentStore";
+import {
+  findUserByEmail,
+  findUserById,
+  upsertUser,
+  insertSession,
+  findValidSession,
+  deleteSessionByToken,
+  updateUserPassword,
+} from "../db/repos";
 
 const SESSION_DAYS = 30;
 const BCRYPT_ROUNDS = 12;
@@ -21,21 +29,20 @@ export interface LoginResult {
 }
 
 export async function login(email: string, password: string): Promise<LoginResult> {
-  const users = getCollection("users");
   const normalizedEmail = email.trim().toLowerCase();
 
-  let user = await users.findOne({ email: { $regex: new RegExp(`^${normalizedEmail}$`, "i") } });
+  let user = findUserByEmail(normalizedEmail);
 
   // Fallback: check UserDB in document store (plaintext, legacy)
   if (!user) {
-    const db = await readDb();
+    const db = readDb();
     const userDb = (db.UserDB || {}) as Record<
       string,
       { email?: string; password?: string; role?: string; designation?: string }
     >;
 
     const entry = Object.entries(userDb).find(
-      ([, u]) => u.email?.toLowerCase() === normalizedEmail
+      ([, u]) => u.email?.toLowerCase() === normalizedEmail,
     );
 
     if (entry) {
@@ -46,8 +53,7 @@ export async function login(email: string, password: string): Promise<LoginResul
 
       const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
       const now = new Date().toISOString();
-      const doc = {
-        _id: id,
+      upsertUser({
         id,
         email: userData.email!,
         password_hash: hash,
@@ -55,9 +61,8 @@ export async function login(email: string, password: string): Promise<LoginResul
         designation: userData.designation || "",
         created_at: now,
         updated_at: now,
-      };
-      await users.replaceOne({ _id: id }, doc, { upsert: true });
-      user = doc;
+      });
+      user = findUserById(id);
     }
   }
 
@@ -65,7 +70,7 @@ export async function login(email: string, password: string): Promise<LoginResul
     return { success: false, message: "Invalid email or password" };
   }
 
-  const valid = await bcrypt.compare(password, user.password_hash as string);
+  const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) {
     return { success: false, message: "Invalid email or password" };
   }
@@ -80,11 +85,9 @@ export async function login(email: string, password: string): Promise<LoginResul
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
   const now = new Date().toISOString();
 
-  const sessions = getCollection("sessions");
-  await sessions.insertOne({
-    _id: sessionId,
+  insertSession({
     id: sessionId,
-    user_id: user.id as string,
+    user_id: user.id,
     token,
     expires_at: expiresAt,
     created_at: now,
@@ -93,57 +96,48 @@ export async function login(email: string, password: string): Promise<LoginResul
   return {
     success: true,
     user: {
-      id: user.id as string,
-      email: user.email as string,
-      role: user.role as string,
-      designation: (user.designation as string) || "",
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      designation: user.designation || "",
     },
     token,
   };
 }
 
 export async function validateSession(token: string): Promise<AuthUser | null> {
-  const sessions = getCollection("sessions");
-  const users = getCollection("users");
-  const now = new Date().toISOString();
-
-  const session = await sessions.findOne({ token, expires_at: { $gt: now } });
+  const session = findValidSession(token);
   if (!session) return null;
 
-  const user = await users.findOne({ id: session.user_id });
+  const user = findUserById(session.user_id);
   if (!user) return null;
 
   return {
-    id: user.id as string,
-    email: user.email as string,
-    role: user.role as string,
-    designation: (user.designation as string) || "",
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    designation: user.designation || "",
   };
 }
 
 export async function logout(token: string): Promise<void> {
-  const sessions = getCollection("sessions");
-  await sessions.deleteOne({ token });
+  deleteSessionByToken(token);
 }
 
 export async function changePassword(
   userId: string,
   currentPassword: string,
-  newPassword: string
+  newPassword: string,
 ): Promise<{ success: boolean; message?: string }> {
-  const users = getCollection("users");
-  const user = await users.findOne({ id: userId });
+  const user = findUserById(userId);
 
   if (!user) return { success: false, message: "User not found" };
 
-  const valid = await bcrypt.compare(currentPassword, user.password_hash as string);
+  const valid = await bcrypt.compare(currentPassword, user.password_hash);
   if (!valid) return { success: false, message: "Current password is incorrect" };
 
   const hash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
-  await users.updateOne(
-    { id: userId },
-    { $set: { password_hash: hash, updated_at: new Date().toISOString() } }
-  );
+  updateUserPassword(userId, hash);
 
   return { success: true };
 }

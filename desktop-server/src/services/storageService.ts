@@ -1,15 +1,18 @@
 import fs from "fs";
 import path from "path";
 
-/** Tauri app identifier — primary AppData folder on Windows/macOS. */
+/** Tauri app identifier — primary AppData folder (canonical write target). */
 export const DESKTOP_APP_ID = "com.vision365.desktop";
+/** Alternate spelling some installs / older builds used. */
+export const DESKTOP_APP_ID_HYPHEN = "com.vision365-desktop";
 /** Older desktop:dev folder name. */
 export const LEGACY_APP_NAME = "Vision365";
 
 export interface AppPaths {
   root: string;
   database: string;
-  mongoData: string;
+  /** Path to vision365.db (SQLite). */
+  sqliteFile: string;
   uploads: string;
   images: string;
   videos: string;
@@ -24,31 +27,54 @@ export interface AppPaths {
   logs: string;
 }
 
-function roamingOrConfigRoot(): string {
+function roamingRoot(): string {
   const home = process.env.HOME || process.env.USERPROFILE || "";
-  const platform = process.platform;
-
-  if (platform === "win32") {
+  if (process.platform === "win32") {
     return process.env.APPDATA || path.join(home, "AppData", "Roaming");
   }
-  if (platform === "darwin") {
+  if (process.platform === "darwin") {
     return path.join(home, "Library", "Application Support");
   }
   return path.join(home, ".config");
 }
 
-/** Known Vision365 AppData roots (Tauri first, then legacy). */
+/** Windows Local AppData (and Linux/macOS equivalents). */
+function localRoot(): string {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  if (process.platform === "win32") {
+    return process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+  }
+  if (process.platform === "darwin") {
+    return path.join(home, "Library", "Caches");
+  }
+  return path.join(home, ".local", "share");
+}
+
+const APP_FOLDER_NAMES = [
+  DESKTOP_APP_ID,
+  DESKTOP_APP_ID_HYPHEN,
+  LEGACY_APP_NAME,
+];
+
+/**
+ * Every known Vision365 data folder we should scan for backups / floor-plans.
+ * Includes Roaming + Local, dotted + hyphen ids, and legacy Vision365.
+ */
 export function listVision365AppDataRoots(): string[] {
-  const base = roamingOrConfigRoot();
-  const roots = [
-    path.join(base, DESKTOP_APP_ID),
-    path.join(base, LEGACY_APP_NAME),
-  ];
+  const bases = [roamingRoot(), localRoot()];
+  const roots: string[] = [];
+
+  for (const base of bases) {
+    for (const name of APP_FOLDER_NAMES) {
+      roots.push(path.join(base, name));
+    }
+  }
+
   // De-dupe while preserving order.
   return [...new Set(roots.map((p) => path.resolve(p)))];
 }
 
-function directoryLooksPopulated(dir: string): boolean {
+export function directoryLooksPopulated(dir: string): boolean {
   try {
     if (!fs.existsSync(dir)) return false;
     const entries = fs.readdirSync(dir);
@@ -58,45 +84,59 @@ function directoryLooksPopulated(dir: string): boolean {
   }
 }
 
-function mongoDataLooksPresent(root: string): boolean {
-  return directoryLooksPopulated(path.join(root, "database", "mongodb"));
+function sqliteLooksPresent(root: string): boolean {
+  const file = path.join(root, "database", "vision365.db");
+  try {
+    return fs.existsSync(file) && fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function snapshotBackupLooksPresent(root: string): boolean {
+  const latest = path.join(root, "backups", "db-snapshots", "db_snapshot_latest.json");
+  if (fs.existsSync(latest)) return true;
+  return directoryLooksPopulated(path.join(root, "backups", "db-snapshots"));
 }
 
 function floorPlansLookPresent(root: string): boolean {
   return directoryLooksPopulated(path.join(root, "floor-plans"));
 }
 
+function rootLooksLikeExistingInstall(root: string): boolean {
+  return (
+    sqliteLooksPresent(root) ||
+    snapshotBackupLooksPresent(root) ||
+    floorPlansLookPresent(root) ||
+    directoryLooksPopulated(path.join(root, "uploads")) ||
+    directoryLooksPopulated(path.join(root, "database", "mongodb"))
+  );
+}
+
 /**
- * Resolve platform-specific app data directory.
- * Prefers %APPDATA%/com.vision365.desktop when it already has data
- * (installed desktop app), otherwise creates/uses that canonical folder.
+ * Resolve platform-specific app data directory (canonical write target).
+ * Prefer Roaming com.vision365.desktop when it already has data.
  */
 export function resolveAppDataPath(customPath?: string): string {
   if (customPath) return customPath;
   if (process.env.VISION365_APP_DATA) return process.env.VISION365_APP_DATA;
 
   const roots = listVision365AppDataRoots();
-  const desktopRoot = roots[0];
-  const legacyRoot = roots[1];
+  const preferred = path.join(roamingRoot(), DESKTOP_APP_ID);
 
-  // Prefer the Tauri folder when it already has mongo or floor-plans.
-  if (
-    desktopRoot &&
-    (mongoDataLooksPresent(desktopRoot) || floorPlansLookPresent(desktopRoot))
-  ) {
-    return desktopRoot;
+  // Prefer the canonical Tauri folder when it already has data.
+  if (rootLooksLikeExistingInstall(preferred)) {
+    return preferred;
   }
 
-  // Fall back to legacy Vision365 if that is where data lives.
-  if (
-    legacyRoot &&
-    (mongoDataLooksPresent(legacyRoot) || floorPlansLookPresent(legacyRoot))
-  ) {
-    return legacyRoot;
+  // Otherwise use the first root that already has backups / floor-plans / uploads.
+  for (const root of roots) {
+    if (root && rootLooksLikeExistingInstall(root)) {
+      return root;
+    }
   }
 
-  // Default for new installs: Tauri identifier folder.
-  return desktopRoot || path.join(roamingOrConfigRoot(), DESKTOP_APP_ID);
+  return preferred;
 }
 
 /** Initialize all required app data directories */
@@ -104,7 +144,7 @@ export function initAppDirectories(appDataPath: string): AppPaths {
   const paths: AppPaths = {
     root: appDataPath,
     database: path.join(appDataPath, "database"),
-    mongoData: path.join(appDataPath, "database", "mongodb"),
+    sqliteFile: path.join(appDataPath, "database", "vision365.db"),
     uploads: path.join(appDataPath, "uploads"),
     images: path.join(appDataPath, "uploads", "images"),
     videos: path.join(appDataPath, "uploads", "videos"),
@@ -120,7 +160,8 @@ export function initAppDirectories(appDataPath: string): AppPaths {
   };
 
   for (const dir of Object.values(paths)) {
-    if (dir.endsWith(".json")) continue;
+    // Skip file paths (settings.json, vision365.db) — only create directories.
+    if (dir.endsWith(".json") || dir.endsWith(".db")) continue;
     fs.mkdirSync(dir, { recursive: true });
   }
 
@@ -130,42 +171,138 @@ export function initAppDirectories(appDataPath: string): AppPaths {
   return paths;
 }
 
-function copyDirRecursive(src: string, dest: string) {
+/**
+ * Copy files from src → dest. Missing files are always added.
+ * Existing files are left alone (no overwrite) unless overwrite=true.
+ * Returns how many files were newly copied.
+ */
+export function copyDirMerge(
+  src: string,
+  dest: string,
+  options: { overwrite?: boolean } = {},
+): number {
+  if (!fs.existsSync(src)) return 0;
   fs.mkdirSync(dest, { recursive: true });
+  let copied = 0;
+
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
     const from = path.join(src, entry.name);
     const to = path.join(dest, entry.name);
     if (entry.isDirectory()) {
-      copyDirRecursive(from, to);
+      copied += copyDirMerge(from, to, options);
     } else if (entry.isFile()) {
-      if (!fs.existsSync(to)) {
+      if (!fs.existsSync(to) || options.overwrite) {
         fs.copyFileSync(from, to);
+        copied += 1;
       }
     }
   }
+
+  return copied;
 }
 
 /**
- * If the active AppData floor-plans folder is empty, copy images from
- * %APPDATA%/com.vision365.desktop (or legacy Vision365) when present.
+ * On startup: pull floor-plans, uploads, settings, and JSON snapshot backups
+ * from every known AppData location (Roaming + Local, hyphen + dotted ids).
+ * Always merges missing files so a half-filled dest still gets the rest.
  */
-export function ensureFloorPlansFromDesktopApp(appDataPath: string): void {
-  const dest = path.join(appDataPath, "floor-plans");
-  if (directoryLooksPopulated(dest)) return;
+export function importLegacyAppDataAssets(appDataPath: string): {
+  floorPlans: number;
+  uploads: number;
+  settings: boolean;
+  snapshots: number;
+  sourcesChecked: string[];
+} {
+  const dest = initAppDirectories(appDataPath);
+  const sourcesChecked: string[] = [];
+  let floorPlans = 0;
+  let uploads = 0;
+  let settings = false;
+  let snapshots = 0;
 
   for (const root of listVision365AppDataRoots()) {
+    if (!fs.existsSync(root)) continue;
     if (path.resolve(root) === path.resolve(appDataPath)) continue;
-    const src = path.join(root, "floor-plans");
-    if (!directoryLooksPopulated(src)) continue;
-    try {
-      console.log(`[storage] Copying floor-plans from ${src} → ${dest}`);
-      copyDirRecursive(src, dest);
-      return;
-    } catch (error) {
-      console.warn(
-        `[storage] Could not copy floor-plans from ${src}: ${(error as Error).message}`,
-      );
+    sourcesChecked.push(root);
+
+    // Floor plan images / DXF / nested floor folders
+    const floorSrc = path.join(root, "floor-plans");
+    if (directoryLooksPopulated(floorSrc)) {
+      const n = copyDirMerge(floorSrc, dest.floorPlans);
+      if (n > 0) {
+        console.log(`[storage] Copied ${n} floor-plan file(s) from ${floorSrc}`);
+        floorPlans += n;
+      }
     }
+
+    // Uploaded images / videos / documents
+    const uploadsSrc = path.join(root, "uploads");
+    if (directoryLooksPopulated(uploadsSrc)) {
+      const n = copyDirMerge(uploadsSrc, dest.uploads);
+      if (n > 0) {
+        console.log(`[storage] Copied ${n} upload file(s) from ${uploadsSrc}`);
+        uploads += n;
+      }
+    }
+
+    // Settings file (only if active install has none)
+    const settingsSrc = path.join(root, "settings", "settings.json");
+    if (!fs.existsSync(dest.settingsFile) && fs.existsSync(settingsSrc)) {
+      fs.mkdirSync(dest.settings, { recursive: true });
+      fs.copyFileSync(settingsSrc, dest.settingsFile);
+      console.log(`[storage] Copied settings from ${settingsSrc}`);
+      settings = true;
+    }
+
+    // JSON DB snapshots → active backups/db-snapshots (for SQLite import)
+    const snapSrc = path.join(root, "backups", "db-snapshots");
+    const snapDest = path.join(dest.backups, "db-snapshots");
+    if (directoryLooksPopulated(snapSrc)) {
+      fs.mkdirSync(snapDest, { recursive: true });
+      const n = copyDirMerge(snapSrc, snapDest);
+      if (n > 0) {
+        console.log(`[storage] Copied ${n} DB snapshot file(s) from ${snapSrc}`);
+        snapshots += n;
+      }
+    }
+
+    // Manual recovery JSON sitting directly under backups/
+    for (const name of [
+      "recovered_snapshot.json",
+      "db_snapshot_latest.json",
+      "manual_restore.json",
+    ]) {
+      const from = path.join(root, "backups", name);
+      const to = path.join(dest.backups, name);
+      if (fs.existsSync(from) && !fs.existsSync(to)) {
+        fs.copyFileSync(from, to);
+        snapshots += 1;
+        console.log(`[storage] Copied recovery snapshot ${from}`);
+      }
+    }
+  }
+
+  if (sourcesChecked.length > 0) {
+    console.log(
+      `[storage] Legacy import scanned ${sourcesChecked.length} AppData root(s); ` +
+        `floorPlans=+${floorPlans}, uploads=+${uploads}, snapshots=+${snapshots}`,
+    );
+  }
+
+  return { floorPlans, uploads, settings, snapshots, sourcesChecked };
+}
+
+/**
+ * If the active AppData floor-plans folder is empty/missing files,
+ * copy from Roaming/Local com.vision365-desktop and other known roots.
+ */
+export function ensureFloorPlansFromDesktopApp(appDataPath: string): void {
+  const result = importLegacyAppDataAssets(appDataPath);
+  if (result.floorPlans === 0 && !directoryLooksPopulated(path.join(appDataPath, "floor-plans"))) {
+    console.warn(
+      "[storage] No floor-plans found under Roaming/Local " +
+        "com.vision365-desktop, com.vision365.desktop, or Vision365.",
+    );
   }
 }
 

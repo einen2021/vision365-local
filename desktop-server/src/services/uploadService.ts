@@ -1,7 +1,6 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { getCollection } from "../db/client";
 import {
   type AppPaths,
   safePath,
@@ -9,6 +8,7 @@ import {
   MAX_FILE_SIZE,
 } from "./storageService";
 import { generateId } from "../db/documentStore";
+import { insertFile, deleteFileByRelativePath, findFileById } from "../db/repos";
 import {
   relativePathFromLocalUrl,
   unlinkLocalAssetFile,
@@ -88,9 +88,7 @@ export async function saveUpload(
   const fileId = generateId();
   const now = new Date().toISOString();
 
-  const files = getCollection("files");
-  await files.insertOne({
-    _id: fileId,
+  insertFile({
     id: fileId,
     category,
     original_name: file.name,
@@ -115,11 +113,9 @@ export async function deleteUpload(paths: AppPaths, filePath: string): Promise<v
   unlinkLocalAssetFile(paths.root, filePath);
 
   const relative = relativePathFromLocalUrl(filePath);
-  const files = getCollection("files");
-  await files.deleteOne({ relative_path: relative });
+  deleteFileByRelativePath(relative);
 }
 
 export async function getFileMetadata(fileId: string) {
-  const files = getCollection("files");
-  return files.findOne({ id: fileId });
+  return findFileById(fileId);
 }

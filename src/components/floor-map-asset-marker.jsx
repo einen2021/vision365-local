@@ -3,7 +3,7 @@
 import { memo, useState } from "react";
 import { resolveAssetTypeFromMapping } from "@/lib/assetIcons";
 import { AssetTypeMarkerImage } from "@/components/floor-plan/asset-type-marker-image";
-import { useAssetMarkerVisualFromMapping } from "@/stores/assetFireStatusStore";
+import { useAssetMarkerVisualFromMapping, useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
 import { useIsDeviceEnabled } from "@/stores/deviceEnabledStore";
 import { resolveMappingDeviceFields } from "@/lib/floorMapAssets";
 import { DISABLED_MARKER_STYLES } from "@/lib/assetEnabledStatus";
@@ -58,7 +58,28 @@ function FloorMapAssetMarkerInner({
     live && !suppressFireEffects,
   );
   const address = resolvedAddress;
-  const location = String(deviceLocation || "").trim();
+  const locationStoreMeta = useAssetFireStatusStore((s) => {
+    const keys = [
+      resolvedAddress,
+      mapping.buildingAssetId,
+      mapping.assetsListId,
+      mapping.id,
+    ].filter(Boolean);
+    for (const key of keys) {
+      const meta = s.metaByAssetId[key];
+      if (meta?.deviceLocation !== undefined && meta?.deviceLocation !== null) {
+        return meta.deviceLocation;
+      }
+    }
+    return undefined;
+  });
+
+  const location =
+    (locationStoreMeta !== undefined && String(locationStoreMeta).trim())
+      ? String(locationStoreMeta).trim()
+      : String(deviceLocation || "").trim() ||
+        resolveMappingDeviceFields(mapping).deviceLocation ||
+        "";
 
   // Live enabled/disabled: checks deviceEnabledStore (updated by asset control)
   // then falls back to the static mapping.enabled field.
@@ -277,6 +298,10 @@ function propsAreEqual(prev, next) {
     prev.mapping.assetsListId === next.mapping.assetsListId &&
     prev.mapping.buildingAssetId === next.mapping.buildingAssetId &&
     prev.mapping.deviceAddress === next.mapping.deviceAddress &&
+    prev.mapping.deviceLocation === next.mapping.deviceLocation &&
+    prev.mapping.details?.deviceLocation === next.mapping.details?.deviceLocation &&
+    prev.mapping.deviceDescription === next.mapping.deviceDescription &&
+    prev.mapping.details?.deviceDescription === next.mapping.details?.deviceDescription &&
     prev.mapping.locationIndex === next.mapping.locationIndex &&
     prev.mapping.assetName === next.mapping.assetName &&
     prev.mapping.itemType === next.mapping.itemType &&

@@ -23,6 +23,8 @@ export function PlanImageCanvas({
   markers = [],
   navMarkers,
   assetMarkers,
+  textLabels = [],
+  imageFit = "contain",
   mode = "nav",
   onImageClick,
   onMarkerClick,
@@ -57,10 +59,12 @@ export function PlanImageCanvas({
   const resolvedAssetMarkers = (
     assetMarkers ?? (mode === "assets" ? markers : [])
   ).filter(markerHasPlacedPosition);
+  const resolvedTextLabels = Array.isArray(textLabels) ? textLabels : [];
 
   const { dims, imageLoaded, handleImageLoad } = useFloorPlanImageDimensions(
     imageRef,
     resolvedSrc,
+    imageFit,
   );
 
   useEffect(() => {
@@ -257,15 +261,33 @@ export function PlanImageCanvas({
               ref={imageRef}
               src={resolvedSrc}
               alt={alt}
-              className="block h-full w-full object-contain"
+              className="block h-full w-full"
               onLoad={handleImageLoad}
               onError={() => setImgError(true)}
               onClick={handleClick}
-              style={{ cursor: placingMarker ? "crosshair" : "default" }}
+              style={{
+                cursor: placingMarker ? "crosshair" : "default",
+                // fill = stretch overview plans; contain = keep device-plan aspect
+                objectFit: imageFit === "fill" ? "fill" : "contain",
+              }}
             />
 
             {imageLoaded ? (
               <TooltipProvider delayDuration={200}>
+                {/* TEXT labels sit under asset markers (lower z-index) */}
+                {resolvedTextLabels.map((label) => {
+                  const { left, top } = naturalToScreenCoords(label, dims);
+                  return (
+                    <div
+                      key={label.id}
+                      className="pointer-events-none absolute z-[5] max-w-[160px] -translate-x-1/2 -translate-y-1/2 truncate text-center text-[10px] font-medium leading-tight text-foreground/80 drop-shadow-[0_1px_1px_rgba(255,255,255,0.9)]"
+                      style={{ left, top }}
+                      title={label.text}
+                    >
+                      {label.text}
+                    </div>
+                  );
+                })}
                 {navMarkerStyle === "floorButton"
                   ? renderFloorButtonGrid()
                   : resolvedNavMarkers.map(renderNavMarker)}

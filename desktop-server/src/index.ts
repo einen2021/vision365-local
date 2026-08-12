@@ -1,6 +1,6 @@
 /**
  * Vision365 Local API Server
- * Offline backend for the Tauri desktop application.
+ * Offline backend for the Tauri desktop application (SQLite).
  */
 
 import fs from "fs";
@@ -8,11 +8,15 @@ import path from "path";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { connectMongo, closeDatabase } from "./db/client";
-import { startEmbeddedMongo, stopEmbeddedMongo } from "./db/embeddedMongo";
+import { connectSqlite, closeDatabase, getSqliteFilePath } from "./db/client";
 import { runMigrations } from "./db/migrate";
 import { seedIfEmpty, restoreFromBackupIfEmpty } from "./db/seed";
-import { resolveAppDataPath, initAppDirectories, ensureFloorPlansFromDesktopApp } from "./services/storageService";
+import {
+  resolveAppDataPath,
+  initAppDirectories,
+  importLegacyAppDataAssets,
+  listVision365AppDataRoots,
+} from "./services/storageService";
 import { loadSettings } from "./services/settingsService";
 import { initServerLog, serverLog, serverLogError } from "./log";
 import dbRoutes from "./routes/db";
@@ -30,19 +34,28 @@ const PORT = Number(process.env.VISION365_PORT || 47821);
 
 function writePortFile(appDataPath: string, port: number) {
   const portFile = path.join(appDataPath, "server-port.json");
-  fs.writeFileSync(portFile, JSON.stringify({ port, host: HOST, at: new Date().toISOString() }));
+  fs.writeFileSync(
+    portFile,
+    JSON.stringify({ port, host: HOST, at: new Date().toISOString() }),
+  );
 }
 
 async function main() {
   const appDataPath = resolveAppDataPath();
   const paths = initAppDirectories(appDataPath);
-  // Pull floor-plan images from com.vision365.desktop when this folder is empty.
-  ensureFloorPlansFromDesktopApp(appDataPath);
+
+  // Before DB init: copy floor-plans, uploads, settings, and JSON snapshots
+  // from Roaming/Local com.vision365-desktop (and other known AppData roots).
+  const legacy = importLegacyAppDataAssets(appDataPath);
   initServerLog(paths.logs);
 
   serverLog(`App data: ${appDataPath}`);
-  serverLog(`MongoDB data: ${paths.mongoData}`);
+  serverLog(`SQLite file: ${paths.sqliteFile}`);
   serverLog(`Floor plans: ${paths.floorPlans}`);
+  serverLog(
+    `Legacy AppData roots scanned: ${listVision365AppDataRoots().length} ` +
+      `(floorPlans=+${legacy.floorPlans}, uploads=+${legacy.uploads}, snapshots=+${legacy.snapshots})`,
+  );
   serverLog(`Seed path: ${process.env.VISION365_SEED_PATH || "(built-in defaults)"}`);
   serverLog(`Port: ${PORT}`);
   serverLog(`CWD: ${process.cwd()}`);
@@ -51,7 +64,7 @@ async function main() {
   process.env.VISION365_APP_DATA = appDataPath;
 
   try {
-    fs.mkdirSync(paths.mongoData, { recursive: true });
+    fs.mkdirSync(paths.database, { recursive: true });
     fs.accessSync(paths.database, fs.constants.W_OK);
     serverLog("Database directory is writable");
   } catch (err) {
@@ -59,28 +72,18 @@ async function main() {
     throw err;
   }
 
-  let mongoUri: string;
   try {
-    // startEmbeddedMongo recovers from exit code 62 by quarantining bad data files.
-    mongoUri = await startEmbeddedMongo(paths.mongoData);
-    serverLog(`MongoDB URI: ${mongoUri}`);
+    connectSqlite(paths.database);
+    serverLog(`SQLite connected: ${getSqliteFilePath()}`);
   } catch (err) {
-    serverLogError(`MongoDB startup failed: ${(err as Error).message}`);
+    serverLogError(`SQLite connect failed: ${(err as Error).message}`);
     throw err;
   }
 
-  try {
-    await connectMongo(mongoUri);
-    serverLog("MongoDB connected");
-  } catch (err) {
-    serverLogError(`MongoDB connect failed: ${(err as Error).message}`);
-    throw err;
-  }
-
-  await runMigrations();
+  runMigrations();
   serverLog("Migrations complete");
 
-  // Seeds / restores from JSON backups under com.vision365.desktop when mongo is empty.
+  // Seeds / restores from JSON backups under AppData when SQLite is empty.
   await seedIfEmpty(appDataPath);
   serverLog("Seed complete");
 
@@ -91,8 +94,13 @@ async function main() {
     serverLogError(`Backup restore check failed: ${(error as Error).message}`);
   }
 
-  // Floor plans may have been copied after a fresh mongo quarantine — ensure again.
-  ensureFloorPlansFromDesktopApp(appDataPath);
+  // After seed/restore: merge any remaining media from other AppData roots.
+  const afterSeed = importLegacyAppDataAssets(appDataPath);
+  if (afterSeed.floorPlans > 0 || afterSeed.uploads > 0) {
+    serverLog(
+      `Post-seed media merge: floorPlans=+${afterSeed.floorPlans}, uploads=+${afterSeed.uploads}`,
+    );
+  }
 
   loadSettings(paths);
 
@@ -103,7 +111,7 @@ async function main() {
     cors({
       origin: "*",
       allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    })
+    }),
   );
 
   app.get("/health", (c) =>
@@ -111,8 +119,9 @@ async function main() {
       status: "ok",
       appData: appDataPath,
       version: "0.1.0",
-      db: mongoUri,
-    })
+      db: getSqliteFilePath(),
+      engine: "sqlite",
+    }),
   );
 
   app.route("/api/db", dbRoutes);
@@ -136,7 +145,7 @@ async function main() {
     if (err.code === "EADDRINUSE") {
       serverLogError(
         `Port ${PORT} is already in use. Another desktop-server may still be running. ` +
-          `On Windows: netstat -ano | findstr :${PORT} then taskkill /PID <pid> /F`
+          `On Windows: netstat -ano | findstr :${PORT} then taskkill /PID <pid> /F`,
       );
       process.exit(1);
     }
@@ -147,8 +156,7 @@ async function main() {
   const shutdown = async () => {
     server.close();
     await shutdownFirePanelWorkers();
-    await closeDatabase();
-    await stopEmbeddedMongo();
+    closeDatabase();
     process.exit(0);
   };
 

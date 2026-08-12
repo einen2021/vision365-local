@@ -20,7 +20,11 @@ import {
 } from "@/components/ui/dialog"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Loader2, Edit, MapPin, CheckCircle, XCircle, RefreshCcw, Hash, FileText, Save } from "lucide-react"
+import { FirestoreService } from "@/services/firestoreService"
 import { resolveAssetsListDocId } from "@/lib/assetsListSimplexStatus"
+import { clearAllAppCaches } from "@/lib/cacheUtils"
+import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets"
+import { updateAssetInAddressFloorIndex } from "@/lib/assetAddressFloorIndex"
 import { useDeviceEnabledStore } from "@/stores/deviceEnabledStore"
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
 import { useShallow } from "zustand/react/shallow"
@@ -324,7 +328,14 @@ export function AssetControlModal({
           asset.description ||
           ""
 
-        let location = String(assetData.deviceLocation || "").trim()
+        let location = String(
+          assetData.deviceLocation ??
+          asset.deviceLocation ??
+          asset.details?.deviceLocation ??
+          asset.DeviceLocation ??
+          asset.details?.DeviceLocation ??
+          ""
+        ).trim()
 
         const assetsListId = await resolveAssetsListDocId(
           { ...asset, buildingAssetId: assetId },
@@ -580,6 +591,28 @@ export function AssetControlModal({
     })
   }
 
+  /** Clear all in-memory, store, and browser storage caches (admin only). */
+  const handleClearCache = async () => {
+    if (userRole !== "admin") return
+    setIsUpdatingAsset(true)
+    try {
+      await clearAllAppCaches()
+      toast({
+        title: "Cache Cleared",
+        description: "All in-memory, floor index, and status caches cleared successfully",
+      })
+    } catch (error) {
+      console.error("Error clearing cache:", error)
+      toast({
+        title: "Error",
+        description: "Failed to clear application caches",
+        variant: "destructive",
+      })
+    } finally {
+      setIsUpdatingAsset(false)
+    }
+  }
+
   /** Save address, description, and location in one write (admin only). */
   const handleSaveDeviceDetails = async () => {
     if (!selectedAsset || !selectedBuilding || userRole !== "admin") {
@@ -637,7 +670,13 @@ export function AssetControlModal({
         description: nextDescription,
         deviceLocation: nextLocation,
         details: selectedAsset.details
-          ? { ...selectedAsset.details, deviceAddress: nextAddress }
+          ? {
+              ...selectedAsset.details,
+              deviceAddress: nextAddress,
+              deviceDescription: nextDescription,
+              description: nextDescription,
+              deviceLocation: nextLocation,
+            }
           : selectedAsset.details,
       }
       setSelectedAsset(nextSelectedAsset)
@@ -645,10 +684,33 @@ export function AssetControlModal({
       setDeviceDescription(nextDescription)
       setDeviceLocation(nextLocation)
 
-      onDeviceStatusChange?.({
-        assetId: selectedAsset.buildingAssetId,
+      // Invalidate AssetsList snapshot cache and update in-memory floor index + fire status meta
+      invalidateAssetsListSnapshotCache()
+      const targetAssetId = selectedAsset.buildingAssetId || selectedAsset.id || selectedAsset.assetsListId
+      updateAssetInAddressFloorIndex({
+        assetId: targetAssetId,
+        deviceAddress: nextAddress,
+        deviceLocation: nextLocation,
+        deviceDescription: nextDescription,
+      })
+      useAssetFireStatusStore.getState().updateAssetMeta({
+        assetId: targetAssetId,
+        deviceAddress: nextAddress,
+        deviceLocation: nextLocation,
+      })
+      void useAssetFireStatusStore.getState().syncFromAssetsList()
+      void FirestoreService.updateAssetMappingInFirestore(selectedBuilding, {
+        ...selectedAsset,
         deviceAddress: nextAddress,
         deviceDescription: nextDescription,
+        deviceLocation: nextLocation,
+      })
+
+      onDeviceStatusChange?.({
+        assetId: targetAssetId,
+        deviceAddress: nextAddress,
+        deviceDescription: nextDescription,
+        deviceLocation: nextLocation,
         enabled,
       })
 
@@ -923,28 +985,45 @@ export function AssetControlModal({
           )}
         </div>
 
-        <DialogFooter className="shrink-0 border-t px-6 py-4">
-          <Button variant="outline" onClick={onClose} disabled={isUpdatingAsset}>
-            Close
-          </Button>
-          {userRole === "admin" ? (
-            <Button
-              onClick={handleSaveDeviceDetails}
-              disabled={isUpdatingAsset || !deviceAddress.trim()}
-            >
-              {isUpdatingAsset ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save className="mr-2 h-4 w-4" />
-                  Save
-                </>
-              )}
+        <DialogFooter className="shrink-0 border-t px-6 py-4 flex flex-row items-center justify-between sm:justify-between">
+          <div>
+            {userRole === "admin" ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleClearCache}
+                disabled={isUpdatingAsset}
+                className="text-xs text-muted-foreground hover:text-foreground border-dashed"
+                title="Clear all in-memory, floor index, and store caches"
+              >
+                <RefreshCcw className="mr-1.5 h-3.5 w-3.5" />
+                Clear Cache
+              </Button>
+            ) : null}
+          </div>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={onClose} disabled={isUpdatingAsset}>
+              Close
             </Button>
-          ) : null}
+            {userRole === "admin" ? (
+              <Button
+                onClick={handleSaveDeviceDetails}
+                disabled={isUpdatingAsset || !deviceAddress.trim()}
+              >
+                {isUpdatingAsset ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Save className="mr-2 h-4 w-4" />
+                    Save
+                  </>
+                )}
+              </Button>
+            ) : null}
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>

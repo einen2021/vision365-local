@@ -1,8 +1,8 @@
 import fs from "fs";
 import path from "path";
 import bcrypt from "bcryptjs";
-import { getCollection } from "./client";
-import { readDb, writeDb } from "./documentStore";
+import { readDb, writeDb, isDocumentsEmpty } from "./documentStore";
+import { findUserByEmail, upsertUser } from "./repos";
 import { getDefaultDbSeed, prepareDbSeed } from "./defaultSeed";
 import {
   countProductiveData,
@@ -10,28 +10,30 @@ import {
   maybeLoadRestoreSnapshot,
   saveDbSnapshotBackup,
 } from "../services/dbSnapshotBackup";
+import { importLegacyAppDataAssets } from "../services/storageService";
 
 const BCRYPT_ROUNDS = 12;
 
 /**
- * Seed only when the database has no snapshot yet.
- * Never strips communities / buildings / assets.
- * Never overwrites an existing snapshot that already has data.
+ * Seed only when the SQLite documents table is empty.
+ * Prefer restoring from AppData JSON backups before writing defaults.
  */
-export async function seedIfEmpty(_appDataPath: string) {
-  const snapshot = getCollection("db_snapshot");
-  const existing = await snapshot.findOne({ _id: 1 });
+export async function seedIfEmpty(appDataPath: string) {
+  // Always pull floor-plans / uploads / snapshot JSON from Roaming+Local
+  // com.vision365-desktop (and other known folders) before seeding.
+  importLegacyAppDataAssets(appDataPath);
 
-  if (existing) {
-    // Existing DB: restore from backup if empty, otherwise leave data untouched.
-    await restoreFromBackupIfEmpty(_appDataPath);
+  if (!isDocumentsEmpty()) {
+    await restoreFromBackupIfEmpty(appDataPath);
     await ensureDefaultUsers();
     return;
   }
 
   // Brand-new install: try JSON backup before writing a seed file.
-  const restored = await restoreFromBackupIfEmpty(_appDataPath, { force: true });
+  const restored = await restoreFromBackupIfEmpty(appDataPath, { force: true });
   if (restored) {
+    // After DB import, copy any remaining media that appeared under other roots.
+    importLegacyAppDataAssets(appDataPath);
     await ensureDefaultUsers();
     return;
   }
@@ -50,7 +52,6 @@ export async function seedIfEmpty(_appDataPath: string) {
     }
   }
 
-  // Keep communities, AssetsList, BuildingDB docs — never sanitize/strip at runtime.
   const seedData =
     Object.keys(rawSeed).length > 0
       ? prepareDbSeed(rawSeed)
@@ -66,9 +67,9 @@ export async function seedIfEmpty(_appDataPath: string) {
     );
   }
 
-  await writeDb(seedData);
+  writeDb(seedData);
   if (!isDbEssentiallyEmpty(seedData)) {
-    saveDbSnapshotBackup(seedData, _appDataPath);
+    saveDbSnapshotBackup(seedData, appDataPath);
   }
   await ensureDefaultUsers();
   console.log("[seed] Database seeded successfully");
@@ -79,7 +80,7 @@ export async function restoreFromBackupIfEmpty(
   appDataPath: string,
   options: { force?: boolean } = {},
 ): Promise<boolean> {
-  const live = await readDb();
+  const live = readDb();
   if (!options.force && !isDbEssentiallyEmpty(live)) {
     try {
       saveDbSnapshotBackup(live, appDataPath);
@@ -93,8 +94,8 @@ export async function restoreFromBackupIfEmpty(
   if (!candidate) {
     if (isDbEssentiallyEmpty(live)) {
       console.warn(
-        "[seed] Database is empty and no JSON snapshot backup was found under " +
-          "backups/db-snapshots/ (checked com.vision365.desktop and Vision365 AppData).",
+        "[seed] Database is empty and no JSON snapshot backup was found. " +
+          "Checked Roaming + Local: com.vision365-desktop, com.vision365.desktop, Vision365.",
       );
     }
     return false;
@@ -116,9 +117,16 @@ export async function restoreFromBackupIfEmpty(
     merged.firePanelState = live.firePanelState;
   }
 
-  await writeDb(merged);
+  writeDb(merged);
   saveDbSnapshotBackup(merged, appDataPath);
-  console.log("[seed] Backup restore complete");
+
+  // Copy floor-plans / uploads / settings from the AppData folder that
+  // owned the snapshot (and every other known root) into the active install.
+  const media = importLegacyAppDataAssets(appDataPath);
+  console.log(
+    `[seed] Backup restore complete — SQLite imported; ` +
+      `floorPlans=+${media.floorPlans}, uploads=+${media.uploads}, snapshots=+${media.snapshots}`,
+  );
   return true;
 }
 
@@ -136,7 +144,7 @@ async function ensureDefaultUsers() {
 
   const defaultUserDb = (defaults.UserDB || {}) as Record<string, SeedUser>;
 
-  const db = await readDb();
+  const db = readDb();
   const userDb = { ...((db.UserDB || {}) as Record<string, SeedUser>) };
   let changed = false;
 
@@ -155,7 +163,7 @@ async function ensureDefaultUsers() {
   }
 
   if (changed) {
-    await writeDb({ ...db, UserDB: userDb });
+    writeDb({ ...db, UserDB: userDb });
     console.log("[seed] Added missing default users to UserDB");
   }
 
@@ -163,8 +171,7 @@ async function ensureDefaultUsers() {
 }
 
 async function migrateUsersToBcrypt() {
-  const users = getCollection("users");
-  const db = await readDb();
+  const db = readDb();
   const userDb = (db.UserDB || {}) as Record<
     string,
     { email?: string; password?: string; role?: string; designation?: string }
@@ -173,15 +180,14 @@ async function migrateUsersToBcrypt() {
   for (const [id, user] of Object.entries(userDb)) {
     if (!user.email) continue;
 
-    const existing = await users.findOne({ email: user.email });
+    const existing = findUserByEmail(user.email);
     if (existing) continue;
 
     const password = user.password || "admin123";
     const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const now = new Date().toISOString();
 
-    await users.insertOne({
-      _id: id,
+    upsertUser({
       id,
       email: user.email,
       password_hash: hash,

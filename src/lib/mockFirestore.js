@@ -298,14 +298,36 @@ export function writeBatch(db) {
   };
 }
 
-/** Poll-based real-time listener (replaces Firebase onSnapshot) */
+/**
+ * Realtime listener: poll cheap /api/db/revision first (SQLite meta counter),
+ * then refetch the document only when something changed.
+ */
 export function onSnapshot(ref, onNext, onError) {
   let active = true;
+  let lastRevision = -1;
   let lastJson = "";
+
+  async function fetchRevision() {
+    try {
+      const res = await apiFetch("/api/db/revision");
+      if (!res.ok) return null;
+      const body = await res.json();
+      return typeof body.revision === "number" ? body.revision : null;
+    } catch {
+      return null;
+    }
+  }
 
   async function poll() {
     if (!active) return;
     try {
+      const revision = await fetchRevision();
+      // Skip heavy get/list when revision is unchanged.
+      if (revision !== null && revision === lastRevision) {
+        if (active) setTimeout(poll, 250);
+        return;
+      }
+
       let snapshot;
       if (ref instanceof DocumentReference) {
         snapshot = await getDoc(ref);
@@ -319,6 +341,7 @@ export function onSnapshot(ref, onNext, onError) {
           ? snapshot.data()
           : snapshot.docs.map((d) => ({ id: d.id, ...d.data() })),
       );
+      if (revision !== null) lastRevision = revision;
       if (json !== lastJson) {
         lastJson = json;
         onNext(snapshot);
@@ -326,7 +349,7 @@ export function onSnapshot(ref, onNext, onError) {
     } catch (err) {
       if (onError) onError(err);
     }
-    if (active) setTimeout(poll, 500);
+    if (active) setTimeout(poll, 250);
   }
 
   poll();

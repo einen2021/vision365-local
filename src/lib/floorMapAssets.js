@@ -174,7 +174,11 @@ export function resolveMappingDeviceFields(mapping = {}) {
   const details = mapping.details || {}
   const source = {
     deviceAddress: mapping.deviceAddress ?? details.deviceAddress,
-    deviceLocation: mapping.deviceLocation ?? details.deviceLocation,
+    deviceLocation:
+      mapping.deviceLocation ??
+      details.deviceLocation ??
+      mapping.DeviceLocation ??
+      details.DeviceLocation,
     partNumber: mapping.partNumber ?? details.partNumber,
     loopNumber: mapping.loopNumber ?? details.loopNumber,
     deviceNumber: mapping.deviceNumber ?? details.deviceNumber,
@@ -445,12 +449,18 @@ export function mergeNestedAssetMappings(primary = [], extras = []) {
         assetsListId:
           existing.assetsListId || asset.assetsListId || asset.id || existing.id,
         deviceAddress:
-          existing.deviceAddress ||
           asset.deviceAddress ||
           resolveAssetDeviceAddress(asset) ||
+          existing.deviceAddress ||
           "",
-        deviceLocation: existing.deviceLocation || asset.deviceLocation || "",
-        partNumber: existing.partNumber || asset.partNumber || "",
+        deviceLocation: asset.deviceLocation || existing.deviceLocation || "",
+        deviceDescription:
+          asset.deviceDescription ||
+          asset.description ||
+          existing.deviceDescription ||
+          existing.description ||
+          "",
+        partNumber: asset.partNumber || existing.partNumber || "",
         loopNumber: existing.loopNumber ?? asset.loopNumber,
         deviceNumber: existing.deviceNumber ?? asset.deviceNumber,
         subAdd: existing.subAdd ?? asset.subAdd,
@@ -542,13 +552,15 @@ export async function enrichAssetMappingsFromAssetsList(db, mappings = []) {
 
       if (!fromList) return mapping
 
-      const listAddress =
-        resolveAssetDeviceAddress(fromList) || fromList.deviceAddress || ""
+      const listLocation = fromList.deviceLocation || ""
+      const listDescription = fromList.deviceDescription || fromList.description || ""
 
       return {
         ...mapping,
         assetsListId: mapping.assetsListId || fromList.id,
-        deviceAddress: currentAddress || listAddress,
+        deviceAddress: listAddress || currentAddress || "",
+        deviceLocation: listLocation || mapping.deviceLocation || "",
+        deviceDescription: listDescription || mapping.deviceDescription || mapping.description || "",
         partNumber: mapping.partNumber || fromList.partNumber || "",
         loopNumber: mapping.loopNumber ?? fromList.loopNumber,
         deviceNumber: mapping.deviceNumber ?? fromList.deviceNumber,
@@ -558,9 +570,18 @@ export async function enrichAssetMappingsFromAssetsList(db, mappings = []) {
         details: {
           ...(mapping.details || {}),
           deviceAddress:
-            currentAddress ||
             listAddress ||
+            currentAddress ||
             mapping.details?.deviceAddress ||
+            "",
+          deviceLocation:
+            listLocation ||
+            mapping.details?.deviceLocation ||
+            "",
+          deviceDescription:
+            listDescription ||
+            mapping.details?.deviceDescription ||
+            mapping.details?.description ||
             "",
           partNumber:
             mapping.partNumber ||

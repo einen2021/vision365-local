@@ -13,15 +13,15 @@ const EMPTY_DIMS = {
 };
 
 /** Track how a floor-plan image is rendered inside its container (for marker placement). */
-export function useFloorPlanImageDimensions(imageRef, imageUrl) {
+export function useFloorPlanImageDimensions(imageRef, imageUrl, imageFit = "contain") {
   const [dims, setDims] = useState(EMPTY_DIMS);
   const [imageLoaded, setImageLoaded] = useState(false);
 
   const recalculate = useCallback(() => {
     if (!imageRef.current) return;
-    setDims(calculateDisplayedImageDimensions(imageRef.current));
+    setDims(calculateDisplayedImageDimensions(imageRef.current, imageFit));
     setImageLoaded(true);
-  }, [imageRef]);
+  }, [imageRef, imageFit]);
 
   const handleImageLoad = useCallback(() => {
     recalculate();
@@ -30,7 +30,7 @@ export function useFloorPlanImageDimensions(imageRef, imageUrl) {
   useEffect(() => {
     setImageLoaded(false);
     setDims(EMPTY_DIMS);
-  }, [imageUrl]);
+  }, [imageUrl, imageFit]);
 
   // Cached images may finish loading before React attaches onLoad.
   useEffect(() => {

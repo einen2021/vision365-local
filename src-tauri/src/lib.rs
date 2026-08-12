@@ -9,9 +9,8 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
 const API_PORT: u16 = 47821;
-const MONGO_PORT: u16 = 47820;
 
-const STARTUP_TOTAL: u32 = 6;
+const STARTUP_TOTAL: u32 = 5;
 
 fn emit_progress(handle: &AppHandle, step: u32, message: &str) {
     let percent = ((step as f32 / STARTUP_TOTAL as f32) * 100.0).round() as u32;
@@ -128,8 +127,6 @@ fn spawn_and_wait_for_server(handle: &AppHandle) -> Result<u16, String> {
         .map_err(|e| format!("Cannot create app data directory: {e}"))?;
     create_dir_all(app_data.join("database"))
         .map_err(|e| format!("Cannot create database directory: {e}"))?;
-    create_dir_all(app_data.join("database").join("mongodb"))
-        .map_err(|e| format!("Cannot create MongoDB data directory: {e}"))?;
     create_dir_all(app_data.join("logs"))
         .map_err(|e| format!("Cannot create logs directory: {e}"))?;
 
@@ -138,14 +135,7 @@ fn spawn_and_wait_for_server(handle: &AppHandle) -> Result<u16, String> {
 
     let seed_path = resolve_seed_path(handle);
 
-    emit_progress(handle, 2, "Starting database engine");
-
-    // Production: start bundled embedded MongoDB before the API server
-    if !cfg!(debug_assertions) {
-        if let Err(e) = spawn_embedded_mongodb(handle, &app_data) {
-            return Err(format!("MongoDB startup failed: {e}"));
-        }
-    }
+    emit_progress(handle, 2, "Preparing SQLite database");
 
     emit_progress(handle, 3, "Launching local server");
 
@@ -173,17 +163,16 @@ fn spawn_and_wait_for_server(handle: &AppHandle) -> Result<u16, String> {
             ),
         );
         let mut c = Command::new(&node);
-        c.arg(&script).current_dir(&work_dir);
+        // Node 22 ships sqlite as experimental — enable it for the bundled server.
+        c.arg("--experimental-sqlite")
+            .arg(&script)
+            .current_dir(&work_dir);
         c.env("NODE_PATH", &work_dir);
         c
     };
 
     cmd.env("VISION365_APP_DATA", &app_data_str)
         .env("VISION365_PORT", API_PORT.to_string())
-        .env(
-            "VISION365_MONGO_URI",
-            format!("mongodb://127.0.0.1:{MONGO_PORT}"),
-        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -267,15 +256,11 @@ fn pipe_to_log<R: std::io::Read>(
 
 fn apply_server_log_progress(handle: &AppHandle, line: &str) {
     let lower = line.to_lowercase();
-    if lower.contains("installing mongodb")
-        || (lower.contains("added") && lower.contains("packages"))
-    {
-        emit_progress(handle, 3, "Installing database packages");
-    } else if lower.contains("mongodb connected") {
-        emit_progress(handle, 4, "Database engine connected");
+    if lower.contains("sqlite connected") {
+        emit_progress(handle, 4, "SQLite database connected");
     } else if lower.contains("migrations complete") {
-        emit_progress(handle, 5, "Database migrations complete");
-    } else if lower.contains("seed complete") {
+        emit_progress(handle, 4, "Database migrations complete");
+    } else if lower.contains("seed complete") || lower.contains("restored database from") {
         emit_progress(handle, 5, "Initial data loaded");
     } else if lower.contains("running at http") {
         emit_progress(handle, 5, "Local server started");
@@ -365,136 +350,18 @@ fn resolve_production_server(
         let node = base.join("node").join("node.exe");
         let server_dir = base.join("server");
         let script = server_dir.join("index.cjs");
-        let mongodb = server_dir.join("node_modules").join("mongodb");
 
         log_message(
             handle,
             &format!(
-                "Check: node={} script={} mongodb={}",
+                "Check: node={} script={}",
                 node.exists(),
-                script.exists(),
-                mongodb.exists()
+                script.exists()
             ),
         );
 
         if node.exists() && script.exists() {
-            if !mongodb.exists() {
-                log_message(handle, "WARNING: mongodb package missing in bundle");
-            }
             return Some((node, script, server_dir));
-        }
-    }
-
-    None
-}
-
-fn spawn_embedded_mongodb(handle: &AppHandle, app_data: &std::path::Path) -> Result<(), String> {
-    let mongod = resolve_mongod_binary(handle).ok_or_else(|| {
-        "Could not find bundled mongod.exe in application resources".to_string()
-    })?;
-
-    let db_path = app_data.join("database").join("mongodb");
-    create_dir_all(&db_path).map_err(|e| format!("Cannot create MongoDB data path: {e}"))?;
-
-    log_message(
-        handle,
-        &format!(
-            "Starting MongoDB: {} --dbpath {} --port {}",
-            mongod.display(),
-            db_path.display(),
-            MONGO_PORT
-        ),
-    );
-
-    let mut cmd = Command::new(&mongod);
-    cmd.args([
-        "--dbpath",
-        &db_path.to_string_lossy(),
-        "--port",
-        &MONGO_PORT.to_string(),
-        "--bind_ip",
-        "127.0.0.1",
-    ])
-    .stdout(Stdio::null())
-    .stderr(Stdio::piped());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to start mongod: {e}"))?;
-
-    if let Some(stderr) = child.stderr.take() {
-        let log = app_data.join("logs").join("server.log");
-        std::thread::spawn(move || pipe_to_log(stderr, &log, true, None));
-    }
-
-    wait_for_mongo_port(handle, MONGO_PORT, 60)?;
-    log_message(handle, &format!("MongoDB ready on port {MONGO_PORT}"));
-    Ok(())
-}
-
-fn wait_for_mongo_port(handle: &AppHandle, port: u16, timeout_secs: u64) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let started = Instant::now();
-    let total = Duration::from_secs(timeout_secs);
-
-    while Instant::now() < deadline {
-        let addr: SocketAddr = match format!("127.0.0.1:{port}").parse() {
-            Ok(a) => a,
-            Err(_) => return Err("Invalid MongoDB address".to_string()),
-        };
-        if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok() {
-            return Ok(());
-        }
-        let elapsed = started.elapsed();
-        let sub_percent = ((elapsed.as_secs_f64() / total.as_secs_f64()) * 100.0).min(99.0) as u32;
-        emit_progress(
-            handle,
-            2,
-            &format!("Starting database engine ({sub_percent}%)"),
-        );
-        std::thread::sleep(Duration::from_millis(300));
-    }
-
-    Err(format!(
-        "MongoDB did not respond within {timeout_secs}s on port {port}"
-    ))
-}
-
-fn resolve_mongod_binary(handle: &AppHandle) -> Option<std::path::PathBuf> {
-    let exe_name = if cfg!(windows) { "mongod.exe" } else { "mongod" };
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-
-    if let Ok(dir) = handle.path().resource_dir() {
-        candidates.push(dir.join("mongodb").join("bin").join(exe_name));
-        candidates.push(
-            dir.join("resources")
-                .join("mongodb")
-                .join("bin")
-                .join(exe_name),
-        );
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(
-                parent
-                    .join("resources")
-                    .join("mongodb")
-                    .join("bin")
-                    .join(exe_name),
-            );
-        }
-    }
-
-    for path in candidates {
-        if path.exists() {
-            return Some(path);
         }
     }
 

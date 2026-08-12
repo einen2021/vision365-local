@@ -897,10 +897,10 @@ export default function ViewNestedFloorPlansPage() {
           asset={selectedAsset}
           userRole={effectiveRole || ""}
           selectedBuilding={selectedBuilding}
-          onDeviceStatusChange={({ assetId, enabled, deviceAddress, deviceDescription }) => {
+          onDeviceStatusChange={({ assetId, enabled, deviceAddress, deviceDescription, deviceLocation }) => {
             const patchList = (list) =>
               list.map((mapping) =>
-                mapping.id === assetId || mapping.buildingAssetId === assetId
+                mapping.id === assetId || mapping.buildingAssetId === assetId || mapping.assetsListId === assetId
                   ? {
                       ...mapping,
                       ...(enabled !== undefined ? { enabled } : {}),
@@ -916,6 +916,17 @@ export default function ViewNestedFloorPlansPage() {
                         ? {
                             deviceDescription,
                             description: deviceDescription,
+                            details: mapping.details
+                              ? { ...mapping.details, deviceDescription, description: deviceDescription }
+                              : mapping.details,
+                          }
+                        : {}),
+                      ...(deviceLocation !== undefined
+                        ? {
+                            deviceLocation,
+                            details: mapping.details
+                              ? { ...mapping.details, deviceLocation }
+                              : mapping.details,
                           }
                         : {}),
                     }
@@ -924,7 +935,7 @@ export default function ViewNestedFloorPlansPage() {
             setAssetMappings(patchList);
             setSectionAssetMappings(patchList);
             setSelectedAsset((prev) =>
-              prev && (prev.id === assetId || prev.buildingAssetId === assetId)
+              prev && (prev.id === assetId || prev.buildingAssetId === assetId || prev.assetsListId === assetId)
                 ? {
                     ...prev,
                     ...(enabled !== undefined ? { enabled } : {}),
@@ -940,6 +951,17 @@ export default function ViewNestedFloorPlansPage() {
                       ? {
                           deviceDescription,
                           description: deviceDescription,
+                          details: prev.details
+                            ? { ...prev.details, deviceDescription, description: deviceDescription }
+                            : prev.details,
+                        }
+                      : {}),
+                    ...(deviceLocation !== undefined
+                      ? {
+                          deviceLocation,
+                          details: prev.details
+                            ? { ...prev.details, deviceLocation }
+                            : prev.details,
                         }
                       : {}),
                   }

@@ -32,6 +32,7 @@ import { PlanImageCanvas } from "@/components/floor-plan/plan-image-canvas";
 import { AssetPickerPanel } from "@/components/floor-plan/asset-picker-panel";
 import { FloorPlanPlacementCsvActions } from "@/components/floor-plan/floor-plan-placement-csv-actions";
 import { FloorPlanLocationCsvImport } from "@/components/floor-plan/floor-plan-location-csv-import";
+import { SgtImportButton } from "@/components/floor-plan/sgt-import-button";
 import { AssetTypeIconSettings } from "@/components/floor-plan/asset-type-icon-settings";
 import { normalizeAssetTypeKey } from "@/lib/assetIcons";
 import {
@@ -590,23 +591,8 @@ export function NestedFloorPlanEditor({ buildingName }) {
     setSelectedAsset(null);
   };
 
-  const removeSectionAsset = (mappingId) => {
-    setSectionAssetMappings((prev) => prev.filter((m) => m.id !== mappingId));
-    setSelectedAsset(null);
-    toast({
-      title: "Marker removed",
-      description: "Save section assets to persist changes.",
-    });
-  };
-
-  const removeSubsectionAsset = (mappingId) => {
-    setAssetMappings((prev) => prev.filter((m) => m.id !== mappingId));
-    setSelectedAsset(null);
-    toast({
-      title: "Marker removed",
-      description: "Save subsection assets to persist changes.",
-    });
-  };
+  const removeSectionAsset = (target) => handleDeleteAssetPlacement(target);
+  const removeSubsectionAsset = (target) => handleDeleteAssetPlacement(target);
 
   const handleCsvLocationImport = (result, targetLevel) => {
     if (targetLevel === "section") {
@@ -615,6 +601,182 @@ export function NestedFloorPlanEditor({ buildingName }) {
       setAssetMappings((prev) => mergePlacementMappings(prev, result.mappings));
     }
     setMappingCounter((count) => count + result.mappings.length);
+  };
+
+  /** After SGT uploads a plan image, refresh the current floor/section/subsection state. */
+  const handleSgtPlanImageUploaded = async (url, meta = {}) => {
+    const imageFit = meta.imageFit || "contain";
+    try {
+      if (level === NAV_LEVELS.FLOOR && floor?.id) {
+        const refreshed = await FirestoreService.getNestedFloor(buildingName, floor.id);
+        setFloor(refreshed || { ...floor, imageUrl: url, imageFit });
+        await loadFloors();
+      } else if (level === NAV_LEVELS.SECTION && floor?.id && section?.id) {
+        const refreshed = await FirestoreService.getNestedSection(
+          buildingName,
+          floor.id,
+          section.id,
+        );
+        setSection(refreshed || { ...section, imageUrl: url, imageFit });
+      } else if (
+        level === NAV_LEVELS.SUBSECTION &&
+        floor?.id &&
+        section?.id &&
+        subsection?.id
+      ) {
+        const refreshed = await FirestoreService.getNestedSubsection(
+          buildingName,
+          floor.id,
+          section.id,
+          subsection.id,
+        );
+        setSubsection(refreshed || { ...subsection, imageUrl: url, imageFit });
+      }
+    } catch (e) {
+      toast({
+        title: "Plan image refresh failed",
+        description: e.message,
+        variant: "destructive",
+      });
+    }
+  };
+
+  /** Reload building assets after SGT creates fire-life-safety devices. */
+  const handleSgtAssetsCreated = async () => {
+    await loadBuildingAssets();
+  };
+
+  /** Merge device marker mappings into editor state (user still clicks Save). */
+  const handleSgtPlacementsReady = (mappings, mergeFn = mergePlacementMappings) => {
+    if (!mappings?.length) return;
+    if (level === NAV_LEVELS.SECTION) {
+      setSectionAssetMappings((prev) => mergeFn(prev, mappings));
+    } else if (level === NAV_LEVELS.SUBSECTION) {
+      setAssetMappings((prev) => mergeFn(prev, mappings));
+    }
+    setMappingCounter((count) => count + mappings.length);
+  };
+
+  /** Update local textLabels after they were written to the plan doc. */
+  const handleSgtTextLabelsReady = (textLabels) => {
+    if (level === NAV_LEVELS.FLOOR && floor) {
+      setFloor({ ...floor, textLabels });
+    } else if (level === NAV_LEVELS.SECTION && section) {
+      setSection({ ...section, textLabels });
+    } else if (level === NAV_LEVELS.SUBSECTION && subsection) {
+      setSubsection({ ...subsection, textLabels });
+    }
+  };
+
+  /**
+   * Overview SGT on a floor: create missing sections and place nav pins.
+   */
+  const handleFloorNavButtonsFromSgt = async (navButtons = []) => {
+    if (!floor?.id || !navButtons.length) return;
+
+    let nextSections = [...sections];
+    let markers = [...(floor.sectionMarkers || [])];
+
+    for (const button of navButtons) {
+      const name = String(button.name || "").trim();
+      if (!name) continue;
+
+      let existing = nextSections.find(
+        (s) => String(s.name || "").trim().toLowerCase() === name.toLowerCase(),
+      );
+      if (!existing) {
+        const id = sanitizeFloorPlanId(name);
+        const saved = await FirestoreService.saveNestedSection(buildingName, floor.id, {
+          id,
+          name,
+        });
+        existing = saved;
+        nextSections = [...nextSections, saved];
+      }
+
+      const idx = markers.findIndex((m) => m.sectionId === existing.id);
+      const entry = {
+        id: markers[idx]?.id || `section_${existing.id}`,
+        sectionId: existing.id,
+        name: existing.name,
+        x: button.x,
+        y: button.y,
+        relativeX: button.relativeX,
+        relativeY: button.relativeY,
+      };
+      if (idx >= 0) markers[idx] = { ...markers[idx], ...entry };
+      else markers.push(entry);
+    }
+
+    await FirestoreService.updateFloorSectionMarkers(buildingName, floor.id, markers);
+    setSections(nextSections);
+    const refreshed = await FirestoreService.getNestedFloor(buildingName, floor.id);
+    setFloor(refreshed || { ...floor, sectionMarkers: markers });
+  };
+
+  /**
+   * Overview SGT on a section: create missing subsections and place nav pins.
+   */
+  const handleSectionNavButtonsFromSgt = async (navButtons = []) => {
+    if (!floor?.id || !section?.id || !navButtons.length) return;
+
+    let nextSubs = [...subsections];
+    let markers = [...(section.subsectionMarkers || [])];
+
+    for (const button of navButtons) {
+      const name = String(button.name || "").trim();
+      if (!name) continue;
+
+      let existing = nextSubs.find(
+        (s) => String(s.name || "").trim().toLowerCase() === name.toLowerCase(),
+      );
+      if (!existing) {
+        const id = sanitizeFloorPlanId(name);
+        const saved = await FirestoreService.saveNestedSubsection(
+          buildingName,
+          floor.id,
+          section.id,
+          { id, name },
+        );
+        existing = saved;
+        nextSubs = [...nextSubs, saved];
+      }
+
+      const idx = markers.findIndex((m) => m.subsectionId === existing.id);
+      const entry = {
+        id: markers[idx]?.id || `subsection_${existing.id}`,
+        subsectionId: existing.id,
+        name: existing.name,
+        x: button.x,
+        y: button.y,
+        relativeX: button.relativeX,
+        relativeY: button.relativeY,
+      };
+      if (idx >= 0) markers[idx] = { ...markers[idx], ...entry };
+      else markers.push(entry);
+    }
+
+    await FirestoreService.updateSectionSubsectionMarkers(
+      buildingName,
+      floor.id,
+      section.id,
+      markers,
+    );
+    setSubsections(nextSubs);
+    const refreshed = await FirestoreService.getNestedSection(
+      buildingName,
+      floor.id,
+      section.id,
+    );
+    setSection(refreshed || { ...section, subsectionMarkers: markers });
+  };
+
+  const handleSgtNavButtonsReady = async (navButtons) => {
+    if (level === NAV_LEVELS.FLOOR) {
+      await handleFloorNavButtonsFromSgt(navButtons);
+    } else if (level === NAV_LEVELS.SECTION) {
+      await handleSectionNavButtonsFromSgt(navButtons);
+    }
   };
 
   const handleAssetReposition = (mapping, coords, targetLevel) => {
@@ -662,8 +824,18 @@ export function NestedFloorPlanEditor({ buildingName }) {
       building: "",
       buildingName: "",
     };
-    const matchesLoadedAsset = (item) =>
-      item.id === asset.id && (item.assetMode || "general") === (asset.assetMode || "general");
+    const matchesLoadedAsset = (item) => {
+      const itemMode = item.assetMode || "general";
+      const assetMode = asset.assetMode || "general";
+      if (itemMode !== assetMode) return false;
+      const itemId = item.id;
+      const assetTargetId = asset.id || asset.buildingAssetId || asset.assetsListId;
+      return (
+        itemId === assetTargetId ||
+        (item.assetsListId && item.assetsListId === asset.assetsListId) ||
+        (item.buildingAssetId && item.buildingAssetId === asset.buildingAssetId)
+      );
+    };
 
     setBuildingAssets((prev) =>
       prev.map((item) => (matchesLoadedAsset(item) ? { ...item, ...clearedFields } : item)),
@@ -673,48 +845,68 @@ export function NestedFloorPlanEditor({ buildingName }) {
     );
   };
 
-  const handleDeleteAssetPlacement = async (asset) => {
-    const placementKey = `${asset.assetMode || "general"}-${asset.id}`;
+  const handleDeleteAssetPlacement = async (assetOrMapping) => {
+    let target = assetOrMapping;
+    const isSubsectionLevel = level === NAV_LEVELS.SUBSECTION;
+    const isSectionLevel = level === NAV_LEVELS.SECTION;
+    const currentMappings = isSectionLevel
+      ? sectionAssetMappings
+      : isSubsectionLevel
+        ? assetMappings
+        : [];
+
+    if (typeof target === "string") {
+      target = currentMappings.find((m) => m.id === target) || { id: target };
+    }
+
+    const isGeneral = (target.assetMode || "general") === "general";
+    const assetRef = {
+      ...target,
+      assetMode: target.assetMode || "general",
+      assetsListId: target.assetsListId || (isGeneral ? target.id : null),
+      buildingAssetId: target.buildingAssetId || (!isGeneral ? target.id : null),
+      id: target.buildingAssetId || target.assetsListId || target.id,
+      category: target.category,
+    };
+
+    const placementKey = `${assetRef.assetMode || "general"}-${assetRef.id}`;
     setDeletingPlacementKey(placementKey);
+
     try {
-      const isSubsectionLevel = level === NAV_LEVELS.SUBSECTION;
-      const isSectionLevel = level === NAV_LEVELS.SECTION;
-      const currentMappings = isSectionLevel
-        ? sectionAssetMappings
-        : isSubsectionLevel
-          ? assetMappings
-          : [];
-      const onCurrentMap = findPickerAssetMapping(asset, currentMappings);
-      const nextMappings = onCurrentMap
-        ? currentMappings.filter((mapping) => !pickerAssetMatchesMapping(asset, mapping))
-        : null;
+      const onCurrentMap = findPickerAssetMapping(assetRef, currentMappings);
+      let nextMappings = currentMappings;
 
       if (onCurrentMap) {
-        if (isSectionLevel) {
-          setSectionAssetMappings(nextMappings);
-          setSavedSectionAssetMappings(nextMappings);
-        } else if (isSubsectionLevel) {
-          setAssetMappings(nextMappings);
-          setSavedAssetMappings(nextMappings);
-        }
+        nextMappings = currentMappings.filter((mapping) => !pickerAssetMatchesMapping(assetRef, mapping));
+      } else {
+        nextMappings = currentMappings.filter(
+          (m) => m.id !== target.id && m.id !== assetRef.id,
+        );
       }
 
-      const persistOptions = onCurrentMap
-        ? {
-            localMappings: nextMappings,
-            floorId: floor?.id,
-            sectionId: section?.id,
-            subsectionId: isSubsectionLevel ? subsection?.id : "",
-            placementLevel: isSubsectionLevel ? "subsection" : "section",
-          }
-        : {};
+      if (isSectionLevel) {
+        setSectionAssetMappings(nextMappings);
+        setSavedSectionAssetMappings(nextMappings);
+      } else if (isSubsectionLevel) {
+        setAssetMappings(nextMappings);
+        setSavedAssetMappings(nextMappings);
+      }
+
+      const persistOptions = {
+        localMappings: nextMappings,
+        floorId: floor?.id,
+        sectionId: section?.id,
+        subsectionId: isSubsectionLevel ? subsection?.id : "",
+        placementLevel: isSubsectionLevel ? "subsection" : "section",
+      };
 
       await FirestoreService.removeAssetNestedPlacement(
         buildingName,
-        asset,
+        assetRef,
         persistOptions,
       );
-      clearAssetInLoadedLists(asset);
+      clearAssetInLoadedLists(assetRef);
+      setSelectedAsset(null);
 
       toast({
         title: "Placement cleared",
@@ -1035,6 +1227,17 @@ export function NestedFloorPlanEditor({ buildingName }) {
               </Button>
             </CardHeader>
             <CardContent className="space-y-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <SgtImportButton
+                  buildingName={buildingName}
+                  targetLevel="floor"
+                  floor={floor}
+                  onPlanImageUploaded={handleSgtPlanImageUploaded}
+                  onAssetsCreated={handleSgtAssetsCreated}
+                  onTextLabelsReady={handleSgtTextLabelsReady}
+                  onNavButtonsReady={handleSgtNavButtonsReady}
+                />
+              </div>
               <Input
                 type="file"
                 accept="image/*"
@@ -1043,6 +1246,8 @@ export function NestedFloorPlanEditor({ buildingName }) {
               <PlanImageCanvas
                 imageUrl={floor.imageUrl}
                 alt={floor.name}
+                imageFit={floor.imageFit || "contain"}
+                textLabels={floor.textLabels || []}
                 markers={filterPlacedNavMarkers(floor.sectionMarkers)}
                 mode="nav"
                 placingMarker={placingMarker}
@@ -1115,17 +1320,30 @@ export function NestedFloorPlanEditor({ buildingName }) {
               <p className="text-sm text-muted-foreground">
                 Place assets directly on this section, or add optional subsections for a deeper room-level plan.
               </p>
-              <FloorPlanLocationCsvImport
-                buildingName={buildingName}
-                planImageUrl={section.imageUrl}
-                placementContext={buildNestedPlacementContext({
-                  buildingName,
-                  floor,
-                  section,
-                  placementLevel: "section",
-                })}
-                onImported={(result) => handleCsvLocationImport(result, "section")}
-              />
+              <div className="flex flex-wrap items-center gap-2">
+                <FloorPlanLocationCsvImport
+                  buildingName={buildingName}
+                  planImageUrl={section.imageUrl}
+                  placementContext={buildNestedPlacementContext({
+                    buildingName,
+                    floor,
+                    section,
+                    placementLevel: "section",
+                  })}
+                  onImported={(result) => handleCsvLocationImport(result, "section")}
+                />
+                <SgtImportButton
+                  buildingName={buildingName}
+                  targetLevel="section"
+                  floor={floor}
+                  section={section}
+                  onPlanImageUploaded={handleSgtPlanImageUploaded}
+                  onAssetsCreated={handleSgtAssetsCreated}
+                  onPlacementsReady={handleSgtPlacementsReady}
+                  onTextLabelsReady={handleSgtTextLabelsReady}
+                  onNavButtonsReady={handleSgtNavButtonsReady}
+                />
+              </div>
               <Input
                 type="file"
                 accept="image/*"
@@ -1134,6 +1352,8 @@ export function NestedFloorPlanEditor({ buildingName }) {
               <PlanImageCanvas
                 imageUrl={section.imageUrl}
                 alt={section.name}
+                imageFit={section.imageFit || "contain"}
+                textLabels={section.textLabels || []}
                 navMarkers={filterPlacedNavMarkers(section.subsectionMarkers)}
                 assetMarkers={sectionAssetMappings}
                 placingMarker={placingMarker || !!selectedAsset}
@@ -1149,7 +1369,7 @@ export function NestedFloorPlanEditor({ buildingName }) {
                 onAssetReposition={(mapping, coords) =>
                   handleAssetReposition(mapping, coords, "section")
                 }
-                onAssetRemove={(mapping) => removeSectionAsset(mapping.id)}
+                onAssetRemove={(mapping) => removeSectionAsset(mapping)}
               />
             </CardContent>
           </Card>
@@ -1271,18 +1491,31 @@ export function NestedFloorPlanEditor({ buildingName }) {
               <CardTitle>{subsection.name} — Subsection Plan (optional detail)</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <FloorPlanLocationCsvImport
-                buildingName={buildingName}
-                planImageUrl={subsection.imageUrl}
-                placementContext={buildNestedPlacementContext({
-                  buildingName,
-                  floor,
-                  section,
-                  subsection,
-                  placementLevel: "subsection",
-                })}
-                onImported={(result) => handleCsvLocationImport(result, "subsection")}
-              />
+              <div className="flex flex-wrap items-center gap-2">
+                <FloorPlanLocationCsvImport
+                  buildingName={buildingName}
+                  planImageUrl={subsection.imageUrl}
+                  placementContext={buildNestedPlacementContext({
+                    buildingName,
+                    floor,
+                    section,
+                    subsection,
+                    placementLevel: "subsection",
+                  })}
+                  onImported={(result) => handleCsvLocationImport(result, "subsection")}
+                />
+                <SgtImportButton
+                  buildingName={buildingName}
+                  targetLevel="subsection"
+                  floor={floor}
+                  section={section}
+                  subsection={subsection}
+                  onPlanImageUploaded={handleSgtPlanImageUploaded}
+                  onAssetsCreated={handleSgtAssetsCreated}
+                  onPlacementsReady={handleSgtPlacementsReady}
+                  onTextLabelsReady={handleSgtTextLabelsReady}
+                />
+              </div>
               <Input
                 type="file"
                 accept="image/*"
@@ -1291,6 +1524,8 @@ export function NestedFloorPlanEditor({ buildingName }) {
               <PlanImageCanvas
                 imageUrl={subsection.imageUrl}
                 alt={subsection.name}
+                imageFit={subsection.imageFit || "contain"}
+                textLabels={subsection.textLabels || []}
                 assetMarkers={assetMappings}
                 placingMarker={!!selectedAsset}
                 editableAssetMarkers={!selectedAsset}
@@ -1298,7 +1533,7 @@ export function NestedFloorPlanEditor({ buildingName }) {
                 onAssetReposition={(mapping, coords) =>
                   handleAssetReposition(mapping, coords, "subsection")
                 }
-                onAssetRemove={(mapping) => removeSubsectionAsset(mapping.id)}
+                onAssetRemove={(mapping) => removeSubsectionAsset(mapping)}
               />
             </CardContent>
           </Card>

@@ -1,5 +1,6 @@
 /**
  * Bundle desktop-server + portable Node.js for MSI installs (no Node required on target PC).
+ * Uses Node built-in node:sqlite — no mongodb package to ship.
  */
 import * as esbuild from "esbuild";
 import { execSync } from "child_process";
@@ -13,16 +14,6 @@ const root = path.resolve(__dirname, "..");
 const serverResDir = path.join(root, "src-tauri", "resources", "server");
 const nodeResDir = path.join(root, "src-tauri", "resources", "node");
 const NODE_VERSION = "22.14.0";
-
-function copyDir(src, dest) {
-  fs.mkdirSync(dest, { recursive: true });
-  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
-    const s = path.join(src, entry.name);
-    const d = path.join(dest, entry.name);
-    if (entry.isDirectory()) copyDir(s, d);
-    else fs.copyFileSync(s, d);
-  }
-}
 
 // 1. Bundle server as CommonJS
 fs.mkdirSync(serverResDir, { recursive: true });
@@ -38,66 +29,58 @@ await esbuild.build({
   outdir: serverResDir,
   entryNames: "[name]",
   format: "cjs",
-  external: ["mongodb"],
+  // Tauri production spawn looks for index.cjs (not .js).
+  outExtension: { ".js": ".cjs" },
+  // node:sqlite is a Node builtin — do not bundle it.
+  external: ["node:sqlite"],
   sourcemap: false,
 });
 
+// Remove leftover Mongo-era artifacts / wrong extensions from older builds.
+for (const stale of ["index.js", "firePanelWorker.js"]) {
+  const stalePath = path.join(serverResDir, stale);
+  if (fs.existsSync(stalePath)) {
+    fs.unlinkSync(stalePath);
+    console.log(`[bundle] Removed stale ${stale}`);
+  }
+}
+
 console.log("[bundle] Built src-tauri/resources/server/*.cjs");
 
-// 2. Ensure portable Node.js
+// 2. Ensure portable Node.js (22+ required for node:sqlite)
 const nodeExe = path.join(nodeResDir, "node.exe");
 ensurePortableNode(nodeExe);
 
-// 3. Production node_modules for externalized packages (mongodb + all transitive deps)
-const nodeModulesDest = path.join(serverResDir, "node_modules");
-if (fs.existsSync(nodeModulesDest)) {
-  fs.rmSync(nodeModulesDest, { recursive: true, force: true });
-}
-
+// 3. Minimal runtime package.json (no native DB deps)
 const runtimePkgPath = path.join(serverResDir, "package.json");
-const rootPkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf-8"));
-const mongoVersion =
-  rootPkg.dependencies?.mongodb || rootPkg.devDependencies?.mongodb || "^7.3.0";
-
 fs.writeFileSync(
   runtimePkgPath,
   JSON.stringify(
     {
       name: "vision365-server-runtime",
       private: true,
-      dependencies: {
-        mongodb: mongoVersion,
-      },
+      type: "commonjs",
     },
     null,
     2,
   ),
 );
 
-console.log(`[bundle] Installing mongodb ${mongoVersion} for desktop runtime...`);
-execSync("npm install --omit=dev --no-package-lock --no-audit --no-fund", {
-  cwd: serverResDir,
-  stdio: "inherit",
-  shell: true,
-  env: {
-    ...process.env,
-    npm_config_update_notifier: "false",
-  },
-});
+// Remove leftover mongodb node_modules from older builds
+const nodeModulesDest = path.join(serverResDir, "node_modules");
+if (fs.existsSync(nodeModulesDest)) {
+  fs.rmSync(nodeModulesDest, { recursive: true, force: true });
+  console.log("[bundle] Removed legacy server node_modules");
+}
 
-// Verify mongodb loads with only the bundled node_modules (no project-root fallback)
+// Verify node:sqlite works with bundled Node
 execSync(
-  `"${nodeExe}" -e "process.chdir('${serverResDir.replace(/\\/g, "/")}'); require('mongodb'); console.log('mongodb runtime ok');"`,
+  `"${nodeExe}" -e "const { DatabaseSync } = require('node:sqlite'); const d = new DatabaseSync(':memory:'); d.exec('CREATE TABLE t(x)'); console.log('sqlite runtime ok');"`,
   { stdio: "inherit", shell: true },
 );
-console.log("[bundle] Verified mongodb runtime dependencies");
+console.log("[bundle] Verified node:sqlite runtime");
 
-// 4. Download bundled mongod for embedded MongoDB
-execSync("node scripts/download-mongodb.mjs", { cwd: root, stdio: "inherit", shell: true });
-
-// 5. Copy login-only seed for first-run on installed machines (package only).
-// Runtime desktop-server never strips communities/assets from an existing DB.
-
+// 4. Copy login-only seed for first-run on installed machines
 const seedSrc = path.join(root, "data", "db.json");
 const seedDest = path.join(root, "src-tauri", "resources", "db-seed.json");
 if (fs.existsSync(seedSrc)) {
@@ -109,10 +92,10 @@ if (fs.existsSync(seedSrc)) {
 
 console.log("[bundle] Desktop server runtime bundle complete");
 
-function ensurePortableNode(nodeExe) {
+function ensurePortableNode(nodeExePath) {
   const versionFile = path.join(nodeResDir, ".node-version");
   const needsDownload =
-    !fs.existsSync(nodeExe) ||
+    !fs.existsSync(nodeExePath) ||
     !fs.existsSync(versionFile) ||
     fs.readFileSync(versionFile, "utf-8").trim() !== NODE_VERSION;
 
@@ -121,7 +104,7 @@ function ensurePortableNode(nodeExe) {
     return;
   }
 
-  if (fs.existsSync(nodeExe)) fs.unlinkSync(nodeExe);
+  if (fs.existsSync(nodeExePath)) fs.unlinkSync(nodeExePath);
 
   fs.mkdirSync(nodeResDir, { recursive: true });
   const zipName = `node-v${NODE_VERSION}-win-x64.zip`;
@@ -132,12 +115,15 @@ function ensurePortableNode(nodeExe) {
   execSync(`curl -fsSL "${zipUrl}" -o "${zipPath}"`, { stdio: "inherit", shell: true });
   execSync(
     `powershell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${nodeResDir}' -Force"`,
-    { stdio: "inherit", shell: true }
+    { stdio: "inherit", shell: true },
   );
 
   const extracted = path.join(nodeResDir, `node-v${NODE_VERSION}-win-x64`, "node.exe");
-  fs.copyFileSync(extracted, nodeExe);
-  fs.rmSync(path.join(nodeResDir, `node-v${NODE_VERSION}-win-x64`), { recursive: true, force: true });
+  fs.copyFileSync(extracted, nodeExePath);
+  fs.rmSync(path.join(nodeResDir, `node-v${NODE_VERSION}-win-x64`), {
+    recursive: true,
+    force: true,
+  });
   fs.unlinkSync(zipPath);
   fs.writeFileSync(versionFile, NODE_VERSION);
   console.log(`[bundle] Portable node.exe v${NODE_VERSION} ready`);

@@ -494,7 +494,13 @@ export function getAssetMarkerTooltip(marker, metaByAssetId = {}) {
   const meta = (id && metaByAssetId[id]) || {};
   const merged = { ...marker, ...meta };
   const address = String(resolveAssetDeviceAddress(merged) || "").trim();
-  const location = String(merged.deviceLocation || "").trim();
+  const location = String(
+    merged.deviceLocation ??
+    merged.details?.deviceLocation ??
+    merged.DeviceLocation ??
+    merged.details?.DeviceLocation ??
+    ""
+  ).trim();
 
   const lines = [];
   if (address) lines.push(`Address: ${address}`);

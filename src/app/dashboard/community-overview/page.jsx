@@ -1859,13 +1859,13 @@ function CommunityOverviewContent() {
         asset={selectedAsset}
         selectedBuilding={selectedAsset?.targetBuilding || selectedBuildingForFloor || selectedBuilding}
         userRole={userRole}
-        onDeviceStatusChange={({ assetId, enabled, deviceAddress, deviceDescription }) => {
+        onDeviceStatusChange={({ assetId, enabled, deviceAddress, deviceDescription, deviceLocation }) => {
           setCurrentFloorMap((prev) => {
             if (!prev?.assetMappings) return prev;
             return {
               ...prev,
               assetMappings: prev.assetMappings.map((mapping) =>
-                mapping.id === assetId || mapping.buildingAssetId === assetId
+                mapping.id === assetId || mapping.buildingAssetId === assetId || mapping.assetsListId === assetId
                   ? {
                       ...mapping,
                       ...(enabled !== undefined ? { enabled } : {}),
@@ -1881,6 +1881,17 @@ function CommunityOverviewContent() {
                         ? {
                             deviceDescription,
                             description: deviceDescription,
+                            details: mapping.details
+                              ? { ...mapping.details, deviceDescription, description: deviceDescription }
+                              : mapping.details,
+                          }
+                        : {}),
+                      ...(deviceLocation !== undefined
+                        ? {
+                            deviceLocation,
+                            details: mapping.details
+                              ? { ...mapping.details, deviceLocation }
+                              : mapping.details,
                           }
                         : {}),
                     }
@@ -1889,7 +1900,7 @@ function CommunityOverviewContent() {
             };
           });
           setSelectedAsset((prev) =>
-            prev && (prev.id === assetId || prev.buildingAssetId === assetId)
+            prev && (prev.id === assetId || prev.buildingAssetId === assetId || prev.assetsListId === assetId)
               ? {
                   ...prev,
                   ...(enabled !== undefined ? { enabled } : {}),
@@ -1905,6 +1916,17 @@ function CommunityOverviewContent() {
                     ? {
                         deviceDescription,
                         description: deviceDescription,
+                        details: prev.details
+                          ? { ...prev.details, deviceDescription, description: deviceDescription }
+                          : prev.details,
+                      }
+                    : {}),
+                  ...(deviceLocation !== undefined
+                    ? {
+                        deviceLocation,
+                        details: prev.details
+                          ? { ...prev.details, deviceLocation }
+                          : prev.details,
                       }
                     : {}),
                 }

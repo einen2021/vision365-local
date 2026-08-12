@@ -261,12 +261,29 @@ export function naturalToScreenCoords(marker, actualImageDimensions) {
   };
 }
 
-export function calculateDisplayedImageDimensions(img) {
+/**
+ * Measure how the plan image is drawn inside its container.
+ * imageFit "fill" stretches to the full box (overview / nav-button plans).
+ * imageFit "contain" (default) letterboxes and keeps aspect ratio.
+ */
+export function calculateDisplayedImageDimensions(img, imageFit = "contain") {
   const containerRect = img.getBoundingClientRect();
   const containerWidth = containerRect.width;
   const containerHeight = containerRect.height;
   const naturalWidth = img.naturalWidth;
   const naturalHeight = img.naturalHeight;
+
+  // Stretch to fill — markers map across the whole container
+  if (imageFit === "fill") {
+    return {
+      width: containerWidth,
+      height: containerHeight,
+      offsetX: 0,
+      offsetY: 0,
+      naturalWidth,
+      naturalHeight,
+    };
+  }
 
   const scale = Math.min(containerWidth / naturalWidth, containerHeight / naturalHeight);
   const displayedWidth = naturalWidth * scale;
@@ -460,4 +477,82 @@ export function buildBuildingFloorMarkers(floors = []) {
       relativeY: count <= 1 ? 0.5 : (index + 1) / (count + 1),
     };
   });
+}
+
+/**
+ * Convert SGT TEXT-layer rows into map label placements (0–1 relative coords).
+ * Uses the same coordOptions as device markers so everything stays aligned.
+ */
+export function buildSgtTextLabelPlacements(labelRows = [], coordOptions = {}) {
+  const labels = [];
+  const now = new Date().toISOString();
+
+  labelRows.forEach((row, index) => {
+    const text = String(row?.text ?? row?.label ?? row?.object_name ?? "").trim();
+    if (!text) return;
+
+    const coords = csvCoordsToRelativePlacement(row.x, row.y, coordOptions);
+    if (!coords) return;
+
+    // id example: sgt_text_0_lobby
+    const slug = String(text)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 40) || "label";
+
+    labels.push({
+      id: `sgt_text_${index}_${slug}`,
+      text,
+      relativeX: coords.relativeX,
+      relativeY: coords.relativeY,
+      x: coords.x,
+      y: coords.y,
+      source: "sgt",
+      createdAt: now,
+    });
+  });
+
+  return labels;
+}
+
+/**
+ * Convert SGT nav buttons into pin placements for section / subsection markers.
+ * Display name prefers short_label, then target.
+ */
+export function buildSgtNavButtonPlacements(buttonRows = [], coordOptions = {}) {
+  const buttons = [];
+
+  buttonRows.forEach((row, index) => {
+    // Prefer short_label for pin text (same rule as getSgtButtonDisplayLabel)
+    const short = String(row?.short_label ?? row?.shortLabel ?? "").trim();
+    const name =
+      short ||
+      String(row?.target ?? row?.label ?? row?.name ?? "").trim();
+    if (!name) return;
+
+    const coords = csvCoordsToRelativePlacement(row.x, row.y, coordOptions);
+    if (!coords) return;
+
+    // id example: sgt_btn_0_zone_a
+    const slug = String(name)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 40) || "btn";
+
+    buttons.push({
+      id: `sgt_btn_${index}_${slug}`,
+      name,
+      short_label: short || name,
+      target: String(row?.target || name).trim(),
+      relativeX: coords.relativeX,
+      relativeY: coords.relativeY,
+      x: coords.x,
+      y: coords.y,
+      source: "sgt",
+    });
+  });
+
+  return buttons;
 }

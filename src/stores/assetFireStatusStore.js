@@ -38,7 +38,12 @@ function buildCacheFromSnapshot(snapshot) {
     if (!key) return;
     const resolvedAddress = resolveAssetDeviceAddress(data);
     metaByAssetId[key] = {
-      deviceLocation: String(data.deviceLocation || "").trim(),
+      deviceLocation: String(
+        data.deviceLocation ??
+        data.details?.deviceLocation ??
+        data.DeviceLocation ??
+        ""
+      ).trim(),
       deviceAddress: resolvedAddress,
     };
   };
@@ -86,6 +91,29 @@ export const useAssetFireStatusStore = create((set, get) => ({
   showStatusByAddress: {},
   lastSync: null,
   isPolling: false,
+
+  updateAssetMeta: ({ assetId = "", deviceAddress = "", deviceLocation }) => {
+    set((prev) => {
+      const nextMeta = { ...prev.metaByAssetId };
+      const location = String(deviceLocation || "").trim();
+      const address = String(deviceAddress || "").trim();
+
+      const updateKey = (k) => {
+        if (!k) return;
+        const key = String(k).trim();
+        if (!key) return;
+        nextMeta[key] = {
+          ...nextMeta[key],
+          ...(deviceLocation !== undefined ? { deviceLocation: location } : {}),
+          ...(address ? { deviceAddress: address } : {}),
+        };
+      };
+
+      updateKey(assetId);
+      updateKey(address);
+      return { metaByAssetId: nextMeta };
+    });
+  },
 
   applyAssetsListSnapshot: (snapshot) => {
     const nextCache = buildCacheFromSnapshot(snapshot);

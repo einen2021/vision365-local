@@ -229,6 +229,156 @@ class FirestoreService {
   }
 
   /**
+   * Create or merge fire-life-safety building assets from SGT device rows.
+   * Doc id: {BUILDING}_{DEVICE_ADDRESS}. Does NOT invent deviceLocation from object_name.
+   * @returns {{ created: number, updated: number, assets: object[] }}
+   */
+  static async createBuildingAssetsFromSgt(buildingName, devices = []) {
+    const coll = buildingCollectionName(buildingName);
+    const buildingLabel = String(buildingName || "")
+      .replace(/BuildingDB$/i, "")
+      .trim();
+    const buildingPrefix = buildingLabel
+      .toUpperCase()
+      .replace(/\s+/g, "_")
+      .replace(/[^A-Z0-9_\-]/g, "_");
+
+    const now = new Date().toISOString();
+    let created = 0;
+    let updated = 0;
+    const assets = [];
+
+    for (const row of devices) {
+      const deviceAddress = String(row?.Name ?? row?.name ?? "").trim();
+      if (!deviceAddress) continue;
+
+      const safeAddress = deviceAddress
+        .toUpperCase()
+        .replace(/[^A-Z0-9_\-]/g, "_");
+      const buildingAssetId = `${buildingPrefix}_${safeAddress}`;
+      const categoryKey = "fire-life-safety";
+      const ref = doc(db, coll, "asset", categoryKey, buildingAssetId);
+      const existing = await getDoc(ref);
+
+      // Only use location when SGT actually provides one — never invent from object_name
+      const deviceLocation = String(
+        row?.deviceLocation ?? row?.DeviceLocation ?? "",
+      ).trim();
+      // Legend / type from extractor objects[] (e.g. object_name "SMOKE DETECTOR", deviceType "S")
+      const objectName = String(row?.object_name ?? row?.objectName ?? "").trim();
+      const deviceType = String(row?.deviceType ?? row?.DeviceType ?? "").trim();
+      const pointType = String(row?.pointType ?? row?.PointType ?? "").trim();
+      const legendName = objectName || pointType || deviceType || deviceAddress;
+
+      const x = Number(row?.x);
+      const y = Number(row?.y);
+      const hasCoords = Number.isFinite(x) && Number.isFinite(y);
+
+      const assetData = {
+        active: 0,
+        activityStatus: 0,
+        assetCategory: "FIRE ALARM",
+        // Prefer legend name from SGT object_name; do not invent deviceLocation
+        assetName: legendName,
+        itemType: legendName,
+        buildingAssetId,
+        buildingId: buildingLabel,
+        buildingName: buildingLabel,
+        categoryKey,
+        deviceAddress,
+        deviceLocation,
+        enabled: true,
+        installed: false,
+        mainCategory: "FIRE AND LIFE SAFETY",
+        quantity: 1,
+        status: "Active",
+        source: "sgt-import",
+        updatedAt: now,
+        ...(existing.exists() ? {} : { createdAt: now, createdBy: "sgt-import" }),
+        ...(deviceType ? { deviceType } : {}),
+        ...(pointType ? { pointType } : {}),
+        ...(objectName ? { objectName, object_name: objectName } : {}),
+        ...(hasCoords ? { coordinates: { x, y } } : {}),
+      };
+
+      await setDoc(ref, assetData, { merge: true });
+      if (existing.exists()) updated += 1;
+      else created += 1;
+
+      assets.push({
+        id: buildingAssetId,
+        ...assetData,
+        assetMode: "building",
+        category: categoryKey,
+      });
+    }
+
+    return { created, updated, assets };
+  }
+
+  /** Persist TEXT labels on a floor plan doc (optional array field). */
+  static async updateFloorTextLabels(buildingName, floorId, textLabels = []) {
+    await updateDoc(this._nestedFloorRef(buildingName, floorId), {
+      textLabels,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  static async updateSectionTextLabels(buildingName, floorId, sectionId, textLabels = []) {
+    await updateDoc(this._nestedSectionRef(buildingName, floorId, sectionId), {
+      textLabels,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  static async updateSubsectionTextLabels(
+    buildingName,
+    floorId,
+    sectionId,
+    subsectionId,
+    textLabels = [],
+  ) {
+    await updateDoc(
+      this._nestedSubsectionRef(buildingName, floorId, sectionId, subsectionId),
+      {
+        textLabels,
+        updatedAt: new Date().toISOString(),
+      },
+    );
+  }
+
+  /** Persist imageFit ("contain" | "fill") on nested plan docs. */
+  static async updateFloorPlanImageFit(buildingName, floorId, imageFit) {
+    await updateDoc(this._nestedFloorRef(buildingName, floorId), {
+      imageFit,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  static async updateSectionPlanImageFit(buildingName, floorId, sectionId, imageFit) {
+    await updateDoc(this._nestedSectionRef(buildingName, floorId, sectionId), {
+      imageFit,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  static async updateSubsectionPlanImageFit(
+    buildingName,
+    floorId,
+    sectionId,
+    subsectionId,
+    imageFit,
+  ) {
+    await updateDoc(
+      this._nestedSubsectionRef(buildingName, floorId, sectionId, subsectionId),
+      {
+        imageFit,
+        updatedAt: new Date().toISOString(),
+      },
+    );
+  }
+
+  /**
    * Update asset coordinates (X, Y, Z) and globalId from IFC/BIM data
    * @param {string} buildingName - Building name (without BuildingDB suffix)
    * @param {string} categoryKey - Asset category key
@@ -1686,6 +1836,57 @@ class FirestoreService {
     }
 
     return null;
+  }
+
+  /**
+   * Update device fields (address, location, description) on placed assetMappings docs in Firestore.
+   */
+  static async updateAssetMappingInFirestore(buildingName, asset = {}) {
+    try {
+      const enrichedAssets = await this._enrichAssetsWithFloorIndex([{
+        ...asset,
+        buildingName: buildingName || asset.buildingName || asset.building,
+      }]);
+      const enriched = enrichedAssets[0] || asset;
+
+      const mappingRefObj = this._resolveAssetMappingCollectionRef(enriched);
+      if (!mappingRefObj?.ref) return 0;
+
+      const snap = await getDocs(mappingRefObj.ref);
+      const targetId = String(asset.buildingAssetId || asset.id || asset.assetsListId || "").trim();
+      const targetAddr = String(asset.deviceAddress || "").trim();
+
+      const batch = writeBatch(db);
+      let updatedCount = 0;
+
+      snap.forEach((docSnap) => {
+        const data = docSnap.data() || {};
+        const mappingId = String(data.buildingAssetId || data.assetsListId || data.id || docSnap.id).trim();
+        const mappingAddr = String(data.deviceAddress || "").trim();
+
+        const isMatch =
+          (targetId && (mappingId === targetId || docSnap.id === targetId)) ||
+          (targetAddr && mappingAddr && targetAddr === mappingAddr);
+
+        if (isMatch) {
+          batch.update(docSnap.ref, {
+            ...(asset.deviceAddress ? { deviceAddress: asset.deviceAddress } : {}),
+            ...(asset.deviceLocation !== undefined ? { deviceLocation: asset.deviceLocation } : {}),
+            ...(asset.deviceDescription !== undefined ? { deviceDescription: asset.deviceDescription, description: asset.deviceDescription } : {}),
+            updatedAt: new Date().toISOString(),
+          });
+          updatedCount++;
+        }
+      });
+
+      if (updatedCount > 0) {
+        await batch.commit();
+      }
+      return updatedCount;
+    } catch (err) {
+      console.warn("[firestoreService] updateAssetMappingInFirestore failed:", err);
+      return 0;
+    }
   }
 
   /**
@@ -4402,4 +4603,5 @@ class FirestoreService {
   }
 }
 
+export { FirestoreService };
 export default FirestoreService;

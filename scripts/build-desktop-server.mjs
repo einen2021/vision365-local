@@ -17,6 +17,8 @@ await esbuild.build({
   entryNames: "[name]",
   format: "esm",
   packages: "external",
+  // node:sqlite is a Node builtin
+  external: ["node:sqlite"],
   sourcemap: true,
 });
 

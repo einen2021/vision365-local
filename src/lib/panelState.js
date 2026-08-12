@@ -1,4 +1,9 @@
-import { getDocument, mutateDb, setDocument } from "@/lib/serverDb";
+/**
+ * Legacy panel helpers — prefer desktop-server firePanelAlarmSync for persistence.
+ * These only operate on an in-memory db object (no Mongo / SQLite connection).
+ */
+
+import { getDocument, setDocument } from "@/lib/serverDb";
 
 /** Read root firePanelState document (panel CVAL totals, not BuildingDB). */
 export function getStoredPanelStateFromDb(db) {
@@ -12,42 +17,27 @@ export function getStoredPanelStateFromDb(db) {
   };
 }
 
-/** Write all three CVAL totals to firePanelState when any value changed. */
-export async function savePanelStateCounts(counts) {
+/** Apply panel totals onto an in-memory db object (caller persists). */
+export function applyPanelStateCounts(db, counts) {
   const next = {
     totalFire: Number(counts.totalFire) || 0,
     totalTrouble: Number(counts.totalTrouble) || 0,
     totalSupervisory: Number(counts.totalSupervisory) || 0,
   };
 
-  let result;
+  const existing = getStoredPanelStateFromDb(db);
+  if (
+    existing.totalFire === next.totalFire &&
+    existing.totalTrouble === next.totalTrouble &&
+    existing.totalSupervisory === next.totalSupervisory
+  ) {
+    return { changed: false, ...existing };
+  }
 
-  await mutateDb((db) => {
-    const existing = getStoredPanelStateFromDb(db);
-
-    if (
-      existing.totalFire === next.totalFire &&
-      existing.totalTrouble === next.totalTrouble &&
-      existing.totalSupervisory === next.totalSupervisory
-    ) {
-      result = { ...existing, unchanged: true };
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const payload = { ...next, lastPanelSync: now };
-    const doc = getDocument(db, ["firePanelState"]) || {};
-    setDocument(
-      db,
-      ["firePanelState"],
-      {
-        ...doc,
-        ...payload,
-      },
-      true,
-    );
-    result = payload;
-  });
-
-  return result;
+  const payload = {
+    ...next,
+    lastPanelSync: new Date().toISOString(),
+  };
+  setDocument(db, ["firePanelState"], payload, false);
+  return { changed: true, ...payload };
 }
