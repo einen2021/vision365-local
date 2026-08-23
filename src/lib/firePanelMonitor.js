@@ -109,6 +109,10 @@ export function extractPanelDeviceAddresses(response) {
 
 /** Known device type suffixes in panel list output (longest first). */
 const PANEL_DEVICE_TYPES = [
+  "SUPERVISORY MONITOR",
+  "SYSTEM POWER SUPPLY",
+  "POWER SUPPLY",
+  "IDNET CARD",
   "SMOKE DETECTOR",
   "HEAT DETECTOR",
   "DUCT DETECTOR",
@@ -120,19 +124,55 @@ const PANEL_DEVICE_TYPES = [
   "MONITOR MODULE",
   "CONTROL MODULE",
   "RELAY MODULE",
+  "AUXILIARY RELAY",
+  "ALARM RELAY",
+  "TROUBLE POINT",
   "HORN STROBE",
   "SPEAKER STROBE",
-  "ALARM RELAY",
-  "HEAT DETECTOR",
   "TAMPER SWITCH",
   "GATE VALVE",
+  "FIRE MONITOR",
+  "SUPERVISORY",
+  "MONITOR ZN",
   "HORN",
   "STROBE",
   "SPEAKER",
   "MODULE",
   "DETECTOR",
   "STATION",
+  "RELAY",
+  "SWITCH",
+  "VALVE",
 ];
+
+const KNOWN_STATUS_TOKENS = new Set([
+  "TRBL",
+  "TRBL*",
+  "TROUBLE",
+  "TROUBLE*",
+  "FIRE",
+  "FIRE*",
+  "ALARM",
+  "ALARM*",
+  "SUPV",
+  "SUPV*",
+  "SUPERVISORY",
+  "SUPERVISORY*",
+  "PRI2",
+  "PRI2*",
+  "DISABLE",
+  "DISABLED",
+  "DISAB",
+  "NORMAL",
+  "NORMAL*",
+  "ACKED",
+  "TEST",
+  "OPEN",
+  "SHORT",
+  "ACTIVE",
+  "OFF",
+  "ON",
+]);
 
 /** Strip echoed list command text that can appear mid-response. */
 function stripListCommandEcho(line) {
@@ -146,16 +186,18 @@ function stripListCommandEcho(line) {
 }
 
 /** Parse one panel list line into structured fields. */
-function parsePanelListLine(line) {
+export function parsePanelListLine(line) {
   const trimmed = stripListCommandEcho(line);
   if (!trimmed) return null;
   if (/_DNE|_END\b/i.test(trimmed)) return null;
   if (trimmed === "-") return null;
   if (/^list\s/i.test(trimmed)) return null;
+  if (/FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+|PRIORITY2\s*=\s*\d+/i.test(trimmed)) return null;
+  if (/^show\s+counts/i.test(trimmed)) return null;
 
   // Address may stand alone, or be followed by location / type / status text.
   // Trailing spaces from NUL padding are fine — do not require extra fields.
-  const match = trimmed.match(/^(?:(\d+):)?(M\d+-\d+(?:-\d+)?)(?:\s+(.*))?$/i);
+  const match = trimmed.match(/^(?:(\d+):)?(M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+|\d+-\d+(?:-\d+)?)(?:\s+(.*))?$/i);
   if (!match) return null;
 
   const node = match[1] || "";
@@ -177,10 +219,16 @@ function parsePanelListLine(line) {
     remainder = remainder.slice(leadingTime[0].length).trim();
   }
 
-  const statusMatch = remainder.match(/\s([A-Z]{2,6}\*?)\s*$/i);
-  const status = statusMatch ? statusMatch[1].toUpperCase() : "";
-  if (statusMatch) {
-    remainder = remainder.slice(0, statusMatch.index).trim();
+  // Extract status ONLY if it matches a known status token at the end
+  let status = "";
+  const words = remainder.split(/\s+/);
+  if (words.length > 0) {
+    const lastWord = words[words.length - 1].toUpperCase();
+    if (KNOWN_STATUS_TOKENS.has(lastWord)) {
+      status = lastWord;
+      words.pop();
+      remainder = words.join(" ").trim();
+    }
   }
 
   if (!panelTimeText) {
@@ -201,30 +249,49 @@ function parsePanelListLine(line) {
   let location = remainder;
   const upperRemainder = remainder.toUpperCase();
 
-  for (const type of PANEL_DEVICE_TYPES) {
-    if (upperRemainder.endsWith(type)) {
-      deviceType = type;
-      location = remainder.slice(0, remainder.length - type.length).trim();
-      break;
+  // Check CARD N (e.g. CARD 4, CARD 10, CARD-6)
+  const cardMatch = upperRemainder.match(/\bCARD\s*[-]?\s*(\d+)\b/i);
+  if (cardMatch) {
+    deviceType = `CARD ${cardMatch[1]}`;
+    location = remainder.replace(/\bCARD\s*[-]?\s*\d+\b/i, "").trim();
+  } else {
+    for (const type of PANEL_DEVICE_TYPES) {
+      if (upperRemainder.endsWith(type)) {
+        deviceType = type;
+        location = remainder.slice(0, remainder.length - type.length).trim();
+        break;
+      }
     }
   }
 
   if (!deviceType && remainder) {
-    const words = remainder.split(/\s+/);
-    if (words.length >= 2) {
-      deviceType = words.slice(-2).join(" ").toUpperCase();
-      location = words.slice(0, -2).join(" ");
+    if (/^P\d+$/i.test(deviceAddress)) {
+      deviceType = "TROUBLE POINT";
+      location = remainder;
     } else {
-      deviceType = remainder.toUpperCase();
-      location = "";
+      const remWords = remainder.split(/\s+/);
+      if (remWords.length >= 3) {
+        deviceType = remWords.slice(-2).join(" ").toUpperCase();
+        location = remWords.slice(0, -2).join(" ");
+      } else if (remWords.length === 2) {
+        deviceType = remWords[1].toUpperCase();
+        location = remWords[0];
+      } else {
+        location = remainder;
+        deviceType = "—";
+      }
     }
+  }
+
+  if (!status) {
+    status = "TRBL";
   }
 
   return {
     fullAddress,
     deviceAddress,
-    location,
-    deviceType,
+    location: location || "—",
+    deviceType: deviceType || "—",
     status,
     label: status.replace(/\*$/, ""),
     panelTimeText,
@@ -253,20 +320,25 @@ export function formatPanelListTime(value) {
   return new Date(ms).toLocaleString();
 }
 
-/** Parse panel `list f|t|s` text into display rows. */
+/** Parse panel `list f|t|s` text into display rows with deduplication. */
 export function parsePanelListResponse(text) {
-  const entries = [];
+  const map = new Map();
   for (const line of splitPanelListLines(text)) {
     const parsed = parsePanelListLine(line);
-    if (parsed) entries.push(parsed);
+    if (parsed) {
+      const key = parsed.fullAddress || parsed.deviceAddress || parsed.location;
+      if (key) {
+        map.set(key, parsed);
+      }
+    }
   }
-  return entries;
+  return Array.from(map.values());
 }
 
 /**
  * Split a list dump into raw message lines.
- * Simplex often uses CR and/or fixed-width NUL padding with no clean newlines,
- * so we also break before every panel address (N:M#-#-#).
+ * Simplex often uses CR and/or fixed-width NUL padding with no clean newlines.
+ * We only insert breaks after a status token followed by a device address.
  */
 export function splitPanelListLines(text) {
   const normalized = String(text || "")
@@ -274,9 +346,10 @@ export function splitPanelListLines(text) {
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n");
 
-  // Force a line break before each device address so multi-row dumps parse fully.
+  // Only break before an address if preceded by a known status token or delimiter.
+  // Never break inside descriptions like "HRP-16" or "TECH AREA P16".
   const broken = normalized.replace(
-    /((?:\d+:)?M\d+-\d+(?:-\d+)?\s+)/gi,
+    /(?<=\b(?:TRBL\*?|FIRE\*?|ALARM\*?|SUPV\*?|SUPERVISORY\*?|PRI2\*?|ACKED|NORMAL|OFF|ON|-)\b)\s+((?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+|\d+-\d+)\s+)/gi,
     "\n$1",
   );
 
@@ -288,6 +361,7 @@ export function splitPanelListLines(text) {
       if (line === "-") return false;
       if (/_DNE|_END\b/i.test(line)) return false;
       if (/^list\s+[fts]\b/i.test(line)) return false;
+      if (/show\s+counts|FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+|PRIORITY2\s*=\s*\d+/i.test(line)) return false;
       return true;
     });
 }
@@ -358,3 +432,10 @@ export function readSimplexStatus(asset) {
   }
   return { F: 0, T: 0, S: 0 };
 }
+
+export {
+  syncPanelListWithTempArray,
+  getTempPanelList,
+  clearTempPanelList,
+} from "@/lib/firePanelListHistory";
+

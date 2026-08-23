@@ -2,6 +2,7 @@ import { createRequire } from "module";
 import path from "path";
 import { Worker } from "worker_threads";
 import { serverLog } from "../log";
+import { getSqlite } from "../db/client";
 
 /** Local require — works under tsx and packaged CJS. */
 function localRequire() {
@@ -37,7 +38,148 @@ type OutgoingMessage =
   | { type: "status"; id: string; connected: boolean; host: string; port: number }
   | { type: "chunk"; id: string; response: string; done: boolean }
   | { type: "result"; id: string; ok: true; response: string }
-  | { type: "result"; id: string; ok: false; error: string };
+  | { type: "result"; id: string; ok: false; error: string }
+  | { type: "panel-log"; entry: PanelLogEntry };
+
+// ---------------------------------------------------------------------------
+// Panel log — persistence + real-time SSE broadcast
+// ---------------------------------------------------------------------------
+
+export type PanelLogKind =
+  | "fire"
+  | "trouble"
+  | "supervisory"
+  | "acknowledged"
+  | "fire-acknowledged"
+  | "reset-in-progress"
+  | "reset-normal"
+  | "reset-complete"
+  | "reset-aborted"
+  | "reset"
+  | "cval"
+  | "system"
+  | "noise"
+  | "other"
+  | "unparsed";
+
+export interface PanelLogEntry {
+  kind: PanelLogKind;
+  raw: string;
+  at: string;
+  time?: string;
+  weekday?: string;
+  date?: string;
+  location?: string;
+  device?: string | null;
+  status?: string;
+  pointId?: string;
+  description?: string;
+  isListEntry?: boolean;
+  register?: "a0" | "a1" | "a2";
+  cval?: number;
+  systemType?: "error" | "login-success" | "banner";
+}
+
+export interface StoredPanelLog extends PanelLogEntry {
+  id: number;
+}
+
+/** Ring-buffer cap for panel_logs table. */
+const PANEL_LOG_MAX_ROWS = 2000;
+
+type LogSender = (entry: StoredPanelLog) => void;
+const panelLogSubscribers = new Set<LogSender>();
+
+function insertPanelLog(entry: PanelLogEntry): StoredPanelLog | null {
+  try {
+    const db = getSqlite();
+    const { lastInsertRowid } = db
+      .prepare(
+        "INSERT INTO panel_logs (kind, raw, data, at) VALUES (?, ?, ?, ?)",
+      )
+      .run(
+        entry.kind,
+        entry.raw.slice(0, 2000), // guard runaway raw lines
+        JSON.stringify(entry),
+        entry.at,
+      );
+
+    // Ring buffer: delete anything older than the last PANEL_LOG_MAX_ROWS rows
+    db.prepare(
+      `DELETE FROM panel_logs WHERE id <= (SELECT MAX(id) - ? FROM panel_logs)`,
+    ).run(PANEL_LOG_MAX_ROWS);
+
+    return { ...entry, id: Number(lastInsertRowid) };
+  } catch {
+    return null;
+  }
+}
+
+function broadcastPanelLog(stored: StoredPanelLog) {
+  for (const send of panelLogSubscribers) {
+    try {
+      send(stored);
+    } catch {
+      // ignore — client disconnected
+    }
+  }
+}
+
+/** Broadcast and persist a custom system message to panel logs. */
+export function logSystemMessage(raw: string): StoredPanelLog | null {
+  const stored = insertPanelLog({
+    kind: "system",
+    systemType: "banner",
+    raw,
+    description: raw,
+    at: new Date().toISOString(),
+  });
+  if (stored) broadcastPanelLog(stored);
+  return stored;
+}
+
+/**
+ * Subscribe to live panel log entries (SSE clients).
+ * Returns an unsubscribe function.
+ */
+export function subscribeToLivePanelLogs(
+  send: LogSender,
+): () => void {
+  panelLogSubscribers.add(send);
+  return () => panelLogSubscribers.delete(send);
+}
+
+/** Fetch the last `limit` panel log rows from SQLite. */
+export function getRecentPanelLogs(limit = 200): StoredPanelLog[] {
+  try {
+    const db = getSqlite();
+    const rows = db
+      .prepare(
+        "SELECT id, kind, raw, data, at FROM panel_logs ORDER BY id DESC LIMIT ?",
+      )
+      .all(limit) as Array<{ id: number; kind: string; raw: string; data: string; at: string }>;
+
+    return rows
+      .map((row) => {
+        let parsed: Partial<PanelLogEntry> = {};
+        try {
+          parsed = JSON.parse(row.data) as Partial<PanelLogEntry>;
+        } catch {
+          // ignore
+        }
+        return {
+          ...parsed,
+          id: row.id,
+          kind: row.kind as PanelLogKind,
+          raw: row.raw,
+          at: row.at,
+        } as StoredPanelLog;
+      })
+      .reverse(); // oldest first for display
+  } catch {
+    return [];
+  }
+}
 
 /** One telnet socket — fire panels reject a second simultaneous session. */
 let panelWorker: Worker | null = null;
@@ -211,6 +353,13 @@ function attachWorkerHandlers(worker: Worker) {
       if (!msg.connected) {
         addLog("Telnet socket closed");
       }
+      return;
+    }
+
+    // Live panel stream — persist to DB and broadcast to SSE subscribers
+    if (msg.type === "panel-log") {
+      const stored = insertPanelLog(msg.entry);
+      if (stored) broadcastPanelLog(stored);
       return;
     }
 

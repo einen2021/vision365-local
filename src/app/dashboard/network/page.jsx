@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { AppSidebar } from "@/components/app-sidebar";
 import {
   SidebarProvider,
@@ -21,15 +21,23 @@ import {
   Eye,
   Unplug,
   Radio,
+  Terminal,
+  PauseCircle,
+  PlayCircle,
+  Trash2,
 } from "lucide-react";
 import { usePageAuth } from "@/hooks/usePageAuth";
 import { useToast } from "@/hooks/use-toast";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { DashboardTopBar, DashboardPageContent } from "@/components/dashboard-header";
+import { apiUrl } from "@/lib/apiClient";
 
 const COMMAND_PLACEHOLDER = "cshow a0 cval";
 
+// ---------------------------------------------------------------------------
+// AlarmCard
+// ---------------------------------------------------------------------------
 function AlarmCard({ title, icon: Icon, total, register, tone, lastSync }) {
   const active = total > 0;
   const toneClasses = {
@@ -69,6 +77,286 @@ function AlarmCard({ title, icon: Icon, total, register, tone, lastSync }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Kind metadata
+// ---------------------------------------------------------------------------
+const KIND_META = {
+  fire:                { label: "FIRE",        color: "text-red-400",     bg: "bg-red-950/40",     priority: 0 },
+  trouble:             { label: "TRBL",        color: "text-yellow-400",  bg: "bg-yellow-950/30",  priority: 1 },
+  supervisory:         { label: "SUPV",        color: "text-purple-400",  bg: "bg-purple-950/30",  priority: 2 },
+  "fire-acknowledged": { label: "F-ACK",       color: "text-orange-400",  bg: "bg-orange-950/30",  priority: 3 },
+  acknowledged:        { label: "ACK",         color: "text-green-400",   bg: "bg-green-950/30",   priority: 4 },
+  "reset-in-progress": { label: "RESET-START", color: "text-blue-400",    bg: "bg-blue-950/30",    priority: 5 },
+  "reset-normal":      { label: "SYS-NORMAL",  color: "text-emerald-400", bg: "bg-emerald-950/30", priority: 6 },
+  "reset-complete":    { label: "RESET-OK",    color: "text-teal-400",    bg: "bg-teal-950/30",    priority: 7 },
+  "reset-aborted":     { label: "RESET-ABORT", color: "text-rose-400",    bg: "bg-rose-950/30",    priority: 8 },
+  reset:               { label: "RESET",       color: "text-indigo-400",  bg: "bg-indigo-950/30",  priority: 9 },
+  cval:                { label: "CVAL",        color: "text-cyan-400",    bg: "bg-cyan-950/30",    priority: 10 },
+  system:              { label: "SYS",         color: "text-blue-400",    bg: "",                  priority: 11 },
+  other:               { label: "EVT",         color: "text-slate-400",   bg: "",                  priority: 12 },
+  unparsed:            { label: "???",         color: "text-slate-500",   bg: "",                  priority: 13 },
+  noise:               { label: "~",           color: "text-slate-600",   bg: "",                  priority: 14 },
+};
+
+const REGISTER_LABELS = { a0: "Fire (A0)", a1: "Supervisory (A1)", a2: "Trouble (A2)" };
+const MAX_DISPLAY_LOGS = 300;
+
+function formatLogRow(entry) {
+  const meta = KIND_META[entry.kind] ?? KIND_META.other;
+
+  // CVAL row
+  if (entry.kind === "cval") {
+    const reg = REGISTER_LABELS[entry.register] ?? entry.register ?? "?";
+    return `${reg}: CVAL = ${entry.cval ?? "?"}`;
+  }
+
+  // System Reset rows
+  if (
+    entry.kind === "reset-in-progress" ||
+    entry.kind === "reset-normal" ||
+    entry.kind === "reset-complete" ||
+    entry.kind === "reset-aborted" ||
+    entry.kind === "reset"
+  ) {
+    const loc = entry.location ? `${entry.location}  |  ` : "";
+    return `${loc}${entry.status || entry.description || entry.raw}`;
+  }
+
+  // Event rows (fire/trouble/supervisory/acknowledged/other)
+  if (entry.location || entry.device || entry.status) {
+    const parts = [entry.location, entry.device, entry.status].filter(Boolean);
+    return parts.join("  |  ");
+  }
+
+  // List entries
+  if (entry.pointId) {
+    return `[${entry.pointId}] ${entry.description ?? ""} — ${entry.status ?? ""}`;
+  }
+
+  // System / fallback
+  return entry.raw?.slice(0, 120) ?? "";
+}
+
+function formatTime(iso) {
+  try {
+    return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch {
+    return iso;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PanelLogConsole
+// ---------------------------------------------------------------------------
+function PanelLogConsole({ connected }) {
+  const [logs, setLogs] = useState([]);
+  const [paused, setPaused] = useState(false);
+  const [filter, setFilter] = useState("all");
+  const [counts, setCounts] = useState({});
+  const bottomRef = useRef(null);
+  const pausedRef = useRef(false);
+  pausedRef.current = paused;
+
+  // ── Initial log fetch & continuous real-time SSE stream ───────────────────
+  useEffect(() => {
+    let active = true;
+    let es = null;
+    let reconnectTimer = null;
+
+    // 1. Fetch latest logs immediately on mount/re-render so console is never blank
+    const fetchInitialLogs = async () => {
+      try {
+        const url = apiUrl("/api/telnet/fire-panel/logs?limit=200");
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const initial = await res.json();
+        if (!active || !Array.isArray(initial)) return;
+
+        setLogs((prev) => {
+          const existingIds = new Set(prev.map((l) => l.id ?? `${l.raw}-${l.at}`));
+          const fresh = initial.filter((l) => !existingIds.has(l.id ?? `${l.raw}-${l.at}`));
+          const merged = [...prev, ...fresh];
+          return merged.length > MAX_DISPLAY_LOGS ? merged.slice(-MAX_DISPLAY_LOGS) : merged;
+        });
+
+        const initialCounts = {};
+        initial.forEach((l) => {
+          if (l.kind) initialCounts[l.kind] = (initialCounts[l.kind] ?? 0) + 1;
+        });
+        setCounts((prev) => ({ ...initialCounts, ...prev }));
+      } catch {
+        // ignore on boot
+      }
+    };
+
+    fetchInitialLogs();
+
+    // 2. Establish continuous SSE stream with auto-reconnect
+    const connectSSE = () => {
+      try {
+        const streamUrl = apiUrl("/api/telnet/fire-panel/logs/stream");
+        es = new EventSource(streamUrl);
+
+        es.onmessage = (e) => {
+          if (!active) return;
+          try {
+            const entry = JSON.parse(e.data);
+            if (!entry || !entry.kind) return;
+
+            setLogs((prev) => {
+              // Deduplicate by id if present, or by raw+at
+              const entryKey = entry.id != null ? entry.id : `${entry.raw}-${entry.at}`;
+              const exists = prev.some((l) => (l.id != null ? l.id === entry.id : `${l.raw}-${l.at}` === entryKey));
+              if (exists) return prev;
+
+              const next = [...prev, entry];
+              return next.length > MAX_DISPLAY_LOGS ? next.slice(-MAX_DISPLAY_LOGS) : next;
+            });
+
+            setCounts((prev) => ({ ...prev, [entry.kind]: (prev[entry.kind] ?? 0) + 1 }));
+          } catch {
+            // ignore heartbeat or comments
+          }
+        };
+
+        es.onerror = () => {
+          if (!active) return;
+          if (es) {
+            es.close();
+            es = null;
+          }
+          // Auto reconnect after 2s
+          reconnectTimer = setTimeout(connectSSE, 2000);
+        };
+      } catch {
+        reconnectTimer = setTimeout(connectSSE, 3000);
+      }
+    };
+
+    connectSSE();
+
+    return () => {
+      active = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (es) es.close();
+    };
+  }, []);
+
+  // ── Auto-scroll ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!pausedRef.current && bottomRef.current) {
+      bottomRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [logs]);
+
+  const clearLogs = useCallback(() => {
+    setLogs([]);
+    setCounts({});
+  }, []);
+
+  // ── Filtering ─────────────────────────────────────────────────────────────
+  const filters = [
+    "all",
+    "fire",
+    "trouble",
+    "supervisory",
+    "fire-acknowledged",
+    "acknowledged",
+    "reset-in-progress",
+    "reset-normal",
+    "reset-complete",
+    "reset-aborted",
+    "cval",
+    "system",
+  ];
+  const displayed = filter === "all"
+    ? logs
+    : logs.filter((l) => l.kind === filter);
+
+  const fireCount = counts.fire ?? 0;
+  const troubleCount = counts.trouble ?? 0;
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="flex items-center gap-2">
+            <Terminal className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-base">Panel live log</CardTitle>
+            {fireCount > 0 && (
+              <Badge variant="destructive" className="text-xs">{fireCount} fire</Badge>
+            )}
+            {troubleCount > 0 && (
+              <Badge className="text-xs bg-yellow-600 hover:bg-yellow-600">{troubleCount} trouble</Badge>
+            )}
+          </div>
+          <div className="flex items-center gap-1">
+            <Button size="sm" variant="ghost" onClick={() => setPaused((p) => !p)} className="h-7 px-2 text-xs">
+              {paused ? <PlayCircle className="h-3.5 w-3.5 mr-1" /> : <PauseCircle className="h-3.5 w-3.5 mr-1" />}
+              {paused ? "Resume" : "Pause"}
+            </Button>
+            <Button size="sm" variant="ghost" onClick={clearLogs} className="h-7 px-2 text-xs text-muted-foreground">
+              <Trash2 className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </div>
+        <CardDescription>
+          Live TCP stream from fire panel — parsed and categorised in real-time
+        </CardDescription>
+        {/* Filter tabs */}
+        <div className="flex flex-wrap gap-1 pt-1">
+          {filters.map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                filter === f
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:bg-muted/80"
+              }`}
+            >
+              {f === "all" ? `All (${logs.length})` : `${KIND_META[f]?.label ?? f} (${counts[f] ?? 0})`}
+            </button>
+          ))}
+        </div>
+      </CardHeader>
+      <CardContent className="p-0">
+        {displayed.length === 0 ? (
+          <p className="p-4 text-xs text-muted-foreground">
+            {!connected ? "Connect to the panel to stream live logs." : "Waiting for panel data…"}
+          </p>
+        ) : (
+          <div className="max-h-72 overflow-auto font-mono text-[11px]">
+            {displayed.map((entry, i) => {
+              const meta = KIND_META[entry.kind] ?? KIND_META.other;
+              return (
+                <div
+                  key={entry.id ?? i}
+                  className={`flex items-start gap-2 border-b border-border/30 px-3 py-1 leading-snug last:border-0 ${meta.bg}`}
+                >
+                  <span className="shrink-0 text-muted-foreground/60 tabular-nums">
+                    {formatTime(entry.at)}
+                  </span>
+                  <span className={`shrink-0 w-11 text-right font-bold ${meta.color}`}>
+                    {meta.label}
+                  </span>
+                  <span className="break-all text-foreground/90">
+                    {formatLogRow(entry)}
+                  </span>
+                </div>
+              );
+            })}
+            <div ref={bottomRef} />
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
 export default function NetworkTelnetPage() {
   const { isReady } = usePageAuth({ redirectIfLoggedOut: true });
   const { toast } = useToast();
@@ -169,7 +457,7 @@ export default function NetworkTelnetPage() {
             <div>
               <h1 className="text-2xl font-semibold">Fire Panel Network</h1>
               <p className="text-sm text-muted-foreground">
-                Connect to the panel and send manual telnet commands
+                Connect to the panel and stream live data
               </p>
             </div>
           </div>
@@ -283,25 +571,8 @@ export default function NetworkTelnetPage() {
                 </p>
               ) : null}
 
-              <Card>
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-base">Log console</CardTitle>
-                  <CardDescription>
-                    CVAL monitor output (a0 fire, a1 supervisory, a2 trouble)
-                  </CardDescription>
-                </CardHeader>
-                <CardContent>
-                  {firePanelMonitorLogs.length > 0 ? (
-                    <pre className="max-h-56 overflow-auto rounded border bg-muted/40 p-3 text-xs font-mono whitespace-pre-wrap">
-                      {firePanelMonitorLogs.join("\n")}
-                    </pre>
-                  ) : (
-                    <p className="text-xs text-muted-foreground">
-                      Click Monitor Data to start reading CVAL registers.
-                    </p>
-                  )}
-                </CardContent>
-              </Card>
+              {/* Live log console — replaces the old CVAL-only pre block */}
+              <PanelLogConsole connected={isConnected} />
 
               <div className="space-y-2">
                 <p className="text-xs text-muted-foreground">

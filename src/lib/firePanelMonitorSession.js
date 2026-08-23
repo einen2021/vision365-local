@@ -95,13 +95,12 @@ export async function withMonitorPaused(fn) {
   const run = state.exclusiveCommandChain.then(async () => {
     pauseMonitorLoop();
     try {
-      // Wait long enough for an in-flight list t/f/s to finish before starting ours.
-      await waitForMonitorYield(180000);
-      // Brief settle so leftover CVAL bytes are less likely to pollute the next command.
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      if (isMonitorLoopActive() && isMonitorCycleRunning()) {
+        await waitForMonitorYield(180000);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
       return await fn();
     } finally {
-      // Decrement only this pause — do not clear a parent hold (e.g. open modal).
       resumeMonitorLoop();
     }
   });

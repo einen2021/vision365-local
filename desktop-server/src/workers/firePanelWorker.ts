@@ -1,5 +1,47 @@
-import net from "net";
+import * as net from "net";
 import { parentPort } from "worker_threads";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+type PanelLogKind =
+  | "fire"
+  | "trouble"
+  | "supervisory"
+  | "acknowledged"
+  | "fire-acknowledged"
+  | "reset-in-progress"
+  | "reset-normal"
+  | "reset-complete"
+  | "reset-aborted"
+  | "reset"
+  | "cval"
+  | "system"
+  | "noise"
+  | "other"
+  | "unparsed";
+
+interface PanelLogEntry {
+  kind: PanelLogKind;
+  raw: string;
+  at: string;
+  // Event record (fire / trouble / acknowledged / other)
+  time?: string;
+  weekday?: string;
+  date?: string;
+  location?: string;
+  device?: string | null;
+  status?: string;
+  // List entry
+  pointId?: string;
+  description?: string;
+  isListEntry?: boolean;
+  // CVAL
+  register?: "a0" | "a1" | "a2";
+  cval?: number;
+  systemType?: "error" | "login-success" | "banner";
+}
 
 type IncomingMessage =
   | { type: "connect"; id?: string; host: string; port: number }
@@ -10,233 +52,529 @@ type IncomingMessage =
       id: string;
       command: string;
       timeoutMs?: number;
-      /** For list f/t/s: keep waiting until this many device rows arrive. */
       expectedCount?: number;
+      priority?: boolean;
     };
-
-/** How long TCP connect may take before we fail (panel offline / wrong IP). */
-const TCP_CONNECT_TIMEOUT_MS = 10000;
 
 type OutgoingMessage =
   | { type: "connected"; connected: boolean; host: string; port: number }
   | { type: "status"; id: string; connected: boolean; host: string; port: number }
+  | { type: "panel-log"; entry: PanelLogEntry }
   | { type: "chunk"; id: string; response: string; done: boolean }
   | { type: "result"; id: string; ok: true; response: string }
   | { type: "result"; id: string; ok: false; error: string };
 
-const CONNECT_DELAY_MS = 300;
-const COMMAND_TIMEOUT_MS = 2000;
-/**
- * Soft timeout for list commands: reset on each data chunk so slow dumps keep going.
- * Absolute ceiling still applies so a stuck panel cannot hang forever.
- */
-const LIST_COMMAND_TIMEOUT_MS = 120000;
-const LIST_COMMAND_ABSOLUTE_MS = 300000;
-const SHOW_COMMAND_TIMEOUT_MS = 8000;
-const BULK_COMMAND_TIMEOUT_MS = 60000;
-/** Resolve when no bytes arrive for this long (panel finished sending) */
-const IDLE_COMPLETE_MS = 100;
-const SHOW_IDLE_COMPLETE_MS = 300;
-const CVAL_IDLE_COMPLETE_MS = 450;
-const LIST_IDLE_COMPLETE_MS = 250;
-/**
- * After at least one list row arrives, finish if the panel goes quiet this long
- * even without full CVAL / _DNE — stream what we have to the UI.
- */
-const LIST_IDLE_AFTER_ROWS_MS = 800;
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-let client: net.Socket | null = null;
+const TCP_CONNECT_TIMEOUT_MS = 10_000;
+const KEEPALIVE_INTERVAL_MS = 15_000;
+
+// ---------------------------------------------------------------------------
+// PanelDataParser
+// ---------------------------------------------------------------------------
+
+const DEVICE_TYPES = [
+  "SUPERVISORY MONITOR",
+  "SYSTEM POWER SUPPLY",
+  "IDNET CARD",
+  "SMOKE DETECTOR",
+  "PULL STATION",
+  "ALARM RELAY",
+  "AUXILIARY RELAY",
+  "TROUBLE POINT",
+];
+
+function splitLocationAndDevice(desc: string): {
+  location: string;
+  device: string | null;
+} {
+  let best: { idx: number; dt: string } | null = null;
+  for (const dt of DEVICE_TYPES) {
+    const idx = desc.lastIndexOf(dt);
+    if (idx !== -1 && (best === null || idx > best.idx)) {
+      best = { idx, dt };
+    }
+  }
+  if (best) {
+    return { location: desc.slice(0, best.idx).trim(), device: best.dt };
+  }
+  return { location: desc.trim(), device: null };
+}
+
+const RE_EVENT_HEADER =
+  /^-?\s*(\d{1,2}:\d{2}:\d{2}\s*[ap]m)\s+([A-Z]{3})\s+(\d{2}-[A-Z]{3}-\d{2})\s+(.+?)\s*$/i;
+const RE_EVENT_DETAIL = /^\s*(\S.*?)\s{2,}(\S.*?)\s*$/;
+// Panel list dumps (list f/t/s) mark rows with a trailing "*" (e.g. "TRBL*", "SUPV*") —
+// match every status token the panel can send, with or without the asterisk.
+const RE_LIST_ENTRY = /^(\S+)\s+(.+?)\s+(TRBL|FIRE|SUPV|SUPR|SUPERVISORY|ALARM|PRI2)\*?\s*$/i;
+const RE_ERROR = /^%ERROR\b/i;
+const RE_LOGIN_OK = /^ACCESS GRANTED\s*$/i;
+const RE_BANNER = /panel service port|reserved for authorized personnel/i;
+const RE_CVAL_REGISTER = /^~A([012])/i;
+const RE_CVAL_VALUE = /^CVAL\s*=\s*(\d+)/i;
+
+const ID_PATTERN = "(?:\\d+:M\\d+-\\d+-\\d+|\\d+-\\d+-\\d+|P\\d+)";
+const HEADER_PATTERN =
+  "-?\\s*\\d{1,2}:\\d{2}:\\d{2}\\s*[ap]m\\s+[A-Z]{3}\\s+\\d{2}-[A-Z]{3}-\\d{2}";
+const RE_GLUE_BOUNDARY = new RegExp(
+  "(TRBL|FIRE)\\s*(?=" + ID_PATTERN + "\\s+[A-Z]|" + HEADER_PATTERN + ")",
+  "i",
+);
+
+interface PendingHeader {
+  time: string;
+  weekday: string;
+  date: string;
+  location: string;
+  raw: string;
+}
+
+class PanelDataParser {
+  private _buffer = "";
+  private _maxBufferLen: number;
+  private _pendingHeader: PendingHeader | null = null;
+  /** CVAL register (~A0/A1/A2) waiting for the CVAL=N line. */
+  private _pendingCvalRegister: "0" | "1" | "2" | null = null;
+  private _onEntry: (entry: PanelLogEntry) => void;
+
+  constructor(
+    onEntry: (entry: PanelLogEntry) => void,
+    maxBufferLen = 1_000_000,
+  ) {
+    this._onEntry = onEntry;
+    this._maxBufferLen = maxBufferLen;
+  }
+
+  feed(chunk: Buffer | string): void {
+    this._buffer += chunk.toString("utf8");
+    if (this._buffer.length > this._maxBufferLen) {
+      this._buffer = this._buffer.slice(-this._maxBufferLen);
+    }
+    let idx: number;
+    while ((idx = this._buffer.indexOf("\n")) !== -1) {
+      const rawLine = this._buffer.slice(0, idx).replace(/\r$/, "");
+      this._buffer = this._buffer.slice(idx + 1);
+      this._processLine(rawLine);
+    }
+  }
+
+  flush(): void {
+    if (this._buffer.trim().length) {
+      this._processLine(this._buffer);
+    }
+    this._buffer = "";
+    this._flushPendingHeader();
+  }
+
+  private _processLine(rawLine: string): void {
+    const line = this._sanitizeLine(rawLine);
+
+    if (!line) {
+      this._flushPendingHeader();
+      return;
+    }
+
+    if (this._tryEventHeader(line)) return;
+    if (this._pendingHeader && this._trySystemResetDetail(line)) return;
+    if (this._pendingHeader && this._tryEventDetail(line)) return;
+    if (this._tryStandaloneSystemReset(line, rawLine)) return;
+    if (this._tryListEntry(line)) return;
+    if (this._trySystemLine(line, rawLine)) return;
+    if (this._trySplitGluedLine(line)) return;
+
+    this._flushPendingHeader();
+    this._onEntry({ kind: "unparsed", raw: rawLine, at: new Date().toISOString() });
+  }
+
+  private _sanitizeLine(rawLine: string): string {
+    const line = rawLine
+      .replace(/\/\/[^/]*$/, "")
+      .replace(/\r/g, "")
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "")
+      .replace(/\s+$/, "");
+
+    if (!line.trim()) return "";
+
+    if (!/[A-Za-z0-9]/.test(line)) {
+      this._onEntry({ kind: "noise", raw: rawLine, at: new Date().toISOString() });
+      return "";
+    }
+
+    return line;
+  }
+
+  private _tryEventHeader(line: string): boolean {
+    const m = RE_EVENT_HEADER.exec(line);
+    if (!m) return false;
+    if (RE_GLUE_BOUNDARY.test(line)) return false;
+
+    this._flushPendingHeader();
+    this._pendingHeader = {
+      time: m[1].replace(/\s+/, " ").trim(),
+      weekday: m[2],
+      date: m[3],
+      location: m[4].trim(),
+      raw: line,
+    };
+    return true;
+  }
+
+  private _trySystemResetDetail(line: string): boolean {
+    const trimmed = line.trim();
+    let kind: PanelLogKind | null = null;
+    let status = "";
+    let description = "";
+
+    if (/SYSTEM\s+RESET\s+IN\s+PROGRESS/i.test(trimmed)) {
+      kind = "reset-in-progress";
+      status = "SYSTEM RESET IN PROGRESS";
+      description = "System Reset in Progress";
+    } else if (/SYSTEM\s+IS\s+NORMAL/i.test(trimmed)) {
+      kind = "reset-normal";
+      status = "SYSTEM IS NORMAL";
+      description = "System is Normal";
+    } else if (/ALARM\s+PRESENT[,\s]+SYSTEM\s+RESET\s+ABORTED|SYSTEM\s+RESET\s+ABORTED/i.test(trimmed)) {
+      kind = "reset-aborted";
+      status = "ALARM PRESENT, SYSTEM RESET ABORTED";
+      description = "Alarm Present, System Reset Aborted";
+    } else if (/NO\s+ALARM\s+PRESENT[,\s]+SYSTEM\s+RESET\s+COMPLETE|SYSTEM\s+RESET\s+COMPLETE/i.test(trimmed)) {
+      kind = "reset-complete";
+      status = "NO ALARM PRESENT, SYSTEM RESET COMPLETE";
+      description = "No Alarm Present, System Reset Complete";
+    }
+
+    if (!kind) return false;
+
+    const record: PanelLogEntry = {
+      kind,
+      time: this._pendingHeader!.time,
+      weekday: this._pendingHeader!.weekday,
+      date: this._pendingHeader!.date,
+      location: this._pendingHeader!.location,
+      status,
+      description,
+      raw: `${this._pendingHeader!.raw} | ${line}`,
+      at: new Date().toISOString(),
+    };
+    this._pendingHeader = null;
+    this._onEntry(record);
+    return true;
+  }
+
+  private _tryStandaloneSystemReset(line: string, rawLine: string): boolean {
+    const trimmed = line.trim();
+    let kind: PanelLogKind | null = null;
+    let status = "";
+    let description = "";
+
+    if (/SYSTEM\s+RESET\s+IN\s+PROGRESS/i.test(trimmed)) {
+      kind = "reset-in-progress";
+      status = "SYSTEM RESET IN PROGRESS";
+      description = "System Reset in Progress";
+    } else if (/SYSTEM\s+IS\s+NORMAL/i.test(trimmed)) {
+      kind = "reset-normal";
+      status = "SYSTEM IS NORMAL";
+      description = "System is Normal";
+    } else if (/ALARM\s+PRESENT[,\s]+SYSTEM\s+RESET\s+ABORTED|SYSTEM\s+RESET\s+ABORTED/i.test(trimmed)) {
+      kind = "reset-aborted";
+      status = "ALARM PRESENT, SYSTEM RESET ABORTED";
+      description = "Alarm Present, System Reset Aborted";
+    } else if (/NO\s+ALARM\s+PRESENT[,\s]+SYSTEM\s+RESET\s+COMPLETE|SYSTEM\s+RESET\s+COMPLETE/i.test(trimmed)) {
+      kind = "reset-complete";
+      status = "NO ALARM PRESENT, SYSTEM RESET COMPLETE";
+      description = "No Alarm Present, System Reset Complete";
+    }
+
+    if (!kind) return false;
+
+    this._flushPendingHeader();
+    this._onEntry({
+      kind,
+      status,
+      description,
+      raw: rawLine,
+      at: new Date().toISOString(),
+    });
+    return true;
+  }
+
+  private _tryEventDetail(line: string): boolean {
+    const m = RE_EVENT_DETAIL.exec(line);
+    if (!m) return false;
+    const device = m[1].trim();
+    const status = m[2].trim();
+
+    const record: Omit<PanelLogEntry, "kind"> = {
+      time: this._pendingHeader!.time,
+      weekday: this._pendingHeader!.weekday,
+      date: this._pendingHeader!.date,
+      location: this._pendingHeader!.location,
+      device,
+      status,
+      raw: `${this._pendingHeader!.raw} | ${line}`,
+      at: new Date().toISOString(),
+    };
+    this._pendingHeader = null;
+    this._routeEvent(record as PanelLogEntry);
+    return true;
+  }
+
+  private _routeEvent(record: PanelLogEntry): void {
+    let kind: PanelLogKind;
+    const status = record.status || "";
+    const device = record.device || "";
+
+    if (/SYSTEM\s+RESET\s+IN\s+PROGRESS/i.test(status)) {
+      kind = "reset-in-progress";
+    } else if (/SYSTEM\s+IS\s+NORMAL/i.test(status)) {
+      kind = "reset-normal";
+    } else if (/SYSTEM\s+RESET\s+ABORTED/i.test(status)) {
+      kind = "reset-aborted";
+    } else if (/SYSTEM\s+RESET\s+COMPLETE/i.test(status)) {
+      kind = "reset-complete";
+    } else if (/^FIRE ALARM\b.*ACKED/i.test(status)) {
+      kind = "fire-acknowledged";
+    } else if (/^FIRE ALARM$/i.test(status)) {
+      kind = "fire";
+    } else if (/^NORMAL ACKED$/i.test(status)) {
+      kind = "acknowledged";
+    } else if (/SUPERVISORY|SUPV|SUPR/i.test(status) || /SUPERVISORY/i.test(device)) {
+      if (/ACKED/i.test(status)) {
+        kind = "acknowledged";
+      } else {
+        kind = "supervisory";
+      }
+    } else if (/TROUBLE|TRBL|DIRTY|NO ANSWER/i.test(status)) {
+      if (/ACKED/i.test(status)) {
+        kind = "acknowledged";
+      } else {
+        kind = "trouble";
+      }
+    } else if (/ACKED/i.test(status)) {
+      kind = "acknowledged";
+    } else {
+      kind = "other";
+    }
+    this._onEntry({ ...record, kind });
+  }
+
+  private _tryListEntry(line: string): boolean {
+    const m = RE_LIST_ENTRY.exec(line);
+    if (!m) return false;
+    if (RE_GLUE_BOUNDARY.test(line)) return false;
+
+    const pointId = m[1];
+    const desc = m[2].trim();
+    const status = m[3];
+    const { location, device } = splitLocationAndDevice(desc);
+
+    const upperStatus = status.toUpperCase();
+    const kind: PanelLogKind = /^(FIRE|ALARM)/.test(upperStatus)
+      ? "fire"
+      : /SUPV|SUPR|SUPERVISORY/.test(upperStatus)
+        ? "supervisory"
+        : "trouble";
+
+    this._onEntry({
+      kind,
+      raw: line,
+      at: new Date().toISOString(),
+      pointId,
+      location,
+      device,
+      description: desc,
+      status,
+      isListEntry: true,
+    });
+    return true;
+  }
+
+  private _trySystemLine(line: string, rawLine: string): boolean {
+    // CVAL register line: ~A0, ~A1, ~A2
+    const regMatch = RE_CVAL_REGISTER.exec(line);
+    if (regMatch) {
+      this._pendingCvalRegister = regMatch[1] as "0" | "1" | "2";
+      return true; // swallow silently — CVAL=N line follows
+    }
+
+    // CVAL value line: CVAL=261
+    const cvalMatch = RE_CVAL_VALUE.exec(line);
+    if (cvalMatch) {
+      const registerMap: Record<string, "a0" | "a1" | "a2"> = {
+        "0": "a0",
+        "1": "a1",
+        "2": "a2",
+      };
+      const register = this._pendingCvalRegister !== null
+        ? registerMap[this._pendingCvalRegister]
+        : undefined;
+      this._pendingCvalRegister = null;
+      this._onEntry({
+        kind: "cval",
+        raw: line,
+        at: new Date().toISOString(),
+        register,
+        cval: Number(cvalMatch[1]),
+      });
+      return true;
+    }
+
+    // Show counts lines: show counts, FIRE = N, TROUBLE = N, SUPERVISORY = N, PRIORITY2 = N
+    if (/show\s+counts|FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+/i.test(line)) {
+      this._onEntry({ kind: "system", systemType: "banner", raw: rawLine, at: new Date().toISOString() });
+      return true;
+    }
+
+    if (RE_ERROR.test(line)) {
+      this._onEntry({ kind: "system", systemType: "error", raw: rawLine, at: new Date().toISOString() });
+      return true;
+    }
+    if (RE_LOGIN_OK.test(line)) {
+      this._onEntry({ kind: "system", systemType: "login-success", raw: rawLine, at: new Date().toISOString() });
+      return true;
+    }
+    if (RE_BANNER.test(line)) {
+      this._onEntry({ kind: "system", systemType: "banner", raw: rawLine, at: new Date().toISOString() });
+      return true;
+    }
+    if (/^!.*!$/.test(line.trim()) || /^-+$/.test(line.trim())) {
+      this._onEntry({ kind: "system", systemType: "banner", raw: rawLine, at: new Date().toISOString() });
+      return true;
+    }
+
+    return false;
+  }
+
+  private _trySplitGluedLine(line: string): boolean {
+    // 1. Split if another event header is embedded mid-line (e.g. SYSTEM IS NORMAL -  3:58:16 am...)
+    const headerMatch = /(?<=\S)\s{2,}(?=-?\s*\d{1,2}:\d{2}:\d{2}\s*[ap]m\s+[A-Z]{3}\s+\d{2}-[A-Z]{3}-\d{2})/i.exec(line);
+    if (headerMatch) {
+      const splitIdx = headerMatch.index;
+      const first = line.slice(0, splitIdx);
+      const second = line.slice(splitIdx);
+      if (first.trim() && second.trim()) {
+        this._processLine(first);
+        this._processLine(second);
+        return true;
+      }
+    }
+
+    const m = RE_GLUE_BOUNDARY.exec(line);
+    if (!m) return false;
+    const splitIdx = m.index + m[1].length;
+    const first = line.slice(0, splitIdx);
+    const second = line.slice(splitIdx);
+    if (!first.trim() || !second.trim()) return false;
+    this._processLine(first);
+    this._processLine(second);
+    return true;
+  }
+
+  private _flushPendingHeader(): void {
+    if (this._pendingHeader) {
+      this._onEntry({
+        kind: "unparsed",
+        raw: this._pendingHeader.raw,
+        at: new Date().toISOString(),
+      });
+      this._pendingHeader = null;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Socket state
+// ---------------------------------------------------------------------------
+
+let socket: net.Socket | null = null;
 let currentHost = "";
 let currentPort = 23;
 let connectInFlight: Promise<void> | null = null;
+let parser: PanelDataParser | null = null;
 
-/** Serialize telnet commands — only one in flight on the socket at a time.
- * Priority jobs (ack / silence / login) jump ahead of queued list/CVAL work.
- */
-type QueuedCommand = {
-  priority: boolean;
-  run: () => Promise<unknown>;
-  resolve: (value: unknown) => void;
-  reject: (err: Error) => void;
-};
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-let commandQueue: QueuedCommand[] = [];
-let commandPumpRunning = false;
-
-/** Active command fail handlers — cleared when the socket drops mid-command. */
-const activeCommandFails = new Set<(err: Error) => void>();
-
-/**
- * When a list dump is in flight, priority commands (ack / silence / login)
- * call this to finish early so fire ack is not stuck behind list t (200+ rows).
- */
-let preemptActiveList: (() => void) | null = null;
-
-function resetCommandQueue(reason?: string) {
-  const err = new Error(reason || "Not connected");
-  for (const job of commandQueue) {
-    try {
-      job.reject(err);
-    } catch {
-      // ignore
-    }
-  }
-  commandQueue = [];
+function post(msg: OutgoingMessage) {
+  parentPort?.postMessage(msg);
 }
 
-function failActiveCommands(reason: string) {
-  const err = new Error(reason);
-  for (const fail of [...activeCommandFails]) {
-    try {
-      fail(err);
-    } catch {
-      // ignore
-    }
-  }
-  activeCommandFails.clear();
+function isSocketLive(sock: net.Socket | null): sock is net.Socket {
+  return Boolean(sock && !sock.destroyed && sock.writable);
 }
 
-/** Drop not-yet-started list/CVAL jobs so ack can run first. */
-function deferPendingNonPriorityCommands(reason: string) {
-  if (commandQueue.length === 0) return;
-  const kept: QueuedCommand[] = [];
-  let deferred = 0;
-  for (const job of commandQueue) {
-    if (!job.priority) {
-      deferred += 1;
-      try {
-        job.reject(new Error(reason));
-      } catch {
-        // ignore
-      }
-    } else {
-      kept.push(job);
-    }
-  }
-  if (deferred > 0) {
-    console.warn(
-      `[fire-panel] deferred ${deferred} queued command(s): ${reason}`,
-    );
-  }
-  commandQueue = kept;
-}
-
-function enqueueCommand<T>(
-  fn: () => Promise<T>,
-  options: { priority?: boolean } = {},
-): Promise<T> {
-  const priority = Boolean(options.priority);
-
-  return new Promise<T>((resolve, reject) => {
-    const job: QueuedCommand = {
-      priority,
-      run: fn,
-      resolve: resolve as (value: unknown) => void,
-      reject,
-    };
-
-    if (priority) {
-      // Insert after other priority jobs, before any non-priority work.
-      let insertAt = 0;
-      while (insertAt < commandQueue.length && commandQueue[insertAt].priority) {
-        insertAt += 1;
-      }
-      commandQueue.splice(insertAt, 0, job);
-    } else {
-      commandQueue.push(job);
-    }
-
-    void pumpCommandQueue();
+function createParser(): PanelDataParser {
+  return new PanelDataParser((entry) => {
+    // Drop pure noise from the SSE/DB stream — too high volume
+    if (entry.kind === "noise") return;
+    post({ type: "panel-log", entry });
   });
 }
 
-async function pumpCommandQueue() {
-  if (commandPumpRunning) return;
-  commandPumpRunning = true;
-  try {
-    while (commandQueue.length > 0) {
-      const job = commandQueue.shift();
-      if (!job) break;
-      try {
-        const result = await job.run();
-        job.resolve(result);
-      } catch (err) {
-        job.reject(err as Error);
-      }
-    }
-  } finally {
-    commandPumpRunning = false;
-    if (commandQueue.length > 0) {
-      void pumpCommandQueue();
-    }
-  }
-}
-
-function isSocketLive(socket: net.Socket | null) {
-  return Boolean(socket && !socket.destroyed && socket.writable);
-}
+// ---------------------------------------------------------------------------
+// Connect / disconnect
+// ---------------------------------------------------------------------------
 
 async function connect(host: string, port: number) {
-  if (isSocketLive(client) && currentHost === host && currentPort === port) {
-    post({ type: "connected", connected: true, host: currentHost, port: currentPort });
+  if (isSocketLive(socket) && currentHost === host && currentPort === port) {
+    post({ type: "connected", connected: true, host, port });
     return;
   }
 
   if (connectInFlight) {
     await connectInFlight;
-    if (!isSocketLive(client)) {
-      throw new Error("Failed to connect to fire panel");
-    }
+    if (!isSocketLive(socket)) throw new Error("Failed to connect to fire panel");
     return;
   }
 
   connectInFlight = (async () => {
-    if (client) {
-      client.removeAllListeners("close");
-      client.removeAllListeners("error");
-      client.destroy();
-      client = null;
+    if (socket) {
+      const prev = socket;
+      socket = null;
+      parser?.flush();
+      parser = null;
+      prev.removeAllListeners();
+      prev.destroy();
     }
 
     await new Promise<void>((resolve, reject) => {
-      const socket = new net.Socket();
-      let settled = false;
+      const sock = new net.Socket();
 
-      const fail = (err: Error) => {
-        if (settled) return;
-        settled = true;
-        try {
-          socket.destroy();
-        } catch {
-          // ignore
-        }
-        reject(err);
+      const cleanup = () => {
+        sock.removeListener("connect", onConnect);
+        sock.removeListener("error", onError);
+        sock.removeListener("timeout", onTimeout);
+        sock.destroy();
       };
+      const onError = (err: Error) => { cleanup(); reject(err); };
+      const onTimeout = () => {
+        cleanup();
+        reject(new Error(`TCP connect timed out after ${TCP_CONNECT_TIMEOUT_MS}ms`));
+      };
+      const onConnect = () => {
+        sock.removeListener("error", onError);
+        sock.removeListener("timeout", onTimeout);
+        sock.setTimeout(0);
+        sock.setKeepAlive(true, KEEPALIVE_INTERVAL_MS);
+        sock.setNoDelay(true);
 
-      socket.setKeepAlive(true, 15000);
-      socket.setNoDelay(true);
-      // Fail fast if the panel never accepts the TCP connection.
-      socket.setTimeout(TCP_CONNECT_TIMEOUT_MS);
-      socket.once("timeout", () => {
-        fail(
-          new Error(
-            `Connection timed out after ${TCP_CONNECT_TIMEOUT_MS / 1000}s (${host}:${port})`,
-          ),
-        );
-      });
-      socket.once("error", (err) => fail(err));
-      socket.connect(port, host, () => {
-        if (settled) return;
-        settled = true;
-        // After connect succeeds, disable the connect timeout (idle traffic is fine).
-        socket.setTimeout(0);
-        client = socket;
+        socket = sock;
         currentHost = host;
         currentPort = port;
-        attachSocketHandlers(socket);
-        // Brief settle so the panel can send its initial banner before commands.
-        setTimeout(resolve, CONNECT_DELAY_MS);
-      });
+        parser = createParser();
+
+        attachSocketHandlers(sock);
+        resolve();
+      };
+
+      sock.setTimeout(TCP_CONNECT_TIMEOUT_MS);
+      sock.once("connect", onConnect);
+      sock.once("error", onError);
+      sock.once("timeout", onTimeout);
+      sock.connect(port, host);
     });
 
     post({ type: "connected", connected: true, host: currentHost, port: currentPort });
@@ -249,510 +587,366 @@ async function connect(host: string, port: number) {
   }
 }
 
-function post(msg: OutgoingMessage) {
-  parentPort?.postMessage(msg);
+// ---------------------------------------------------------------------------
+// Active Command Response Collection
+// ---------------------------------------------------------------------------
+
+interface PendingCommand {
+  id: string;
+  command: string;
+  buffer: string;
+  expectedCount?: number;
+  /** Original per-gap budget — reused to extend timeoutTimer while a list dump is still progressing. */
+  timeoutMs: number;
+  timeoutTimer: NodeJS.Timeout;
+  silenceTimer: NodeJS.Timeout | null;
+  priority?: boolean;
+  /** Highest list-row address count seen so far, for progress-based deadline extension. */
+  lastProgressCount?: number;
 }
 
-/** Remove hidden control chars (paste/JSON) and collapse whitespace. */
-function cleanCommandText(command: string) {
-  return command
-    .replace(/[\x00-\x1f\x7f]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-}
+let activeCommand: PendingCommand | null = null;
+const commandQueue: Array<{
+  msg: Extract<IncomingMessage, { type: "command" }>;
+}> = [];
 
-function timeoutForCommand(command: string, overrideMs?: number) {
-  if (overrideMs && overrideMs > 0) return overrideMs;
-  const trimmed = cleanCommandText(command).toLowerCase();
-  if (trimmed.includes("cshow *") || trimmed.includes("cshow*"))
-    return BULK_COMMAND_TIMEOUT_MS;
-  if (trimmed.startsWith("list")) return LIST_COMMAND_TIMEOUT_MS;
-  if (trimmed.startsWith("show")) return SHOW_COMMAND_TIMEOUT_MS;
-  if (trimmed.startsWith("cshow") && trimmed.includes("cval")) return 3000;
-  // Ack / silence / login should never sit on a long soft timeout.
-  if (
-    trimmed.startsWith("ack") ||
-    trimmed.startsWith("silence") ||
-    trimmed.startsWith("login") ||
-    /^set\s+p21[27]\s+on$/i.test(trimmed)
-  ) {
-    return 3000;
+function completeActiveCommand() {
+  if (!activeCommand) return;
+  const cmd = activeCommand;
+  activeCommand = null;
+
+  if (cmd.timeoutTimer) clearTimeout(cmd.timeoutTimer);
+  if (cmd.silenceTimer) clearTimeout(cmd.silenceTimer);
+
+  // Final partial chunk so streaming callers see the completed dump (list commands only).
+  if (cmd.command.toLowerCase().startsWith("list")) {
+    post({ type: "chunk", id: cmd.id, response: cmd.buffer, done: true });
   }
-  return COMMAND_TIMEOUT_MS;
+
+  post({
+    type: "result",
+    id: cmd.id,
+    ok: true,
+    response: cmd.buffer,
+  });
+
+  processNextCommand();
 }
 
-function idleMsForCommand(command: string) {
-  const trimmed = cleanCommandText(command).toLowerCase();
-  if (isCvalCommand(command)) return CVAL_IDLE_COMPLETE_MS;
-  if (trimmed.startsWith("show")) return SHOW_IDLE_COMPLETE_MS;
-  if (
-    trimmed.startsWith("list") ||
-    trimmed.includes("cshow *") ||
-    trimmed.includes("cshow*")
-  ) {
-    return LIST_IDLE_COMPLETE_MS;
-  }
-  return IDLE_COMPLETE_MS;
-}
-
-function isDefiniteComplete(response: string) {
-  return /_DNE|_END\b/i.test(sanitizePanelText(response));
-}
-
-/** NUL-padded panel columns look blank in logs but break \s-based matching. */
-function sanitizePanelText(text: string) {
-  return String(text || "").replace(/\0/g, " ");
-}
-
-function isQuickComplete(command: string, response: string) {
-  const trimmed = cleanCommandText(command).toLowerCase();
-  const text = sanitizePanelText(response);
-  if (trimmed.startsWith("cshow") && trimmed.includes("cval")) {
-    return /CVAL\s*=\s*\d+/i.test(text);
-  }
-  if (trimmed.startsWith("login")) {
-    return /ACCESS GRANTED/i.test(text) || /INVALID PASSCODE/i.test(text);
-  }
-  if (trimmed.startsWith("show")) {
-    return hasCompleteShowFields(text);
-  }
-  // Ack / silence / set usually echo quickly — do not wait for a long idle.
-  if (
-    trimmed.startsWith("ack") ||
-    trimmed.startsWith("silence") ||
-    /^set\s+p21[27]\s+on$/i.test(trimmed)
-  ) {
-    return text.trim().length > 0;
-  }
-  return false;
-}
-
-function isListCommand(command: string) {
-  return cleanCommandText(command).toLowerCase().startsWith("list");
-}
-
-/** True when the dump already contains at least one device address row. */
-function listHasDeviceRows(response: string) {
-  return /\b\d*:?M\d+-\d+(?:-\d+)?\b/i.test(sanitizePanelText(response));
-}
-
-/** Count device rows in a list dump (approx. matches client parsePanelListResponse). */
-function countListMessages(response: string) {
-  const text = sanitizePanelText(response);
-  let count = 0;
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (/_DNE|_END\b/i.test(trimmed)) continue;
-    if (/^list\s/i.test(trimmed)) continue;
-    if (/\b\d*:?M\d+-\d+(?:-\d+)?\b/i.test(trimmed)) count += 1;
-  }
-  return count;
-}
-
-/**
- * Complete when we have ~CVAL messages, or _DNE, or (fallback) rows + idle.
- * expectedCount comes from totalFire / totalTrouble / totalSupervisory.
- */
-function isListCountReady(response: string, expectedCount?: number) {
-  if (isDefiniteComplete(response)) return true;
-  if (
-    typeof expectedCount === "number" &&
-    Number.isFinite(expectedCount) &&
-    expectedCount > 0 &&
-    countListMessages(response) >= expectedCount
-  ) {
-    return true;
-  }
-  return false;
-}
-
-/** True for Asset Control `show <address>`. */
-function isShowCommand(command: string) {
-  return cleanCommandText(command).toLowerCase().startsWith("show");
-}
-
-/**
- * Fire-critical panel commands — must not wait behind a long list dump.
- * Asset Control `show` is separate but also preempts lists (see sendCommand).
- */
-function isPriorityCommand(command: string) {
-  const trimmed = cleanCommandText(command).toLowerCase();
-  return (
-    trimmed.startsWith("ack") ||
-    trimmed.startsWith("silence") ||
-    trimmed.startsWith("login") ||
-    /^set\s+p21[27]\s+on$/i.test(trimmed)
-  );
-}
-
-/** Match PRIMARY STATUS / ENABLED STATE even with one space (no colon). */
-function hasCompleteShowFields(response: string) {
-  const text = sanitizePanelText(response);
-  return (
-    /PRIMARY\s+STATUS\s*:?\s+\S/i.test(text) &&
-    /ENABLED\s+STATE\s*:?\s+\S/i.test(text)
-  );
-}
-
-function isCvalCommand(command: string) {
-  const trimmed = cleanCommandText(command).toLowerCase();
-  return trimmed.startsWith("cshow") && trimmed.includes("cval");
-}
-
-// Panel service port expects CR (PuTTY default). LF causes login passcode failures.
-function normalizeCommand(command: string) {
-  const cleaned = cleanCommandText(command);
-  if (!cleaned) return "\r";
-  return `${cleaned}\r`;
-}
-
-function ensureConnected() {
-  if (!isSocketLive(client)) {
-    throw new Error("Not connected");
+function processNextCommand() {
+  if (activeCommand) return;
+  if (commandQueue.length === 0) return;
+  const next = commandQueue.shift();
+  if (next) {
+    executeCommand(next.msg);
   }
 }
 
-function attachSocketHandlers(socket: net.Socket) {
-  socket.on("close", () => {
-    if (client !== socket) return;
-    client = null;
-    failActiveCommands("Not connected");
-    // Reset command queue so a reconnect is not blocked by a hung prior command.
-    resetCommandQueue("Not connected");
+function executeCommand(msg: Extract<IncomingMessage, { type: "command" }>) {
+  if (!isSocketLive(socket)) {
+    post({
+      type: "result",
+      id: msg.id,
+      ok: false,
+      error: "Fire panel not connected",
+    });
+    processNextCommand();
+    return;
+  }
+
+  const clean = msg.command.replace(/[\r\n]+/g, " ").trim();
+  if (!clean) {
+    post({ type: "result", id: msg.id, ok: true, response: "OK" });
+    processNextCommand();
+    return;
+  }
+
+  // Fast-path: ack commands are written immediately and return OK in 0ms (no response needed)
+  const isAck = /^(ack\b|ack$)/i.test(clean);
+  if (isAck) {
+    socket.write(`${clean}\r\n`, (err) => {
+      if (err) {
+        post({ type: "result", id: msg.id, ok: false, error: err.message });
+      } else {
+        post({ type: "result", id: msg.id, ok: true, response: "OK" });
+      }
+    });
+    processNextCommand();
+    return;
+  }
+
+  // Interactive commands (login, show, disable, enable, list) require collecting panel output
+  const timeoutMs = msg.timeoutMs && msg.timeoutMs > 0 ? msg.timeoutMs : 5000;
+
+  activeCommand = {
+    id: msg.id,
+    command: clean,
+    buffer: "",
+    expectedCount: msg.expectedCount,
+    timeoutMs,
+    timeoutTimer: setTimeout(() => {
+      if (activeCommand && activeCommand.id === msg.id) {
+        completeActiveCommand();
+      }
+    }, timeoutMs),
+    silenceTimer: null,
+    priority: msg.priority,
+    lastProgressCount: 0,
+  };
+
+  socket.write(`${clean}\r\n`, (err) => {
+    if (err && activeCommand && activeCommand.id === msg.id) {
+      if (activeCommand.timeoutTimer) clearTimeout(activeCommand.timeoutTimer);
+      if (activeCommand.silenceTimer) clearTimeout(activeCommand.silenceTimer);
+      const cmdId = activeCommand.id;
+      activeCommand = null;
+      post({
+        type: "result",
+        id: cmdId,
+        ok: false,
+        error: err.message || "Failed to write command to socket",
+      });
+      processNextCommand();
+    }
+  });
+}
+
+function attachSocketHandlers(sock: net.Socket) {
+  sock.on("close", () => {
+    if (socket !== sock) return;
+    parser?.flush();
+    parser = null;
+    socket = null;
+    if (activeCommand) {
+      if (activeCommand.timeoutTimer) clearTimeout(activeCommand.timeoutTimer);
+      if (activeCommand.silenceTimer) clearTimeout(activeCommand.silenceTimer);
+      post({
+        type: "result",
+        id: activeCommand.id,
+        ok: false,
+        error: "Socket closed while waiting for response",
+      });
+      activeCommand = null;
+    }
+    while (commandQueue.length > 0) {
+      const item = commandQueue.shift();
+      if (item) {
+        post({
+          type: "result",
+          id: item.msg.id,
+          ok: false,
+          error: "Socket closed",
+        });
+      }
+    }
     post({ type: "connected", connected: false, host: currentHost, port: currentPort });
   });
-  socket.on("error", (err) => {
-    // Keep the socket unless the panel closed it — commands report their own errors.
-    if (client === socket && /ECONNRESET|EPIPE|ETIMEDOUT/i.test(err.message || "")) {
-      client = null;
-      failActiveCommands(err.message || "Not connected");
-      resetCommandQueue(err.message || "Not connected");
+
+  sock.on("error", (err: NodeJS.ErrnoException) => {
+    if (socket !== sock) return;
+    const msg = err?.message || "";
+    if (/ECONNRESET|EPIPE|ETIMEDOUT/i.test(msg)) {
+      parser?.flush();
+      parser = null;
+      socket = null;
       post({ type: "connected", connected: false, host: currentHost, port: currentPort });
+    }
+  });
+
+  // Feed all incoming panel data into the parser & collect command responses
+  sock.on("data", (chunk: Buffer) => {
+    // 1. Feed parser for real-time live log persistence & SSE
+    parser?.feed(chunk);
+
+    // 2. If an active command is waiting for response, collect the chunk
+    if (activeCommand) {
+      const text = chunk.toString("utf8");
+      activeCommand.buffer += text;
+
+      const trimmed = activeCommand.buffer.trim();
+      const lowerCmd = activeCommand.command.toLowerCase();
+
+      let isComplete = false;
+
+      if (lowerCmd.startsWith("login")) {
+        if (/ACCESS GRANTED|ACCESS DENIED|%ERROR|INVALID|ALREADY|LEVEL/i.test(trimmed) || trimmed.endsWith("-") || /\n-\s*$/.test(trimmed)) {
+          isComplete = true;
+        }
+      } else if (lowerCmd.startsWith("set")) {
+        if (/COMMAND ACCEPTED|%ERROR|INVALID|ALREADY|ON|OFF/i.test(trimmed) || trimmed.endsWith("-") || /\n-\s*$/.test(trimmed)) {
+          isComplete = true;
+        }
+      } else if (lowerCmd.startsWith("show counts")) {
+        if (
+          (/FIRE\s*=\s*\d+/i.test(trimmed) || /TROUBLE\s*=\s*\d+/i.test(trimmed) || /SUPERVISORY\s*=\s*\d+/i.test(trimmed)) &&
+          (trimmed.endsWith("-") || /-\s*$/.test(trimmed) || /_DNE|_END/i.test(trimmed) || trimmed.includes("\n-"))
+        ) {
+          isComplete = true;
+        }
+      } else if (lowerCmd.startsWith("show")) {
+        // Complete when show output contains PRIMARY STATUS / POINT ADDRESS / ENABLED STATE and ends with prompt "-" or _DNE
+        if (
+          (/PRIMARY STATUS|POINT ADDRESS|ENABLED STATE|UNVERIFIED/i.test(trimmed) &&
+            (trimmed.endsWith("-") || /-\s*$/.test(trimmed) || /_DNE|_END/i.test(trimmed) || trimmed.includes("\n-"))) ||
+          /%ERROR|INVALID|NOT FOUND|ACCESS DENIED/i.test(trimmed)
+        ) {
+          isComplete = true;
+        }
+      } else if (lowerCmd.startsWith("disable") || lowerCmd.startsWith("enable")) {
+        if (/COMMAND ACCEPTED|%ERROR|INVALID|DISABLED|ENABLED/i.test(trimmed) || trimmed.endsWith("-") || /\n-\s*$/.test(trimmed)) {
+          isComplete = true;
+        }
+      } else if (lowerCmd.startsWith("list")) {
+        const exp = activeCommand.expectedCount || 0;
+        const addressMatches = trimmed.match(/(?:^|\n)\s*(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+(?:-\d+)?)\b/g);
+        const count = addressMatches ? addressMatches.length : 0;
+
+        // Stream the growing dump on every chunk so callers can save rows one by
+        // one as they arrive, instead of waiting for the full expected count.
+        post({ type: "chunk", id: activeCommand.id, response: activeCommand.buffer, done: false });
+
+        // Slow panels can take minutes to dump hundreds of rows one at a time. As
+        // long as new rows keep trickling in, push the deadline back instead of
+        // cutting the dump off mid-stream (a retry restarts "list" from row 1, so
+        // a fixed total-time budget would otherwise mean the tail rows are never
+        // reached no matter how many attempts run).
+        if (exp > 0 && count > (activeCommand.lastProgressCount || 0)) {
+          activeCommand.lastProgressCount = count;
+          const cmdId = activeCommand.id;
+          clearTimeout(activeCommand.timeoutTimer);
+          activeCommand.timeoutTimer = setTimeout(() => {
+            if (activeCommand && activeCommand.id === cmdId) {
+              completeActiveCommand();
+            }
+          }, activeCommand.timeoutMs);
+        }
+
+        if (exp > 0) {
+          // If expectedCount is set (e.g. 215), only complete when count >= exp OR _DNE/_END reached with count >= 95%
+          if (count >= exp || (count >= Math.floor(exp * 0.95) && /_DNE|_END/i.test(trimmed))) {
+            isComplete = true;
+          }
+        } else {
+          // No expectedCount specified: complete if ends with prompt "-" after receiving at least 1 line or _DNE/_END
+          if (
+            /_DNE|_END/i.test(trimmed) ||
+            /%ERROR|INVALID/i.test(trimmed) ||
+            (count > 0 && (trimmed.endsWith("-") || /\n-\s*$/.test(trimmed)))
+          ) {
+            isComplete = true;
+          }
+        }
+      }
+
+      if (isComplete) {
+        completeActiveCommand();
+        return;
+      }
+
+      // Reset silence timer: finalize response after data chunk arrives
+      if (activeCommand.silenceTimer) {
+        clearTimeout(activeCommand.silenceTimer);
+      }
+      activeCommand.silenceTimer = setTimeout(() => {
+        if (!activeCommand) return;
+        const bufTrimmed = activeCommand.buffer.trim();
+        const cmdClean = activeCommand.command.trim();
+
+        // If buffer only contains the echoed command (or command prompt with no actual response text yet),
+        // do not complete early on silence — keep waiting for the panel data until timeoutTimer.
+        const stripped = bufTrimmed
+          .replace(/^-+\s*/, "")
+          .replace(/\s*-+$/, "")
+          .replace(/[\r\n\-]+/g, " ")
+          .trim();
+        const isOnlyEcho =
+          stripped === cmdClean ||
+          stripped === "" ||
+          stripped === "-";
+
+        if (isOnlyEcho) {
+          return;
+        }
+
+        // Special check for show counts: do not complete on silence if counts have not arrived yet
+        if (
+          lowerCmd.startsWith("show counts") &&
+          !/FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+|%ERROR/i.test(bufTrimmed)
+        ) {
+          return;
+        }
+
+        // Special check for show <device>: do not complete on silence if status/details have not arrived yet
+        if (
+          lowerCmd.startsWith("show") &&
+          !lowerCmd.startsWith("show counts") &&
+          !/PRIMARY STATUS|POINT ADDRESS|ENABLED STATE|%ERROR|NOT FOUND|ACCESS DENIED/i.test(bufTrimmed)
+        ) {
+          return;
+        }
+
+        // Special check for list: if expectedCount is specified, keep collecting unless silence has elapsed with sufficient data
+        if (lowerCmd.startsWith("list")) {
+          const exp = activeCommand.expectedCount || 0;
+          const addressMatches = bufTrimmed.match(/(?:^|\n)\s*(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+(?:-\d+)?)\b/g);
+          const count = addressMatches ? addressMatches.length : 0;
+          if (exp > 0 && count < Math.floor(exp * 0.95)) {
+            // Still waiting for full list data from panel — do not finish early on silence
+            return;
+          }
+        }
+
+        completeActiveCommand();
+      }, 500);
     }
   });
 }
 
 function disconnect() {
-  if (client) {
-    client.removeAllListeners("close");
-    client.removeAllListeners("error");
-    client.end();
-    client.destroy();
-    client = null;
+  if (socket) {
+    const prev = socket;
+    socket = null;
+    parser?.flush();
+    parser = null;
+    prev.removeAllListeners();
+    prev.destroy();
   }
-  failActiveCommands("Not connected");
-  resetCommandQueue("Not connected");
+  if (activeCommand) {
+    if (activeCommand.timeoutTimer) clearTimeout(activeCommand.timeoutTimer);
+    if (activeCommand.silenceTimer) clearTimeout(activeCommand.silenceTimer);
+    post({
+      type: "result",
+      id: activeCommand.id,
+      ok: false,
+      error: "Disconnected",
+    });
+    activeCommand = null;
+  }
   post({ type: "connected", connected: false, host: currentHost, port: currentPort });
 }
 
-function sendCommand(
-  command: string,
-  timeoutMs?: number,
-  commandId?: string,
-  expectedCount?: number,
-  forcePriority?: boolean,
-) {
-  // Allow the service layer to explicitly mark ack/silence as priority even if
-  // the heuristic doesn't catch the exact command text.
-  const priority = Boolean(forcePriority) || isPriorityCommand(command);
-  const isShow = isShowCommand(command);
-
-  // Make room for fire ack / Asset Control show: stop the active list dump and
-  // drop queued non-priority jobs so ack f is not stuck behind list t.
-  if (priority || isShow) {
-    if (preemptActiveList) {
-      console.warn(
-        `[fire-panel] preempting in-flight list for ${priority ? "priority" : "show"} command: ${cleanCommandText(command)}`,
-      );
-      try {
-        preemptActiveList();
-      } catch {
-        // ignore — list may already be finishing
-      }
-    }
-    if (priority) {
-      deferPendingNonPriorityCommands("Deferred for priority command");
-    }
-  }
-
-  return enqueueCommand(
-    async () => {
-      // Brief settle after preempt so leftover list bytes are less likely to
-      // pollute the next response.
-      if (priority || isShow) {
-        await new Promise((resolve) => setTimeout(resolve, 120));
-      }
-      return sendCommandOnce(command, timeoutMs, commandId, expectedCount);
-    },
-    { priority: priority || isShow },
-  );
-}
-
-function sendCommandOnce(
-  command: string,
-  timeoutMs?: number,
-  commandId?: string,
-  expectedCount?: number,
-) {
-  ensureConnected();
-  const socket = client as net.Socket;
-  const normalized = normalizeCommand(command);
-  const maxWaitMs = timeoutForCommand(command, timeoutMs);
-  const idleMs = idleMsForCommand(command);
-  const isList = isListCommand(command);
-  const hasExpected =
-    isList &&
-    typeof expectedCount === "number" &&
-    Number.isFinite(expectedCount) &&
-    expectedCount > 0;
-  // List soft timeout resets on every chunk; absolute ceiling stops a hung panel.
-  const absoluteMaxMs = isList
-    ? Math.max(maxWaitMs, LIST_COMMAND_ABSOLUTE_MS)
-    : maxWaitMs;
-
-  return new Promise<string>((resolve, reject) => {
-    let response = "";
-    let idleTimer: ReturnType<typeof setTimeout> | null = null;
-    let hardTimeout: ReturnType<typeof setTimeout> | null = null;
-    let settled = false;
-    let lastChunkPost = 0;
-    const startedAt = Date.now();
-    const streamingList = isList && Boolean(commandId);
-
-    const emitChunk = (done: boolean) => {
-      if (!streamingList || !commandId) return;
-      post({ type: "chunk", id: commandId, response, done });
-      lastChunkPost = Date.now();
-    };
-
-    const clearPreemptHook = () => {
-      if (preemptActiveList === finishEarly) preemptActiveList = null;
-    };
-
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearPreemptHook();
-      activeCommandFails.delete(fail);
-      if (hardTimeout) clearTimeout(hardTimeout);
-      clearTimeout(absoluteTimeout);
-      if (idleTimer) clearTimeout(idleTimer);
-      socket.removeListener("data", onData);
-      if (streamingList) emitChunk(true);
-      // Return NUL-cleaned text so Asset Control can parse PRIMARY STATUS / ENABLED STATE.
-      const cleaned = cleanCommandText(command).toLowerCase().startsWith("show")
-        ? sanitizePanelText(response)
-        : // Also clean NULs from list dumps so the UI parser sees full rows.
-          isList
-          ? sanitizePanelText(response)
-          : response;
-      resolve(cleaned);
-    };
-
-    // Same as finish — used as the preempt hook identity.
-    function finishEarly() {
-      console.warn(
-        `[fire-panel] list preempted after ${Date.now() - startedAt}ms (${response.length} chars) — returning best effort`,
-      );
-      finish();
-    }
-
-    const fail = (err: Error) => {
-      if (settled) return;
-      settled = true;
-      clearPreemptHook();
-      activeCommandFails.delete(fail);
-      if (hardTimeout) clearTimeout(hardTimeout);
-      clearTimeout(absoluteTimeout);
-      if (idleTimer) clearTimeout(idleTimer);
-      socket.removeListener("data", onData);
-      reject(err);
-    };
-
-    activeCommandFails.add(fail);
-    if (isList) {
-      preemptActiveList = finishEarly;
-    }
-
-    const scheduleIdleComplete = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      // Only settle quickly once we already have ~CVAL messages (or _DNE path).
-      // Do NOT use a short idle when still short of CVAL — large dumps pause between batches.
-      const countReady = isListCountReady(response, expectedCount);
-      const waitMs =
-        isList && countReady
-          ? 200 // got CVAL amount — brief window for trailing _DNE
-          : idleMs;
-      idleTimer = setTimeout(() => {
-        if (response.length === 0) return;
-
-        if (isList) {
-          if (isDefiniteComplete(response) || isListCountReady(response, expectedCount)) {
-            finish();
-            return;
-          }
-          // Known CVAL target and still short: keep reading (soft timeout handles stopped panels).
-          if (hasExpected) {
-            return;
-          }
-          // No CVAL target: finish on quiet after rows so UI does not hang.
-          if (listHasDeviceRows(response)) {
-            console.warn(
-              `[fire-panel] list idle after rows (${Date.now() - startedAt}ms) — have ${countListMessages(response)} messages — completing`,
-            );
-            finish();
-            return;
-          }
-          return;
-        }
-
-        // CVAL responses often arrive in multiple chunks — wait until CVAL= is present
-        if (isCvalCommand(command) && !/CVAL\s*=\s*\d+/i.test(response)) {
-          scheduleIdleComplete();
-          return;
-        }
-        if (isShowCommand(command) && !hasCompleteShowFields(response)) {
-          scheduleIdleComplete();
-          return;
-        }
-        finish();
-      }, waitMs);
-    };
-
-    const onHardTimeout = () => {
-      // Never return a partial `show` — Asset Control needs PRIMARY STATUS + ENABLED STATE.
-      if (cleanCommandText(command).toLowerCase().startsWith("show")) {
-        if (isQuickComplete(command, response)) {
-          finish();
-          return;
-        }
-        fail(new Error("Timeout waiting for complete show response"));
-        return;
-      }
-      // Soft timeout resets on every chunk. If quiet while still short of CVAL, take best effort.
-      if (isList && response.length > 0 && !isListCountReady(response, expectedCount)) {
-        console.warn(
-          `[fire-panel] list soft-timeout after idle (${Date.now() - startedAt}ms) — have ${countListMessages(response)}${hasExpected ? `/${expectedCount}` : ""} messages — completing best effort`,
-        );
-        finish();
-        return;
-      }
-      if (response.length > 0) {
-        finish();
-        return;
-      }
-      fail(new Error("Timeout waiting for response"));
-    };
-
-    const armSoftTimeout = () => {
-      if (hardTimeout) clearTimeout(hardTimeout);
-      // While short of CVAL, allow longer gaps between telnet batches (panel dumps slowly).
-      // Soft timer still resets on every chunk so continuous dumps keep going.
-      let wait = maxWaitMs;
-      if (isList && listHasDeviceRows(response)) {
-        if (hasExpected && !isListCountReady(response, expectedCount)) {
-          wait = Math.min(maxWaitMs, 90000);
-        } else {
-          wait = Math.min(maxWaitMs, 12000);
-        }
-      }
-      hardTimeout = setTimeout(onHardTimeout, wait);
-    };
-
-    // Absolute ceiling for list dumps only (CVAL/ack/show use their own soft timeout).
-    const absoluteTimeout = setTimeout(() => {
-      if (settled) return;
-      if (!isList) {
-        onHardTimeout();
-        return;
-      }
-      console.warn(
-        `[fire-panel] list absolute timeout after ${absoluteMaxMs}ms (${response.length} chars, ${countListMessages(response)} messages) — returning best effort`,
-      );
-      if (response.length > 0) {
-        finish();
-        return;
-      }
-      fail(new Error("Timeout waiting for response"));
-    }, absoluteMaxMs);
-
-    armSoftTimeout();
-
-    function onData(data: Buffer) {
-      response += data.toString();
-
-      // Keep waiting as long as the panel is still dumping list rows.
-      if (isList) {
-        armSoftTimeout();
-      }
-
-      if (streamingList) {
-        const now = Date.now();
-        const text = data.toString();
-        const hasNewline = text.includes("\n") || text.includes("\r");
-        const ready = isListCountReady(response, expectedCount);
-        if (hasNewline || ready || now - lastChunkPost >= 120) {
-          emitChunk(ready);
-        }
-      }
-
-      if (isList) {
-        if (isDefiniteComplete(response)) {
-          finish();
-          return;
-        }
-        // Hit CVAL count — settle briefly then finish (do not wait forever for _DNE).
-        if (isListCountReady(response, expectedCount)) {
-          scheduleIdleComplete();
-          return;
-        }
-        scheduleIdleComplete();
-        return;
-      }
-
-      if (isDefiniteComplete(response)) {
-        finish();
-        return;
-      }
-
-      if (isQuickComplete(command, response)) {
-        scheduleIdleComplete();
-        return;
-      }
-
-      scheduleIdleComplete();
-    }
-
-    socket.on("data", onData);
-    socket.write(normalized, (err) => {
-      if (err) fail(err);
-    });
-  });
-}
-
-function shouldAcceptCommand(_command: string) {
-  return true;
-}
+// ---------------------------------------------------------------------------
+// Message handler
+// ---------------------------------------------------------------------------
 
 parentPort?.on("message", (msg: IncomingMessage) => {
   if (msg.type === "connect") {
-    const connectId = msg.id || "connect";
+    const connectId = msg.id ?? "connect";
     void connect(msg.host, msg.port)
       .then(() => {
-        post({
+        parentPort?.postMessage({
           type: "result",
           id: connectId,
           ok: true,
           response: `connected ${currentHost}:${currentPort}`,
         });
       })
-      .catch((err) => {
-        post({
+      .catch((err: Error) => {
+        parentPort?.postMessage({
           type: "result",
           id: connectId,
           ok: false,
-          error: (err as Error).message || "Failed to connect to fire panel",
+          error: err.message || "Failed to connect to fire panel",
         });
       });
     return;
@@ -763,31 +957,32 @@ parentPort?.on("message", (msg: IncomingMessage) => {
     return;
   }
 
+  if (msg.type === "command") {
+    if (msg.priority) {
+      // Priority commands (ack/silence) jump to front of queue or execute immediately
+      if (!activeCommand) {
+        executeCommand(msg);
+      } else {
+        commandQueue.unshift({ msg });
+      }
+    } else {
+      if (!activeCommand) {
+        executeCommand(msg);
+      } else {
+        commandQueue.push({ msg });
+      }
+    }
+    return;
+  }
+
   if (msg.type === "status") {
     post({
       type: "status",
       id: msg.id,
-      connected: isSocketLive(client),
+      connected: isSocketLive(socket),
       host: currentHost,
       port: currentPort,
     });
     return;
   }
-
-  if (msg.type === "command") {
-    if (!shouldAcceptCommand(msg.command)) {
-      post({
-        type: "result",
-        id: msg.id,
-        ok: false,
-        error: "Worker refused command",
-      });
-      return;
-    }
-
-    void sendCommand(msg.command, msg.timeoutMs, msg.id, msg.expectedCount, msg.priority)
-      .then((response) => post({ type: "result", id: msg.id, ok: true, response }))
-      .catch((err) => post({ type: "result", id: msg.id, ok: false, error: (err as Error).message }));
-  }
 });
-

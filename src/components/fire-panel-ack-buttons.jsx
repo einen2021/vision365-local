@@ -65,6 +65,7 @@ export function FirePanelAckButtons() {
     setLoadingLabel(label);
     try {
       await acknowledge(label);
+      await acknowledge(label);
       toast({
         title: `${title} sent`,
         description: "Acknowledge command sent to the fire panel.",
@@ -85,37 +86,25 @@ export function FirePanelAckButtons() {
   const handleButtonClick = (label, title) => {
     const route = LIVE_PANEL_ROUTE_BY_LABEL[label];
 
-    // Already on this category's live list page → just acknowledge.
-    if (route && pathname === route) {
-      if (label === "Trouble") {
-        silenceTroubleAlertBeep();
-      }
-      if (label === "Supervisory") {
-        silenceSupervisoryAlertBeep();
-      }
-      void handleAck(label, title);
-      return;
-    }
-
-    // Trouble Ack only: send `ack t` first, then open live-trouble.
-    // Navigating first would mount the page and run `list t` before `ack t`.
-    if (label === "Trouble" && route) {
+    if (label === "Trouble") {
       silenceTroubleAlertBeep();
-      void (async () => {
-        const ok = await handleAck(label, title);
-        if (ok) {
-          router.push(route);
-        }
-      })();
-      return;
+    }
+    if (label === "Supervisory") {
+      silenceSupervisoryAlertBeep();
     }
 
-    // Fire / Supervisory: open the live list page (unchanged).
-    if (route) {
-      router.push(route);
-      return;
-    }
-    void handleAck(label, title);
+    void (async () => {
+      // Run ACK command (`ack f`, `ack t`, `ack s`) and wait for OK response.
+      // No list command is sent here — never run list commands while an ack
+      // button is being clicked, to avoid overlapping requests on the panel
+      // connection. The live list page refreshes on its own.
+      const ok = await handleAck(label, title);
+      if (!ok) return;
+
+      if (route && pathname !== route) {
+        router.push(route);
+      }
+    })();
   };
 
   return (

@@ -1,0 +1,456 @@
+j================================================================================
+VISION365 ARCHITECTURE ANALYSIS: FIRE MONITORING, FLOORPLANS, AND ASSETS
+================================================================================
+
+This document provides a comprehensive technical analysis of the Vision365 building
+and fire-alarm management platform. It covers the logic, algorithms, data flows,
+protocols, UI/UX engines, and architectural techniques used across three core systems:
+
+  1. FIRE MONITORING SYSTEM
+  2. FLOORPLANS & GRAPHICS VIEW SYSTEM
+  3. ASSET MANAGEMENT & IMPORT SYSTEM
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY & SYSTEM OVERVIEW
+2. FIRE MONITORING SYSTEM
+   2.1 Architecture & Telnet Worker Thread
+   2.2 Simplex Command Protocol & Telnet Parsing Engine
+   2.3 Alarm State Distribution & Persisted Snapshot Storage
+   2.4 React Provider Hierarchy & Global Context Pipeline
+   2.5 Audio Alarm Synthesizer & Siren Engine
+   2.6 Interactive Alarm Modals & Priority Hierarchy
+   2.7 Two-Way Panel Control & Device Acknowledgment
+   2.8 Live Alarm Feeds & Message History Log
+3. FLOORPLANS & GRAPHICS VIEW SYSTEM
+   3.1 4-Tier Hierarchical Structure (Building -> Floor -> Section -> Subsection)
+   3.2 Floor Plan Setup & Asset Placement Storage
+   3.3 DXF / CAD Parsing & Vector Layer Extraction
+   3.4 Coordinate Transformation & Bounding Box Normalization Matrix
+   3.5 Interactive Canvas Viewer (Zoom, Pan, Markers)
+   3.6 Bulk CSV / Excel Placement Engine
+   3.7 Dynamic Icon Highlighting & Visual Status Pulsing
+   3.8 Deep-Linking & Auto-Navigation from Alarms to Floor Plan Pinpoints
+4. ASSET MANAGEMENT & INVENTORY SYSTEM
+   4.1 Asset Data Model & Database Architecture
+   4.2 Multi-Format Asset Parsing Engine (Simplex TXT, SGT, Excel/XLSX)
+   4.3 In-Memory Fast Indexing & Address Matching
+   4.4 Cross-Building Asset Mapping & Transfer
+   4.5 Custom Asset Type Icon & Brand Registry Engine
+   4.6 Device Search & Query System
+5. CROSS-SUBSYSTEM INTEGRATION & END-TO-END DATA FLOW
+6. SUMMARY OF TECHNICAL TECHNIQUES & INNOVATIONS
+
+================================================================================
+1. EXECUTIVE SUMMARY & SYSTEM OVERVIEW
+================================================================================
+Vision365 is a real-time fire-safety management application designed to operate both
+as a desktop app (built with Tauri v2 + Next.js 16 + Hono server + embedded MongoDB)
+and as a client-side web dashboard.
+
+The application continuously communicates with physical Fire Alarm Control Panels
+(such as Simplex 4100ES / 4010ES systems) over local TCP/IP Telnet networks, decodes
+raw panel message streams, updates device states across building databases, renders
+interactive floorplan graphics with live asset markers, and alerts facility operators
+with audio sirens and priority navigation modals.
+
+Key Technologies Used:
+- Desktop Shell: Tauri v2 (Rust)
+- Backend: Hono Node.js server (`desktop-server/` at port 47821)
+- Frontend: Next.js 16 (App Router), React 19, Tailwind CSS
+- State Management: React Contexts + Zustand 5
+- Spatial / Graphics: HTML5 Canvas, SVG, DXF-Parser, Web Audio API
+- Storage: MongoDB Embedded (`db_snapshot` collection) + Local File System
+
+================================================================================
+2. FIRE MONITORING SYSTEM
+================================================================================
+
+2.1 Architecture & Telnet Worker Thread
+---------------------------------------
+Fire alarm panels enforce a strict single-telnet-session policy: connecting a second
+socket immediately rejects or closes the connection. To guarantee session stability,
+Vision365 isolates the TCP socket inside a dedicated Node worker thread:
+
+File: `desktop-server/src/services/firePanelService.ts`
+Worker: `desktop-server/src/workers/firePanelWorker.ts`
+
+- Isolation: `firePanelWorker` runs in a separate Node.js `Worker` thread to prevent
+  main-thread event loop blocks from dropping socket TCP frames.
+- Connection Lifecycle: The worker handles `connect`, `disconnect`, `status`, and
+  `command` execution. It auto-reconnects on TCP drops and emits socket chunk events.
+- Soft-Timeout Buffer: List commands (`list f`, `list t`, `list s`) stream large dumps.
+  The worker maintains a soft timer (default 30,000ms) that resets on every chunk,
+  detecting completed dumps by looking for the panel prompt (`"\n -"` or `"_DNE"`).
+
+2.2 Simplex Command Protocol & Telnet Parsing Engine
+---------------------------------------------------
+File: `src/lib/firePanelMonitor.js`
+File: `src/lib/parseSimplexFile.js`
+
+The monitoring logic relies on polling CVAL (Current Value) counters, then pulling
+itemized lists when counts change:
+
+1. CVAL Query Phase:
+   Sends commands:
+   - `cshow a0 cval` -> Fire CVAL count
+   - `cshow a1 cval` -> Supervisory CVAL count
+   - `cshow a2 cval` -> Trouble CVAL count
+   Extracted via Regex: `/CVAL\s*=\s*(\d+)/i`
+
+2. List Dump Phase:
+   When a CVAL counter increases, the monitor fires the matching list command:
+   - Fire -> `list f`
+   - Supervisory -> `list s`
+   - Trouble -> `list t`
+
+3. Telnet Line & Key-Value Parsing Logic:
+   Raw telnet output often glues keys together due to NUL-byte padding. `parseSimplexFile.js`
+   executes boundary insertion algorithms:
+   - Inserts spaces before glued keys: `PT=WSOF=0-` -> `PT=WSOF F=0-`
+   - Extracts device header: `~2:M1-2-0` -> Panel 2, Loop 1, Device 2, Sub-address 0.
+   - Extracts key-value attributes: `ADD`, `NAM`, `LAB`, `CVAL`, `PEAK`, `BAN`, `DT`, `PT`,
+     and flags `F` (Fire), `T` (Trouble), `S` (Supervisory), `D` (Disabled).
+   - Maps raw text lines like `1:M1-1-0 SUB BASEMENT CORRIDOR 1 SMOKE DETECTOR FIRE*`
+     into structured JSON:
+     {
+       node: "1",
+       deviceAddress: "M1-1-0",
+       deviceLocation: "SUB BASEMENT CORRIDOR 1",
+       deviceType: "SMOKE DETECTOR",
+       status: "FIRE",
+       timestamp: "..."
+     }
+
+2.3 Alarm State Distribution & Persisted Snapshot Storage
+---------------------------------------------------------
+File: `desktop-server/src/services/firePanelAlarmSync.ts`
+File: `src/lib/buildingAlarmFeedWrite.js`
+
+When the backend panel sync receives parsed list outputs:
+- It looks up corresponding asset records in `AssetsList` using address match keys
+  (e.g., `M1-1-0`, `1:M1-1-0`, `1-1-0`).
+- It updates the asset's active alarm status field (`simplexStatus`: `F`, `T`, `S`, or `NORMAL`).
+- It writes active alarm objects into the building's document inside MongoDB (`alarmDetails`).
+- It updates root panel count totals in the `firePanelState` document snapshot.
+
+2.4 React Provider Hierarchy & Global Context Pipeline
+-----------------------------------------------------
+The frontend wraps the application in a multi-stage alert provider stack (`src/app/layout.js`):
+
+  FirePanelProvider
+    └── AssetFireStatusProvider
+          └── FireAlertProvider (Critical Fire Siren & Modal)
+                └── LivePanelAlertProvider (Trouble / Supervisory Popups)
+
+- `FirePanelProvider` (`stores/firePanelStore.ts`): Keeps connection status, host/port,
+  and socket connection states in Zustand.
+- `AssetFireStatusProvider`: Subscribes to backend updates, maintains active fire/trouble
+  maps, and triggers alerts when new active alarms arrive.
+
+2.5 Audio Alarm Synthesizer & Siren Engine
+------------------------------------------
+File: `src/lib/fireAlertSiren.js`
+File: `src/lib/troubleAlertBeep.js`
+
+To ensure immediate acoustic warning without relying on external media files, Vision365
+features a dual audio sound generator:
+
+1. Fire Alarm Siren (`startFireAlertSiren`):
+   - Uses Web Audio API (`AudioContext`).
+   - Creates a sweeping dual-oscillator frequency modulator (switching between 750 Hz
+     and 950 Hz at 4 Hz frequency modulation).
+   - Loops continuously until muted or acknowledged by the operator.
+
+2. Trouble / Supervisory Beep Generator (`startTroubleAlertBeep`, `startSupervisoryAlertBeep`):
+   - Generates intermittent high-pitch warning tones (e.g. 1000 Hz pulse every 2 seconds).
+   - Allows operator muting without disabling future new alarm sounds.
+
+2.6 Interactive Alarm Modals & Priority Hierarchy
+-------------------------------------------------
+File: `src/contexts/FireModalContext.jsx`
+File: `src/contexts/LivePanelAlertContext.jsx`
+
+Alert modal dialogs are strictly prioritized to avoid operator confusion during emergencies:
+
+- Priority 1 (Fire Alarm): Rendered by `FireAlertModalView`. Red flashing gradient backdrop,
+  animated pulsing flame icon, lock-on screen (prevents click-outside dismiss), plays
+  un-silenced continuous siren sound.
+- Priority 2 (Trouble Alarm): Rendered by `LivePanelAlertModalView`. Yellow themed popup.
+- Priority 3 (Supervisory Alarm): Purple themed popup.
+
+Override Rule: If a Fire Alarm occurs while a Trouble or Supervisory popup is open,
+`dismissForFirePriority()` instantly closes the lower-priority popups and presents the
+Critical Fire Alarm Modal.
+
+2.7 Two-Way Panel Control & Device Acknowledgment
+------------------------------------------------
+File: `src/lib/acknowledgePanelDevice.js`
+
+When an operator clicks "Acknowledge" on an alarm:
+- Category Ack: Sends telnet command `ack f` (Fire), `ack t` (Trouble), or `ack s` (Supervisory).
+- Device Ack: Sends `ack <ADDRESS>` (e.g., `ack M1-1-0`).
+- Priority Endpoint: Commands are dispatched via the priority HTTP endpoint `/api/telnet/fire-panel`
+  which bypasses routine polling in the worker command queue.
+- Re-try Protocol: Category acknowledgments are transmitted twice in sequence to verify
+  panel reception over lossy serial bridge adapters.
+
+2.8 Live Alarm Feeds & Message History Log
+------------------------------------------
+Routes:
+- `/dashboard/live-fire` (Active Fire Alarms list)
+- `/dashboard/live-trouble` (Active Trouble Alarms list)
+- `/dashboard/live-supervisory` (Active Supervisory Alarms list)
+- `/dashboard/live-panel` (All active panel items)
+- `/dashboard/alarm_message_history` (Historical log of cleared & active alarms)
+
+Operators can filter by building, search by device address/location, view date timestamps,
+and click any alarm row to jump straight to its physical position on the floorplan.
+
+
+================================================================================
+3. FLOORPLANS & GRAPHICS VIEW SYSTEM
+================================================================================
+
+3.1 4-Tier Hierarchical Structure (Building -> Floor -> Section -> Subsection)
+-----------------------------------------------------------------------------
+File: `src/lib/nestedFloorPlan.js`
+
+Large complex structures (hospitals, high-rises, commercial malls) cannot be viewed
+on a single flat image. Vision365 structures floorplans into a 4-level navigation tree:
+
+1. Building Overview: Top-level master plan image showing the building layout or campus.
+2. Floor Plan: Specific level (e.g. Ground Floor, Floor 1, Sub-Basement).
+3. Section Plan: Partitioned area on a floor (e.g. Section A - North Wing).
+4. Subsection Plan: Granular room/corridor breakdown (e.g. Sub-Section 1 - Pump Room).
+
+3.2 Floor Plan Setup & Asset Placement Storage
+----------------------------------------------
+File: `src/lib/floorPlanStorage.js`
+File: `src/lib/floorMapAssets.js`
+
+- Storage: Floorplan configurations (section names, image URLs, navigation markers) are
+  stored in Firestore/MongoDB under the building's collection (`<BuildingName>BuildingDB`).
+- Markers: Section markers placed on parent floor images store:
+  `{ sectionId, sectionName, x, y, relativeX, relativeY, imageUrl }`
+
+3.3 DXF / CAD Parsing & Vector Layer Extraction
+-----------------------------------------------
+File: `src/app/dashboard/floor_configuration/edit/page.jsx`
+
+Vision365 natively imports AutoCAD `.dxf` CAD drawings using `dxf-parser`:
+- Layer Extraction: Parses ENTITIES (LINES, LWPOLYLINE, TEXT, MTEXT, INSERT blocks).
+- Vector Rendering: Converts CAD coordinate geometry into HTML5 Canvas / SVG vector paths.
+- Block Reference Mapping: Automatically extracts device block insertion points (X, Y, Z)
+  and attributes (Device Address, Location Text) from CAD blocks, allowing one-click
+  auto-placement of hundreds of devices.
+
+3.4 Coordinate Transformation & Bounding Box Normalization Matrix
+-----------------------------------------------------------------
+File: `src/lib/nestedFloorPlan.js` (`csvCoordsToRelativePlacement`)
+
+CAD systems and images use conflicting coordinate origin systems:
+- Image / HTML DOM: Origin (0,0) at Top-Left, Y increases Downward.
+- CAD / DXF: Origin (0,0) at Bottom-Left, Y increases Upward (Cartesian).
+
+Transformation Matrix:
+To map arbitrary DXF/CSV coordinates onto an arbitrary floorplan image:
+
+1. Compute Bounds: Find `minX`, `maxX`, `minY`, `maxY` across all imported coordinates.
+2. Normalize to Range [0, 1]:
+   `relativeX = (X - minX) / (maxX - minX)`
+   `relativeY = (Y - minY) / (maxY - minY)`
+3. Y-Inversion (CAD to Image conversion):
+   `relativeY = 1.0 - relativeY`
+4. Convert to Natural Image Pixel Coordinates:
+   `pixelX = relativeX * imageNaturalWidth`
+   `pixelY = relativeY * imageNaturalHeight`
+
+This algorithm guarantees that imported device CAD coordinates overlay perfectly on top
+of exported floorplan raster images regardless of screen DPI or image scaling.
+
+3.5 Interactive Canvas Viewer (Zoom, Pan, Markers)
+--------------------------------------------------
+Route: `/dashboard/floor_configuration/view`
+
+The Graphics View tab provides an interactive pan-and-zoom viewer:
+- Navigation: Clickable section markers allow operators to click on a building section
+  and drill down into high-resolution subsection maps.
+- Zoom & Pan: Smooth mouse-wheel zooming and drag-panning.
+- Asset Overlays: Draws device icons at exact relative percentage positions `(relativeX, relativeY)`.
+
+3.6 Bulk CSV / Excel Placement Engine
+-------------------------------------
+File: `src/lib/floorPlanPlacementCsv.js`
+
+Operators can export or import full building asset layouts via CSV/Excel spreadsheets.
+Columns include: `deviceAddress`, `deviceLocation`, `assetName`, `itemType`, `buildingName`,
+`floorId`, `sectionId`, `subsectionId`, `relativeX`, `relativeY`, `coordinateX`, `coordinateY`.
+
+This enables offline batch layout configuration in Excel or AutoCAD scripts.
+
+3.7 Dynamic Icon Highlighting & Visual Status Pulsing
+----------------------------------------------------
+File: `src/lib/floorPlanLegend.js`
+File: `src/components/floor-plan/`
+
+Asset icons on floorplan graphics update their appearance dynamically based on live panel state:
+- Fire Alarm: Bright Red background icon (`#ef4444`) with animated expanding pulse ring.
+- Trouble Alarm: Amber / Yellow icon (`#f59e0b`).
+- Supervisory Alarm: Purple / Violet icon (`#8b5cf6`).
+- Normal: Green / Neutral icon (`#22c55e`).
+
+3.8 Deep-Linking & Auto-Navigation from Alarms to Floor Plan Pinpoints
+---------------------------------------------------------------------
+File: `src/lib/fireAlertFloorNavigation.js`
+File: `src/lib/assetAddressFloorIndex.js`
+
+When an operator clicks an alarm item in the Live Fire/Trouble feed, Vision365 automatically:
+1. Fast Index Lookup: Queries `assetAddressFloorIndex.js` using the device address (`M1-1-0`).
+2. Target Resolution: Resolves target building, floorId, sectionId, subsectionId, and assetId.
+3. Deep-Link Navigation: Constructs URL:
+   `/dashboard/floor_configuration/view?building=TowerA&floor=Floor2&section=SecB&assetId=doc123&address=M1-1-0&highlight=1`
+4. Auto-Focus & Pinpoint: Graphics View loads the exact subsection graphic, scrolls/zooms
+   to center the device icon, and displays a glowing orange target highlight around the asset.
+
+
+================================================================================
+4. ASSET MANAGEMENT & INVENTORY SYSTEM
+================================================================================
+
+4.1 Asset Data Model & Database Architecture
+--------------------------------------------
+File: `src/lib/mockFirestore.js`
+File: `src/lib/serverDb.js`
+File: `desktop-server/src/services/storageService.ts`
+
+Assets represent physical fire protection hardware (detectors, call points, modules,
+sounders, valves). Asset records are stored in the `AssetsList` collection and duplicated into
+building specific collections (`<BuildingName>BuildingDB`).
+
+Asset Schema Structure:
+{
+  id: "doc_uuid",
+  building: "Tower A",
+  buildingName: "Tower A",
+  assetId: "AST-001",
+  deviceAddress: "M1-1-0",       // Simplex loop address
+  simplexAddress: "1-1-0",       // Normalized address
+  deviceLocation: "FLOOR 1 MAIN LOBBY",
+  itemType: "Smoke Detector",     // Device category
+  pointType: "MONITOR",           // Panel point type (IAM, ZAM, MAPNET)
+  brand: "Simplex",               // Hardware brand
+  simplexStatus: "NORMAL",        // Current live state (F, T, S, NORMAL)
+  floorPlanName: "Floor_1_Sec_A", // Linked floorplan image
+  placementLevel: "subsection",   // Placement depth
+  floorId: "floor_1",
+  sectionId: "section_a",
+  subsectionId: "sub_1",
+  x: 450,                        // Natural image pixel X
+  y: 320,                        // Natural image pixel Y
+  relativeX: 0.45,               // Percentage X (0.0 to 1.0)
+  relativeY: 0.32,               // Percentage Y (0.0 to 1.0)
+  coordinates: { x: 12.5, y: 8.2, z: 3.0 } // 3D BIM / CAD spatial coordinates
+}
+
+4.2 Multi-Format Asset Parsing Engine (Simplex TXT, SGT, Excel/XLSX)
+-------------------------------------------------------------------
+File: `src/lib/parseSimplexFile.js`
+File: `src/lib/sgtExtractor.js`
+Route: `/dashboard/assets`
+
+Vision365 features a robust multi-format importer:
+
+1. Simplex Text Dump Importer (`parseSimplexFile.js`): Parses full panel programming
+   dumps (`cshow *`), extracting points, addresses, custom labels, and device types.
+2. SGT Extractor (`sgtExtractor.js`): Parses raw binary/structured Simplex SGT database
+   export files, extracting system card configs, channel loops, and point databases.
+3. Excel / BOQ Importer: Uses `xlsx` library to parse Bill of Quantities (BOQ) spreadsheets
+   and auto-map columns (Address, Description, Location, Type, Floor).
+
+4.3 In-Memory Fast Indexing & Address Matching
+----------------------------------------------
+File: `src/lib/assetAddressFloorIndex.js`
+File: `src/lib/assetsListSimplexStatus.js`
+
+To maintain sub-millisecond lookups during high-frequency telnet updates:
+- Address Match Keys Generator (`collectAssetAddressMatchKeys`): For an asset with address
+  `1:M1-2-0`, generates all possible panel variation keys:
+  `["1:M1-2-0", "M1-2-0", "1-2-0", "M1-2", "1:M1-2"]`
+- In-Memory Index Map: Maps every variation key directly to its asset record and floorplan position.
+- Cache Invalidation: Automatically clears and rebuilds indices whenever asset collections are modified.
+
+4.4 Cross-Building Asset Mapping & Transfer
+-------------------------------------------
+Route: `/dashboard/assets/map_assets`
+File: `src/lib/panelListAssetSync.js`
+
+Allows facility managers to transfer asset inventories between buildings or re-assign panel
+loops when building configurations change. Updates building references across both `AssetsList`
+and linked floorplan marker records atomically.
+
+4.5 Custom Asset Type Icon & Brand Registry Engine
+--------------------------------------------------
+File: `src/lib/assetIcons.js`
+File: `src/lib/assetTypeIconStorage.js`
+File: `src/contexts/AssetTypeIconsContext.jsx`
+
+- Icon Registry: Maps device types (`Smoke Detector`, `Heat Detector`, `Manual Call Point`,
+  `Duct Detector`, `Sprinkler Flow Switch`, `Control Module`) to specific vector icons.
+- Custom Icon Uploads: Allows users to assign custom PNG/SVG icons per asset type.
+- Brand Registry: Integrates manufacturer brand specifications (Simplex, Shield, Hochiki, GST).
+
+4.6 Device Search & Query System
+--------------------------------
+File: `src/lib/assetDeviceSearch.js`
+
+Provides multi-field fuzzy search across:
+- Device Address (`M1-1-0`)
+- Custom Label / Asset Name
+- Location String (`PUMP ROOM BASEMENT`)
+- Item Type (`SMOKE DETECTOR`)
+- Building / Floor Name
+
+
+================================================================================
+5. CROSS-SUBSYSTEM INTEGRATION & END-TO-END DATA FLOW
+================================================================================
+
+Below is the step-by-step end-to-end data flow when a physical fire detector triggers:
+
+1. Physical Event: A smoke detector at Address `M1-3-0` (Floor 2, Section A) detects smoke.
+2. Telnet Transmission: Simplex Panel sends string over TCP telnet socket to port 23.
+3. Backend Worker Processing (`firePanelWorker.ts`): Worker receives socket chunk,
+   identifies CVAL increase or alarm string `1:M1-3-0 ... SMOKE DETECTOR FIRE*`.
+4. Database Alarm Sync (`firePanelAlarmSync.ts`): Updates MongoDB snapshot `firePanelState`
+   and marks `AssetsList` asset `M1-3-0` with `simplexStatus = "FIRE"`.
+5. Frontend SSE/Polling Receiver (`AssetFireStatusProvider`): Receives active fire event.
+6. Audio Siren Activation (`fireAlertSiren.js`): Triggers Web Audio API sweep siren.
+7. Critical Modal Launch (`FireModalContext.jsx`): Displays full-screen red Fire Alert Modal.
+8. Operator Acknowledgment: Operator clicks "Acknowledge". Sends `ack f` command to panel.
+9. Auto Deep-Link Navigation (`fireAlertFloorNavigation.js`): Operator clicks "View Location".
+   Page redirects to `/dashboard/floor_configuration/view?building=TowerA&floor=Floor2&section=SecA&address=M1-3-0`.
+10. Canvas Visual Pinpoint (`/dashboard/floor_configuration/view`): Loads Floor 2 Section A graphic,
+    zooms to location `(relativeX: 0.42, relativeY: 0.68)`, renders glowing red pulsing icon.
+
+
+================================================================================
+6. SUMMARY OF TECHNICAL TECHNIQUES & INNOVATIONS
+================================================================================
+
+1. Isolated Telnet Socket Worker: Prevents socket drops caused by UI rendering load, ensuring
+   uninterrupted panel connectivity.
+2. Robust Boundary-Insertion Parsing Matrix: Cleans NUL-byte padded and glued panel telnet
+   strings, extracting precise addresses and flags.
+3. Web Audio API Acoustic Synthesizer: Pure programmatic siren generation without external
+   audio file loading delays.
+4. Normalized CAD-to-Image Spatial Matrix: Seamlessly maps Cartesian Y-Up DXF CAD coordinates
+   to HTML DOM Y-Down raster image coordinates with Y-inversion and bounding box normalization.
+5. 4-Tier Hierarchical Spatial Navigation: Allows smooth navigation across massive facility graphics
+   from Campus level down to specific room Subsections.
+6. Fast Multi-Key Address Matching: Sub-millisecond lookup map mapping panel address variations
+   to exact database assets and floorplan locations.
+7. Deep-Linked Critical Emergency Navigation: Instant one-click path from an incoming panel alert
+   straight to the physical device pinpoint on the floor plan map.
+================================================================================

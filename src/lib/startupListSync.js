@@ -1,0 +1,294 @@
+import { apiUrl } from "@/lib/apiClient";
+import { parseShowCountsResponse } from "@/lib/panelState";
+import {
+  extractPanelDeviceAddresses,
+  parsePanelListResponse,
+} from "@/lib/firePanelMonitor";
+import { syncPanelListWithTempArray, getTempPanelList } from "@/lib/firePanelListHistory";
+import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
+import { resetAllAssetsSimplexStatus } from "@/lib/systemResetWorkflow";
+import {
+  recordNewElementsToHistory,
+  saveListToCategoryDb,
+} from "@/lib/recordAlarmHistory";
+import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
+import { useStartupProgressStore } from "@/stores/startupProgressStore";
+
+let startupSyncCompleted = false;
+let startupSyncInProgress = false;
+
+async function logStartupSync(message) {
+  console.log(message);
+  try {
+    await fetch(apiUrl("/api/telnet/fire-panel/logs"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+    });
+  } catch {
+    // ignore
+  }
+}
+
+export function isStartupListSyncCompleted() {
+  return startupSyncCompleted;
+}
+
+export function isStartupListSyncInProgress() {
+  return startupSyncInProgress;
+}
+
+/**
+ * Runs when the app starts up / opens and connects to the panel:
+ * 1. Resets all assets with F, T, or S > 0 to 0.
+ * 2. Runs `show counts` command to query totalFire, totalTrouble, totalSupervisory.
+ * 3. If any count > 0, executes the corresponding `list` command sequentially.
+ * 4. Confirms total count number of items are received before saving.
+ * 5. Saves elements to DB ({fire/trouble/supervisory}-list and building live history).
+ * 6. Logs saving complete message to console.
+ * 7. Updates matching assets' F, T, S values to 1 in AssetsList & store.
+ * 8. Strictly awaits saving all elements of the previous command before running the next!
+ * 9. Once all data is saved, closes the splash screen.
+ */
+export async function runStartupListSync(arg1, arg2) {
+  let setFirePanelListResponses = null;
+  let onProgress = null;
+
+  if (typeof arg1 === "function") {
+    setFirePanelListResponses = arg1;
+    if (typeof arg2 === "function") {
+      onProgress = arg2;
+    }
+  } else if (arg1 && typeof arg1 === "object") {
+    setFirePanelListResponses = arg1.setFirePanelListResponses || null;
+    onProgress = arg1.onProgress || null;
+  }
+
+  const reportProgress = (step, total, percent, message) => {
+    useStartupProgressStore.getState().setProgress({
+      step,
+      total: total || 12,
+      percent,
+      message,
+    });
+    if (typeof onProgress === "function") {
+      try {
+        onProgress({ step, total: total || 12, percent, message });
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  if (startupSyncCompleted) {
+    if (setFirePanelListResponses) {
+      for (const label of ["Fire", "Trouble", "Supervisory"]) {
+        const rows = getTempPanelList(label);
+        setFirePanelListResponses((prev) => ({
+          ...prev,
+          [label]: {
+            ...(prev[label] || {}),
+            rows,
+            fetchedAt: prev[label]?.fetchedAt || new Date().toISOString(),
+          },
+        }));
+      }
+    }
+    reportProgress(12, 12, 100, "Application ready");
+    useStartupProgressStore.getState().closeSplash();
+    return;
+  }
+
+  if (startupSyncInProgress) return;
+  startupSyncInProgress = true;
+
+  try {
+    const sendCommand = async (command, timeoutMs = 15000, expectedCount) => {
+      const res = await fetch(apiUrl("/api/telnet/fire-panel/command"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command, timeoutMs, expectedCount }),
+      });
+      if (!res.ok) return "";
+      const data = await res.json();
+      return typeof data === "string" ? data : (data?.response || data?.raw || "");
+    };
+
+    // Step 7: Reset all assets F, T, S values to 0
+    reportProgress(7, 12, 60, "Resetting device status (F/T/S to 0)...");
+    await logStartupSync("[startupSync] Resetting all assets F/T/S values to 0 before list commands...");
+    await resetAllAssetsSimplexStatus();
+
+    // Step 8: Run `show counts` (with retry attempts)
+    reportProgress(8, 12, 68, "Checking fire panel counts...");
+    let counts = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await logStartupSync(`[startupSync] Querying show counts on app startup (attempt ${attempt}/3)...`);
+      const countsRaw = await sendCommand("show counts", 6000);
+      counts = parseShowCountsResponse(countsRaw);
+      if (counts) break;
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    }
+
+    const totalFire = counts ? counts.totalFire : 0;
+    const totalTrouble = counts ? counts.totalTrouble : 0;
+    const totalSupervisory = counts ? counts.totalSupervisory : 0;
+
+    if (counts) {
+      await logStartupSync(
+        `[startupSync] Initial counts: Fire=${totalFire}, Trouble=${totalTrouble}, Supervisory=${totalSupervisory}`,
+      );
+      reportProgress(
+        8,
+        12,
+        72,
+        `Panel counts: Fire: ${totalFire} | Trouble: ${totalTrouble} | Supervisory: ${totalSupervisory}`,
+      );
+      // Save initial counts to database and dispatch event for realtime UI update
+      await fetch(apiUrl("/api/telnet/fire-panel/panel-state"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(counts),
+      }).catch(() => {});
+
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("vision365:firePanelStateUpdated", { detail: counts }),
+        );
+      }
+    }
+
+    // Helper to fetch, confirm count, and save a category list
+    const fetchConfirmAndSaveCategory = async (
+      label,
+      listCmd,
+      expectedCount = 0,
+      stepNum = 9,
+      basePercent = 75,
+    ) => {
+      const docName = `${label.toLowerCase()}-list`;
+
+      if (expectedCount === 0) {
+        reportProgress(stepNum, 12, basePercent + 5, `Saving ${label} list to database (0 items)...`);
+        syncPanelListWithTempArray(label, []);
+        await saveListToCategoryDb(label, []);
+        await syncAssetsListWithPanelList(label, []);
+        if (setFirePanelListResponses) {
+          setFirePanelListResponses((prev) => ({
+            ...prev,
+            [label]: { response: "", rows: [], fetchedAt: new Date().toISOString() },
+          }));
+        }
+        await logStartupSync(`[startupSync] Saving ${docName} to DB complete (0 items).`);
+        reportProgress(stepNum, 12, basePercent + 8, `${label} list synchronized (0 items).`);
+        return [];
+      }
+
+      reportProgress(
+        stepNum,
+        12,
+        basePercent,
+        `Fetching ${label} alarms (${expectedCount} items expected)...`,
+      );
+      await logStartupSync(`[startupSync] Running ${listCmd} (expecting ~${expectedCount} items)...`);
+
+      let parsedRows = [];
+      let rawRes = "";
+      const maxAttempts = 10;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const timeoutMs = Math.max(30000, Math.min(120000, expectedCount * 250 + 15000));
+        rawRes = await sendCommand(listCmd, timeoutMs, expectedCount);
+        parsedRows = parsePanelListResponse(rawRes);
+
+        // Confirm whether total count number of items were received
+        const isCountConfirmed =
+          parsedRows.length >= expectedCount ||
+          (parsedRows.length >= Math.floor(expectedCount * 0.95) && /_DNE|_END|\n-\s*$/i.test(rawRes));
+
+        if (isCountConfirmed) {
+          break;
+        }
+
+        if (attempt === maxAttempts) {
+          await logStartupSync(
+            `[startupSync] ${listCmd} completed with ${parsedRows.length}/${expectedCount} items after ${attempt} attempts. Proceeding to save...`,
+          );
+          break;
+        }
+
+        reportProgress(
+          stepNum,
+          12,
+          basePercent + Math.min(4, attempt),
+          `Fetching ${label} alarms: ${parsedRows.length}/${expectedCount} items (attempt ${attempt})...`,
+        );
+        await logStartupSync(
+          `[startupSync] ${listCmd} attempt ${attempt} received ${parsedRows.length}/${expectedCount} items. Waiting and retrying until full data is received...`,
+        );
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+
+      reportProgress(
+        stepNum,
+        12,
+        basePercent + 5,
+        `Saving ${label} list to database (${parsedRows.length} items)...`,
+      );
+      const addresses = extractPanelDeviceAddresses(rawRes);
+
+      // 1. Save to temp array cache
+      syncPanelListWithTempArray(label, parsedRows);
+
+      // 2. Save complete list to category DB ({fire/trouble/supervisory}-list)
+      await saveListToCategoryDb(label, parsedRows);
+
+      // 3. Update matching assets in Firestore AssetsList and live status store
+      await syncAssetsListWithPanelList(label, addresses);
+
+      // 4. Update frontend state
+      if (setFirePanelListResponses) {
+        setFirePanelListResponses((prev) => ({
+          ...prev,
+          [label]: { response: rawRes, rows: parsedRows, fetchedAt: new Date().toISOString() },
+        }));
+      }
+
+      // 5. Log saving complete message in log console (and do not run again)
+      await logStartupSync(`[startupSync] Saving ${docName} to DB complete (${parsedRows.length} items).`);
+      reportProgress(
+        stepNum,
+        12,
+        basePercent + 8,
+        `${label} data saved (${parsedRows.length} items).`,
+      );
+      return parsedRows;
+    };
+
+    // Step 9: Process Fire list
+    await fetchConfirmAndSaveCategory("Fire", "list f", totalFire, 9, 74);
+
+    // Step 10: Process Trouble list
+    await fetchConfirmAndSaveCategory("Trouble", "list t", totalTrouble, 10, 83);
+
+    // Step 11: Process Supervisory list
+    await fetchConfirmAndSaveCategory("Supervisory", "list s", totalSupervisory, 11, 92);
+
+    startupSyncCompleted = true;
+    reportProgress(12, 12, 100, "All panel data saved. Launching Vision365...");
+    await logStartupSync("[startupSync] All startup list commands, DB saving, and asset updates completed successfully.");
+
+    await new Promise((r) => setTimeout(r, 400));
+    useStartupProgressStore.getState().closeSplash();
+  } catch (error) {
+    console.error("[startupSync] Error during startup list synchronization:", error);
+    reportProgress(12, 12, 100, "Synchronization finished with warnings.");
+    await new Promise((r) => setTimeout(r, 400));
+    useStartupProgressStore.getState().closeSplash();
+  } finally {
+    startupSyncInProgress = false;
+    useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
+  }
+}

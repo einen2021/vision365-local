@@ -58,6 +58,7 @@ import { resolveAssetDeviceAddress, resolveSimplexDeviceAddress } from "@/lib/si
 import FirestoreService from "@/services/firestoreService"
 import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets"
 import { warmAddressFloorDetailsIndex } from "@/lib/assetAddressFloorIndex"
+import { getStoredSessionUser } from "@/lib/sessionUser"
 
 const normalizeMatchValue = (value) => String(value || "").toLowerCase().trim()
 
@@ -901,7 +902,13 @@ export default function AssetsPage() {
   const [previewData, setPreviewData] = useState([])
   const [previewHeaders, setPreviewHeaders] = useState([])
   const [uploadSuccess, setUploadSuccess] = useState(false)
-  const { communities, isReady } = useAppData({ toastOnCommunitiesError: true })
+  const { communities, isReady, role, user, userRole } = useAppData({ toastOnCommunitiesError: true })
+  const isClient = useMemo(() => {
+    const session = getStoredSessionUser()
+    const r = String(role || userRole || user?.role || session?.role || "").toLowerCase()
+    const d = String(user?.designation || session?.designation || "").toLowerCase()
+    return r === "client" || d === "client"
+  }, [role, userRole, user])
   const [buildings, setBuildings] = useState([])
   const [selectedCommunityId, setSelectedCommunityId] = useState("")
   const [selectedBuildingName, setSelectedBuildingName] = useState("")
@@ -1452,6 +1459,7 @@ export default function AssetsPage() {
     return filteredAssets.slice(start, start + ASSETS_PAGE_SIZE)
   }, [filteredAssets, assetsPage])
   const toggleAssetSelection = (asset, checked) => {
+    if (isClient) return
     const key = getAssetRowKey(asset)
     setSelectedAssetKeys((prev) => {
       if (checked) return prev.includes(key) ? prev : [...prev, key]
@@ -1460,6 +1468,7 @@ export default function AssetsPage() {
   }
 
   const toggleSelectAllFiltered = (checked) => {
+    if (isClient) return
     const filteredKeys = filteredAssets.map(getAssetRowKey)
     if (!checked) {
       setSelectedAssetKeys((prev) => prev.filter((key) => !filteredKeys.includes(key)))
@@ -1467,6 +1476,12 @@ export default function AssetsPage() {
     }
     setSelectedAssetKeys((prev) => [...new Set([...prev, ...filteredKeys])])
   }
+
+  useEffect(() => {
+    if (isClient && selectedAssetKeys.length > 0) {
+      setSelectedAssetKeys([])
+    }
+  }, [isClient, selectedAssetKeys.length])
 
   // Floor-plan markers should disappear quickly after an upload-asset delete.
   const FLOOR_MAPPING_CLEANUP_MS = 5000
@@ -1850,6 +1865,15 @@ export default function AssetsPage() {
   }
 
   const handleDeleteAsset = async (asset) => {
+    if (isClient) {
+      toast({
+        title: "Permission Denied",
+        description: "Delete functionality is disabled for client users.",
+        variant: "destructive",
+      })
+      return
+    }
+
     try {
       setDeletingAssetId(asset.id)
 
@@ -1881,6 +1905,15 @@ export default function AssetsPage() {
   }
 
   const handleBulkDeleteSelected = async () => {
+    if (isClient) {
+      toast({
+        title: "Permission Denied",
+        description: "Delete functionality is disabled for client users.",
+        variant: "destructive",
+      })
+      return
+    }
+
     const selectedAssets = filteredAssets.filter((asset) =>
       selectedAssetKeys.includes(getAssetRowKey(asset)),
     )
@@ -2611,7 +2644,7 @@ export default function AssetsPage() {
           <Card className="shadow-md">
             <CardHeader className="py-3">
               <CardTitle className="text-base flex items-center gap-2">
-                Upload Assets
+                {isClient ? "All Assets" : "Upload Assets"}
                 <FaqHelpButton articleId="page-assets-upload" />
                 <FaqHelpButton articleId="as-upload" />
               </CardTitle>
@@ -3391,7 +3424,7 @@ export default function AssetsPage() {
                     </div>
                   </div>
 
-                  {selectedCount > 0 && (
+                  {selectedCount > 0 && !isClient && (
                     <div className="mb-3 flex items-center justify-between rounded-md border bg-muted/40 px-3 py-2">
                       <span className="text-xs font-medium">
                         {selectedCount} asset{selectedCount === 1 ? "" : "s"} selected
@@ -3410,7 +3443,8 @@ export default function AssetsPage() {
                           variant="destructive"
                           size="sm"
                           className="h-7 text-xs"
-                          disabled={isBulkDeleting}
+                          disabled={isBulkDeleting || isClient}
+                          title={isClient ? "Delete disabled for client role" : undefined}
                           onClick={handleBulkDeleteSelected}
                         >
                           {isBulkDeleting ? (
@@ -3438,10 +3472,10 @@ export default function AssetsPage() {
                         <TableRow className="text-[10px]">
                           <TableHead className="w-10 px-2 py-1.5">
                             <Checkbox
-                              checked={allFilteredSelected}
-                              onCheckedChange={(checked) => toggleSelectAllFiltered(!!checked)}
+                              checked={!isClient && allFilteredSelected}
+                              onCheckedChange={(checked) => !isClient && toggleSelectAllFiltered(!!checked)}
                               aria-label="Select all visible assets"
-                              disabled={filteredAssets.length === 0 || isBulkDeleting}
+                              disabled={isClient || filteredAssets.length === 0 || isBulkDeleting}
                             />
                           </TableHead>
                           {isBuildingAsset ? (
@@ -3487,14 +3521,14 @@ export default function AssetsPage() {
                             return (
                             <TableRow
                               key={rowKey}
-                              className={`text-[11px] ${isSelected ? "bg-muted/50" : ""} cursor-pointer`}
-                              onClick={() => toggleAssetSelection(asset, !isSelected)}
+                              className={`text-[11px] ${!isClient && isSelected ? "bg-muted/50" : ""} ${isClient ? "cursor-default" : "cursor-pointer"}`}
+                              onClick={() => !isClient && toggleAssetSelection(asset, !isSelected)}
                             >
-                              <TableCell className="px-2 py-1.5">
+                              <TableCell className="px-2 py-1.5" onClick={(e) => isClient && e.stopPropagation()}>
                                 <Checkbox
-                                  checked={isSelected}
-                                  onCheckedChange={(checked) => toggleAssetSelection(asset, !!checked)}
-                                  disabled={isBulkDeleting}
+                                  checked={!isClient && isSelected}
+                                  onCheckedChange={(checked) => !isClient && toggleAssetSelection(asset, !!checked)}
+                                  disabled={isClient || isBulkDeleting}
                                   aria-label={`Select ${asset.assetId || asset.buildingAssetId || asset.id}`}
                                 />
                               </TableCell>
@@ -3522,13 +3556,14 @@ export default function AssetsPage() {
                                     {asset.createdAt ? new Date(asset.createdAt).toLocaleString() : "-"}
                                   </TableCell>
                                   <TableCell className="px-2 py-1.5 text-right" onClick={(e) => e.stopPropagation()}>
-                                    <DropdownMenu modal={false}>
+                                    <DropdownMenu modal={false} open={isClient ? false : undefined}>
                                       <DropdownMenuTrigger asChild>
                                         <Button
                                           variant="ghost"
                                           size="icon"
                                           className="h-8 w-8"
-                                          disabled={deletingAssetId === asset.id || isBulkDeleting}
+                                          disabled={isClient || deletingAssetId === asset.id || isBulkDeleting}
+                                          title={isClient ? "Options disabled for client role" : undefined}
                                         >
                                           {Object.values(uploadingDocTypes[asset.id] || {}).some(Boolean) ? (
                                             <Loader2 className="h-4 w-4 animate-spin" />
@@ -3630,8 +3665,9 @@ export default function AssetsPage() {
 
                                         <DropdownMenuItem
                                           className="text-destructive"
-                                          disabled={deletingAssetId === asset.id}
-                                          onClick={() => handleDeleteAsset(asset)}
+                                          disabled={isClient || deletingAssetId === asset.id}
+                                          title={isClient ? "Delete disabled for client role" : undefined}
+                                          onClick={() => !isClient && handleDeleteAsset(asset)}
                                         >
                                           <Trash2 className="mr-2 h-4 w-4" />
                                           Delete Asset
@@ -3672,13 +3708,14 @@ export default function AssetsPage() {
                                     {asset.description || "-"}
                                   </TableCell>
                                   <TableCell className="px-2 py-1.5 text-right" onClick={(e) => e.stopPropagation()}>
-                                    <DropdownMenu modal={false}>
+                                    <DropdownMenu modal={false} open={isClient ? false : undefined}>
                                       <DropdownMenuTrigger asChild>
                                         <Button
                                           variant="ghost"
                                           size="icon"
                                           className="h-8 w-8"
-                                          disabled={deletingAssetId === asset.id || isBulkDeleting}
+                                          disabled={isClient || deletingAssetId === asset.id || isBulkDeleting}
+                                          title={isClient ? "Options disabled for client role" : undefined}
                                         >
                                           {Object.values(uploadingDocTypes[asset.id] || {}).some(Boolean) ? (
                                             <Loader2 className="h-4 w-4 animate-spin" />
@@ -3780,8 +3817,9 @@ export default function AssetsPage() {
 
                                         <DropdownMenuItem
                                           className="text-destructive"
-                                          disabled={deletingAssetId === asset.id}
-                                          onClick={() => handleDeleteAsset(asset)}
+                                          disabled={isClient || deletingAssetId === asset.id}
+                                          title={isClient ? "Delete disabled for client role" : undefined}
+                                          onClick={() => !isClient && handleDeleteAsset(asset)}
                                         >
                                           <Trash2 className="mr-2 h-4 w-4" />
                                           Delete Asset

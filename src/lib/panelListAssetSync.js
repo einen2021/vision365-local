@@ -46,7 +46,6 @@ function patchStoreFromEntry(entryId, data, status, extraAddress = "") {
  * Sets the category flag on active devices and clears it on stale ones.
  */
 export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
-  // Always read fresh AssetsList rows for F/T sync (never a stale placement cache).
   invalidateAssetsListSnapshotCache();
 
   const statusKey = simplexKeyForCategoryLabel(label);
@@ -55,46 +54,61 @@ export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
   let updatedCount = 0;
   let clearedCount = 0;
 
-  // Keep map markers correct even when AssetsList has no matching rows.
+  // 1. Instantly update in-memory store in 0ms
   useAssetFireStatusStore
     .getState()
     .syncPanelLiveFlagsForCategory(statusKey, deviceAddresses);
+
+  // 2. Resolve entries and prepare parallel Firestore writes
+  const updatePromises = [];
+  const matchedDocIds = new Set();
 
   for (const deviceAddress of deviceAddresses) {
     const entry = await findAssetsListEntryByPanelAddress(deviceAddress);
     if (!entry) continue;
 
+    matchedDocIds.add(entry.id);
     const data = { ...entry.data, id: entry.id };
     const current = readSimplexStatus(data);
     if (Number(current[statusKey]) === 1) {
-      // Still patch store so id keys match markers without relying only on address.
       patchStoreFromEntry(entry.id, data, current, deviceAddress);
       continue;
     }
 
     const next = { ...current, [statusKey]: 1 };
-    await updateDoc(doc(db, "AssetsList", entry.id), {
-      simplexStatus: next,
-      updatedAt: now,
-    });
     patchStoreFromEntry(entry.id, data, next, deviceAddress);
+    updatePromises.push(
+      updateDoc(doc(db, "AssetsList", entry.id), {
+        simplexStatus: next,
+        updatedAt: now,
+      }),
+    );
     updatedCount += 1;
   }
 
+  // 3. Clear stale assets in AssetsList
   const snapshot = await getDocs(collection(db, "AssetsList"));
   for (const docSnap of snapshot.docs) {
+    if (matchedDocIds.has(docSnap.id)) continue;
     const data = { ...docSnap.data(), id: docSnap.id };
     const current = readSimplexStatus(data);
     if (Number(current[statusKey]) !== 1) continue;
     if (assetMatchesActiveList(data, activeKeys)) continue;
 
     const next = { ...current, [statusKey]: 0 };
-    await updateDoc(doc(db, "AssetsList", docSnap.id), {
-      simplexStatus: next,
-      updatedAt: now,
-    });
     patchStoreFromEntry(docSnap.id, data, next);
+    updatePromises.push(
+      updateDoc(doc(db, "AssetsList", docSnap.id), {
+        simplexStatus: next,
+        updatedAt: now,
+      }),
+    );
     clearedCount += 1;
+  }
+
+  // 4. Concurrently execute all writes
+  if (updatePromises.length > 0) {
+    await Promise.all(updatePromises);
   }
 
   return { updatedCount, clearedCount, statusKey };

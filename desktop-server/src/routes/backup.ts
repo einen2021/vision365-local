@@ -6,6 +6,7 @@ import { createBackup, restoreBackup, listBackups } from "../services/backupServ
 import { readDb, writeDb } from "../db/documentStore";
 import {
   countProductiveData,
+  findLatestDbSnapshotBackup,
   findBestDbSnapshotBackup,
   saveDbSnapshotBackup,
 } from "../services/dbSnapshotBackup";
@@ -54,14 +55,22 @@ export function createBackupRoutes(paths: AppPaths) {
       })
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
-    const best = findBestDbSnapshotBackup(paths.root);
+    const latest = findLatestDbSnapshotBackup(paths.root);
     return c.json({
       snapshots,
-      best: best
+      latest: latest
         ? {
-            path: best.path,
-            score: best.score,
-            ...countProductiveData(best.data),
+            path: latest.path,
+            score: latest.score,
+            timestamp: latest.timestamp,
+            ...countProductiveData(latest.data),
+          }
+        : null,
+      best: latest
+        ? {
+            path: latest.path,
+            score: latest.score,
+            ...countProductiveData(latest.data),
           }
         : null,
     });
@@ -77,14 +86,14 @@ export function createBackupRoutes(paths: AppPaths) {
       if (filename) {
         filePath = path.join(dir, path.basename(filename));
       } else {
-        const best = findBestDbSnapshotBackup(paths.root);
-        if (!best) {
+        const latest = findLatestDbSnapshotBackup(paths.root);
+        if (!latest) {
           return c.json(
             { success: false, message: "No db snapshot backup found" },
             404,
           );
         }
-        filePath = best.path;
+        filePath = latest.path;
       }
 
       if (!fs.existsSync(filePath)) {

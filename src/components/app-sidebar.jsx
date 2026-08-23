@@ -95,19 +95,42 @@ const navMain = [
 function buildNavItemsForRole(role) {
   const allowedRoutes = getAllowedRoutesForRole(role);
   const isAdmin = String(role || "").toLowerCase() === "admin";
+  const isClient = String(role || "").toLowerCase() === "client";
 
   if (isAdmin) {
     return navMain;
   }
 
   return navMain
-    .map((section) => ({
-      ...section,
-      items: (section.items || []).map((subItem) => ({
-        ...subItem,
-        disabled: !isPathAllowed(subItem.url, allowedRoutes),
-      })),
-    }))
+    .map((section) => {
+      const isAssetsSection = section.title === "Assets";
+      const items = (section.items || [])
+        .filter((subItem) => {
+          if (isClient && isAssetsSection) {
+            // For client: show upload assets (as All Assets), hide create assets and view/edit assets
+            return subItem.url === "/dashboard/assets";
+          }
+          return isPathAllowed(subItem.url, allowedRoutes);
+        })
+        .map((subItem) => {
+          if (isClient && isAssetsSection && subItem.url === "/dashboard/assets") {
+            return {
+              ...subItem,
+              title: "All Assets",
+              disabled: false,
+            };
+          }
+          return {
+            ...subItem,
+            disabled: !isPathAllowed(subItem.url, allowedRoutes),
+          };
+        });
+
+      return {
+        ...section,
+        items,
+      };
+    })
     .filter((section) => section.items?.some((subItem) => !subItem.disabled));
 }
 

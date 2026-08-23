@@ -5,7 +5,11 @@ export function normalizeRoleKey(role) {
 }
 
 export function extractLoginRole(userData) {
-  return normalizeRoleKey(userData?.role);
+  const role = normalizeRoleKey(userData?.role);
+  if (role) return role;
+  const designation = normalizeRoleKey(userData?.designation);
+  if (designation) return designation;
+  return "";
 }
 
 export function isUserLoggedIn(user) {
@@ -37,7 +41,22 @@ export function isPathAllowed(pathname, allowedRoutes) {
   const path = normalizePathname(pathname);
   return allowedRoutes.some((route) => {
     const r = normalizePathname(route);
-    return path === r || path.startsWith(`${r}/`);
+    if (path === r) return true;
+    if (path.startsWith(`${r}/`)) {
+      // If path matches a distinct known common route not included in allowedRoutes, disallow it
+      const matchesOtherCommonRoute = commonRoutes.some((cr) => {
+        const ncr = normalizePathname(cr);
+        return ncr !== r && (path === ncr || path.startsWith(`${ncr}/`));
+      });
+      if (matchesOtherCommonRoute) {
+        return allowedRoutes.some((ar) => {
+          const nar = normalizePathname(ar);
+          return path === nar || path.startsWith(`${nar}/`);
+        });
+      }
+      return true;
+    }
+    return false;
   });
 }
 

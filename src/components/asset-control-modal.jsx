@@ -21,7 +21,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Loader2, Edit, MapPin, CheckCircle, XCircle, RefreshCcw, Hash, FileText, Save } from "lucide-react"
 import { FirestoreService } from "@/services/firestoreService"
-import { resolveAssetsListDocId } from "@/lib/assetsListSimplexStatus"
+import { resolveAssetsListDocId, resetSimplexFlag } from "@/lib/assetsListSimplexStatus"
 import { clearAllAppCaches } from "@/lib/cacheUtils"
 import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets"
 import { updateAssetInAddressFloorIndex } from "@/lib/assetAddressFloorIndex"
@@ -136,6 +136,7 @@ export function AssetControlModal({
   const [enabledState, setEnabledState] = useState("")
   const [enabled, setEnabled] = useState(true)
   const [selectedAsset, setSelectedAsset] = useState(null)
+  const [resettingFlag, setResettingFlag] = useState(null)
 
   // Bump this to ignore late responses from a previous open / asset / refresh.
   const statusRequestIdRef = useRef(0)
@@ -451,6 +452,7 @@ export function AssetControlModal({
       setEnabled(true)
       setSelectedAsset(null)
       setIsLoadingPanelStatus(false)
+      setResettingFlag(null)
     }
   }, [isOpen])
 
@@ -560,6 +562,50 @@ export function AssetControlModal({
         variant: "destructive",
       })
     } finally {
+      setIsUpdatingAsset(false)
+    }
+  }
+
+  const handleResetFlag = async (flag) => {
+    if (!selectedAsset || userRole !== "admin") {
+      toast({
+        title: "Unauthorized",
+        description: "Only admins can reset status flags",
+        variant: "destructive",
+      })
+      return
+    }
+
+    const flagNames = {
+      F: "Fire",
+      T: "Trouble",
+      S: "Supervisory",
+    }
+    const label = flagNames[flag] || flag
+
+    setResettingFlag(flag)
+    setIsUpdatingAsset(true)
+    try {
+      const address = deviceAddress.trim()
+      await resetSimplexFlag(selectedAsset, address, flag)
+
+      toast({
+        title: "Status Reset",
+        description: `${label} status flag (${flag}) reset to 0`,
+      })
+
+      if (address && useFirePanelStore.getState().connected) {
+        void fetchPanelShowStatus(address, selectedAsset)
+      }
+    } catch (error) {
+      console.error(`Error resetting ${label} status:`, error)
+      toast({
+        title: "Reset Failed",
+        description: error.message || `Failed to reset ${label} status`,
+        variant: "destructive",
+      })
+    } finally {
+      setResettingFlag(null)
       setIsUpdatingAsset(false)
     }
   }
@@ -909,6 +955,54 @@ export function AssetControlModal({
                       {Number(simplexFTS.S) || 0}
                     </span>
                   </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2 pt-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 text-xs border-red-500/30 text-red-700 hover:bg-red-500/10 dark:text-red-300 disabled:opacity-40"
+                    disabled={isUpdatingAsset || Number(simplexFTS.F) !== 1}
+                    onClick={() => handleResetFlag("F")}
+                  >
+                    {resettingFlag === "F" ? (
+                      <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCcw className="mr-1 h-3.5 w-3.5 shrink-0" />
+                    )}
+                    <span className="truncate">Reset Fire</span>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 text-xs border-yellow-500/30 text-yellow-700 hover:bg-yellow-500/10 dark:text-yellow-300 disabled:opacity-40"
+                    disabled={isUpdatingAsset || Number(simplexFTS.T) !== 1}
+                    onClick={() => handleResetFlag("T")}
+                  >
+                    {resettingFlag === "T" ? (
+                      <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCcw className="mr-1 h-3.5 w-3.5 shrink-0" />
+                    )}
+                    <span className="truncate">Reset Trouble</span>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 text-xs border-purple-500/30 text-purple-700 hover:bg-purple-500/10 dark:text-purple-300 disabled:opacity-40"
+                    disabled={isUpdatingAsset || Number(simplexFTS.S) !== 1}
+                    onClick={() => handleResetFlag("S")}
+                  >
+                    {resettingFlag === "S" ? (
+                      <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCcw className="mr-1 h-3.5 w-3.5 shrink-0" />
+                    )}
+                    <span className="truncate">Reset Supervisory</span>
+                  </Button>
                 </div>
               </div>
 

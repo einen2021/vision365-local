@@ -1,5 +1,6 @@
-/** Active scale for floor maps / 3D markers — derived from simplexStatus F and T */
+/** Active scale for floor maps / 3D markers — derived from simplexStatus F, T, and S */
 export const FIRE_ACTIVE_NORMAL = 0;
+export const FIRE_ACTIVE_SUPERVISORY = 3;
 export const FIRE_ACTIVE_TROUBLE = 5;
 export const FIRE_ACTIVE_ALARM = 9;
 
@@ -9,10 +10,10 @@ export function normalizeDeviceAddress(value) {
   return stripPanelAddressPrefix(value).toUpperCase();
 }
 
-/** Normalize cache entry (legacy number = F only) to { F, T } */
+/** Normalize cache entry (legacy number = F only) to { F, T, S } */
 export function normalizeSimplexStatus(entry) {
-  if (entry == null) return { F: 0, T: 0 };
-  if (typeof entry === "number") return { F: Number(entry), T: 0 };
+  if (entry == null) return { F: 0, T: 0, S: 0 };
+  if (typeof entry === "number") return { F: Number(entry), T: 0, S: 0 };
   return {
     F: Number(entry.F ?? entry.f ?? 0),
     T: Number(entry.T ?? entry.t ?? 0),
@@ -20,16 +21,17 @@ export function normalizeSimplexStatus(entry) {
   };
 }
 
-/** Map panel simplexStatus F/T to marker active scale */
-export function simplexStatusToActive(f, t) {
+/** Map panel simplexStatus F/T/S to marker active scale */
+export function simplexStatusToActive(f, t, s = 0) {
   if (Number(f) === 1) return FIRE_ACTIVE_ALARM;
   if (Number(t) === 1) return FIRE_ACTIVE_TROUBLE;
+  if (Number(s) === 1) return FIRE_ACTIVE_SUPERVISORY;
   return FIRE_ACTIVE_NORMAL;
 }
 
-/** @deprecated Use simplexStatusToActive(F, T) */
+/** @deprecated Use simplexStatusToActive(F, T, S) */
 export function fireValueToActive(f) {
-  return simplexStatusToActive(f, 0);
+  return simplexStatusToActive(f, 0, 0);
 }
 
 export function isFireAlarmActive(activeValue) {
@@ -41,41 +43,42 @@ export function isFireTroubleActive(activeValue) {
   return v >= FIRE_ACTIVE_TROUBLE && v < FIRE_ACTIVE_ALARM;
 }
 
+export function isFireSupervisoryActive(activeValue) {
+  const v = Number(activeValue);
+  return v >= FIRE_ACTIVE_SUPERVISORY && v < FIRE_ACTIVE_TROUBLE;
+}
+
 function resolveStatusFromCache(cache, deviceAddress, assetId) {
   if (!cache) return null;
 
-  let fromList = null;
-
   const addressKeys = collectDeviceAddressKeys(deviceAddress);
-  for (const addr of addressKeys) {
-    if (cache.byDeviceAddress[addr] !== undefined) {
-      fromList = normalizeSimplexStatus(cache.byDeviceAddress[addr]);
-      break;
-    }
-  }
+  const idKeys = collectAssetIdKeys(assetId);
 
-  if (!fromList) {
-    const idKeys = collectAssetIdKeys(assetId);
-    for (const id of idKeys) {
-      if (cache.byAssetId[id] !== undefined) {
-        fromList = normalizeSimplexStatus(cache.byAssetId[id]);
-        break;
-      }
-    }
-  }
-
-  // 1) Live monitor list F/T/S — highest priority.
-  let fromPanel = null;
+  // 1) Live monitor list F/T/S — highest priority (updated in milliseconds).
   if (cache.panelLiveByAddress) {
     for (const addr of addressKeys) {
       if (cache.panelLiveByAddress[addr] !== undefined) {
-        fromPanel = normalizeSimplexStatus(cache.panelLiveByAddress[addr]);
-        break;
+        return normalizeSimplexStatus(cache.panelLiveByAddress[addr]);
+      }
+    }
+    for (const id of idKeys) {
+      if (cache.panelLiveByAddress[id] !== undefined) {
+        return normalizeSimplexStatus(cache.panelLiveByAddress[id]);
       }
     }
   }
-  if (fromPanel) return fromPanel;
-  if (fromList) return fromList;
+
+  // 2) AssetsList database cache fallback.
+  for (const addr of addressKeys) {
+    if (cache.byDeviceAddress?.[addr] !== undefined) {
+      return normalizeSimplexStatus(cache.byDeviceAddress[addr]);
+    }
+  }
+  for (const id of idKeys) {
+    if (cache.byAssetId?.[id] !== undefined) {
+      return normalizeSimplexStatus(cache.byAssetId[id]);
+    }
+  }
 
   // 3) Asset Control `show` PRIMARY STATUS — lowest priority fallback.
   if (cache.showStatusByAddress) {
@@ -109,52 +112,21 @@ export function resolveStatusFromCacheForMapping(
     mapping.details?.partNumber,
     resolveAssetDeviceAddress(mapping),
     resolveAssetDeviceAddress(mapping.details || {}),
-  ];
+  ].filter(Boolean);
 
-  let fromList = null;
-  for (const address of addresses) {
-    const addressKeys = collectDeviceAddressKeys(address);
-    for (const addr of addressKeys) {
-      if (cache.byDeviceAddress?.[addr] !== undefined) {
-        fromList = normalizeSimplexStatus(cache.byDeviceAddress[addr]);
-        break;
-      }
-    }
-    if (fromList) break;
-  }
+  const ids = [
+    mapping.assetsListId,
+    mapping.details?.assetsListId,
+    mapping.details?.id,
+    mapping.buildingAssetId,
+    mapping.id,
+    mapping.sanitizedId,
+    mapping.assetId,
+  ].filter(Boolean);
 
-  if (!fromList) {
-    const ids = [
-      mapping.assetsListId,
-      mapping.details?.assetsListId,
-      mapping.details?.id,
-      mapping.buildingAssetId,
-      mapping.id,
-      mapping.sanitizedId,
-      mapping.assetId,
-    ];
-    for (const id of ids) {
-      const idKeys = collectAssetIdKeys(id);
-      for (const key of idKeys) {
-        if (cache.byAssetId?.[key] !== undefined) {
-          fromList = normalizeSimplexStatus(cache.byAssetId[key]);
-          break;
-        }
-      }
-      if (fromList) break;
-    }
-  }
-
-  // AssetsList meta may expose the panel address when the mapping omitted it.
+  // Collect metaAddresses from metaByAssetId for any id associated with this mapping
   const metaAddresses = [];
   if (cache.metaByAssetId) {
-    const ids = [
-      mapping?.assetsListId,
-      mapping?.details?.assetsListId,
-      mapping?.buildingAssetId,
-      mapping?.id,
-      mapping?.assetId,
-    ];
     for (const id of ids) {
       const key = String(id || "").trim();
       if (!key) continue;
@@ -164,8 +136,11 @@ export function resolveStatusFromCacheForMapping(
     }
   }
 
+  const allAddresses = [...new Set([...addresses, ...metaAddresses])];
+
+  // 1. Highest Priority: Live panel monitor status (panelLiveByAddress) — updated in milliseconds!
   let fromPanel = null;
-  for (const address of [...addresses, ...metaAddresses]) {
+  for (const address of allAddresses) {
     for (const addr of collectDeviceAddressKeys(address)) {
       if (cache.panelLiveByAddress?.[addr] !== undefined) {
         fromPanel = orSimplexStatus(
@@ -175,13 +150,47 @@ export function resolveStatusFromCacheForMapping(
       }
     }
   }
-
+  for (const id of ids) {
+    for (const key of collectAssetIdKeys(id)) {
+      if (cache.panelLiveByAddress?.[key] !== undefined) {
+        fromPanel = orSimplexStatus(
+          fromPanel,
+          cache.panelLiveByAddress[key],
+        );
+      }
+    }
+  }
   if (fromPanel) return fromPanel;
+
+  // 2. Second Priority: AssetsList database cache (fromList)
+  let fromList = null;
+  for (const address of allAddresses) {
+    for (const addr of collectDeviceAddressKeys(address)) {
+      if (cache.byDeviceAddress?.[addr] !== undefined) {
+        fromList = normalizeSimplexStatus(cache.byDeviceAddress[addr]);
+        break;
+      }
+    }
+    if (fromList) break;
+  }
+
+  if (!fromList) {
+    for (const id of ids) {
+      for (const key of collectAssetIdKeys(id)) {
+        if (cache.byAssetId?.[key] !== undefined) {
+          fromList = normalizeSimplexStatus(cache.byAssetId[key]);
+          break;
+        }
+      }
+      if (fromList) break;
+    }
+  }
+
   if (fromList) return fromList;
 
-  // Lowest priority: `show` PRIMARY STATUS from Asset Control modal.
+  // 3. Lowest Priority: `show` PRIMARY STATUS from Asset Control modal.
   let fromShow = null;
-  for (const address of [...addresses, ...metaAddresses]) {
+  for (const address of allAddresses) {
     for (const addr of collectDeviceAddressKeys(address)) {
       if (cache.showStatusByAddress?.[addr] !== undefined) {
         fromShow = normalizeSimplexStatus(cache.showStatusByAddress[addr]);
@@ -198,16 +207,45 @@ export function resolveStatusFromCacheForMapping(
 /** All cache keys to try for a panel / Simplex device address. */
 export function collectDeviceAddressKeys(deviceAddress) {
   const keys = new Set();
-  const raw = String(deviceAddress || "").trim();
+  const raw = String(deviceAddress || "").trim().toUpperCase();
   if (!raw) return keys;
 
-  keys.add(raw.toUpperCase());
-  keys.add(normalizeDeviceAddress(raw));
+  const addVariations = (val) => {
+    const str = String(val || "").trim().toUpperCase();
+    if (!str) return;
+    keys.add(str);
+
+    const stripped = stripPanelAddressPrefix(str).toUpperCase();
+    if (stripped) {
+      keys.add(stripped);
+      if (/-\d+$/.test(stripped)) {
+        keys.add(stripped.replace(/-\d+$/, ""));
+      }
+      if (/^M\d+-\d+$/i.test(stripped)) {
+        keys.add(`${stripped}-0`);
+      }
+    }
+
+    if (/^(\d+:)(.+)$/.test(str)) {
+      const match = str.match(/^(\d+:)(.+)$/);
+      if (match) {
+        const prefix = match[1];
+        const rest = match[2];
+        if (/-\d+$/.test(rest)) {
+          keys.add(`${prefix}${rest.replace(/-\d+$/, "")}`);
+        }
+        if (/^M\d+-\d+$/i.test(rest)) {
+          keys.add(`${prefix}${rest}-0`);
+        }
+      }
+    }
+  };
+
+  addVariations(raw);
 
   const resolved = resolveAssetDeviceAddress({ deviceAddress: raw });
   if (resolved) {
-    keys.add(resolved.toUpperCase());
-    keys.add(normalizeDeviceAddress(resolved));
+    addVariations(resolved);
   }
 
   return keys;
@@ -315,19 +353,22 @@ export function resolveMarkerStatusFromMapping(
 }
 
 /**
- * Floor-map colors + ripple from F/T:
- * - F=1 (T=0 or T=1) → red + ripple
- * - F=0, T=1 → yellow, no ripple
- * - F=0, T=0 → green, no ripple
+ * Floor-map colors + ripple from F/T/S:
+ * - F=1 → red + ripple
+ * - T=1 (F=0) → yellow, no ripple
+ * - S=1 (F=0, T=0) → purple, no ripple
+ * - F=0, T=0, S=0 → green, no ripple
  */
-export function markerVisualFromFT(f, t) {
+export function markerVisualFromFTS(f, t, s = 0) {
   const F = Number(f) === 1 ? 1 : 0;
   const T = Number(t) === 1 ? 1 : 0;
+  const S = Number(s) === 1 ? 1 : 0;
 
   if (F === 1) {
     return {
       F,
       T,
+      S,
       active: FIRE_ACTIVE_ALARM,
       borderColor: "rgb(239, 68, 68)",
       dimColor: "rgba(239, 68, 68, 0.22)",
@@ -340,6 +381,7 @@ export function markerVisualFromFT(f, t) {
     return {
       F,
       T,
+      S,
       active: FIRE_ACTIVE_TROUBLE,
       borderColor: "rgb(234, 179, 8)",
       dimColor: "rgba(234, 179, 8, 0.22)",
@@ -348,9 +390,23 @@ export function markerVisualFromFT(f, t) {
     };
   }
 
+  if (S === 1) {
+    return {
+      F,
+      T,
+      S,
+      active: FIRE_ACTIVE_SUPERVISORY,
+      borderColor: "rgb(168, 85, 247)",
+      dimColor: "rgba(168, 85, 247, 0.22)",
+      radarColor: "rgba(168, 85, 247, 0.6)",
+      ripple: false,
+    };
+  }
+
   return {
     F,
     T,
+    S,
     active: FIRE_ACTIVE_NORMAL,
     borderColor: "rgb(34, 197, 94)",
     dimColor: "rgba(34, 197, 94, 0.22)",
@@ -359,27 +415,35 @@ export function markerVisualFromFT(f, t) {
   };
 }
 
+/** @deprecated Alias for markerVisualFromFTS */
+export function markerVisualFromFT(f, t, s = 0) {
+  return markerVisualFromFTS(f, t, s);
+}
+
 /** Pulse animation only when fire alarm (F=1) */
 export function shouldFireRipple(activeValue) {
   return isFireAlarmActive(activeValue);
 }
 
-/** 2D floor map — green normal, yellow trouble, red fire alarm */
+/** 2D floor map — green normal, purple supervisory, yellow trouble, red fire alarm */
 export function getFireRadarColor(activeValue) {
   if (isFireAlarmActive(activeValue)) return "rgba(239, 68, 68, 0.6)";
   if (isFireTroubleActive(activeValue)) return "rgba(234, 179, 8, 0.6)";
+  if (isFireSupervisoryActive(activeValue)) return "rgba(168, 85, 247, 0.6)";
   return "rgba(34, 197, 94, 0.6)";
 }
 
 export function getFireDimColor(activeValue) {
   if (isFireAlarmActive(activeValue)) return "rgba(239, 68, 68, 0.22)";
   if (isFireTroubleActive(activeValue)) return "rgba(234, 179, 8, 0.22)";
+  if (isFireSupervisoryActive(activeValue)) return "rgba(168, 85, 247, 0.22)";
   return "rgba(34, 197, 94, 0.22)";
 }
 
 export function getFireBorderColor(activeValue) {
   if (isFireAlarmActive(activeValue)) return "rgb(239, 68, 68)";
   if (isFireTroubleActive(activeValue)) return "rgb(234, 179, 8)";
+  if (isFireSupervisoryActive(activeValue)) return "rgb(168, 85, 247)";
   return "rgb(34, 197, 94)";
 }
 
@@ -387,16 +451,20 @@ export function getFireBorderColor(activeValue) {
 export function getFireMarkerHexColor(activeValue) {
   if (isFireAlarmActive(activeValue)) return "#ef4444";
   if (isFireTroubleActive(activeValue)) return "#eab308";
+  if (isFireSupervisoryActive(activeValue)) return "#a855f7";
   return "#16a34a";
 }
 
-/** Human-readable status label + color for UI lists (F/T derived active value) */
+/** Human-readable status label + color for UI lists (F/T/S derived active value) */
 export function getFireStatusDisplay(activeValue) {
   if (isFireAlarmActive(activeValue)) {
     return { label: "Fire", color: "rgb(239, 68, 68)" };
   }
   if (isFireTroubleActive(activeValue)) {
     return { label: "Trouble", color: "rgb(234, 179, 8)" };
+  }
+  if (isFireSupervisoryActive(activeValue)) {
+    return { label: "Supervisory", color: "rgb(168, 85, 247)" };
   }
   return { label: "Normal", color: "rgb(34, 197, 94)" };
 }

@@ -10,12 +10,15 @@ import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { usePageAuth } from "@/hooks/usePageAuth";
 import { useToast } from "@/hooks/use-toast";
+import { doc, onSnapshot } from "firebase/firestore";
+import { db } from "@/config/firebase";
 import {
-  countListMessages,
+  extractPanelDeviceAddresses,
   formatPanelListTime,
   getExpectedListCountForLabel,
   isListResponseReady,
   parsePanelListResponse,
+  syncPanelListWithTempArray,
 } from "@/lib/firePanelMonitor";
 import {
   silenceSupervisoryAlertBeep,
@@ -23,22 +26,17 @@ import {
 } from "@/lib/troubleAlertBeep";
 import { cn } from "@/lib/utils";
 import { useLivePanelAlert } from "@/contexts/LivePanelAlertContext";
-import { acknowledgeDevice } from "@/lib/acknowledgePanelDevice";
+import { acknowledgeDevice, sendPriorityPanelCommand } from "@/lib/acknowledgePanelDevice";
 import { findAssetsListEntryByPanelAddress } from "@/lib/assetsListSimplexStatus";
 import { resolveAssetNavigationUrl } from "@/lib/assetPlacementNavigation";
+import { saveListToCategoryDb } from "@/lib/recordAlarmHistory";
+import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-
-const STATUS_BADGE_CLASSES = {
-  TRBL: "border-yellow-500/50 bg-yellow-500/10 text-yellow-800 dark:text-yellow-300",
-  ALRM: "border-red-500/50 bg-red-500/10 text-red-700 dark:text-red-300",
-  FIRE: "border-red-500/50 bg-red-500/10 text-red-700 dark:text-red-300",
-  SUPV: "border-purple-500/50 bg-purple-500/10 text-purple-700 dark:text-purple-300",
-  SUPR: "border-purple-500/50 bg-purple-500/10 text-purple-700 dark:text-purple-300",
-  SUP: "border-purple-500/50 bg-purple-500/10 text-purple-700 dark:text-purple-300",
-};
+import { Skeleton } from "@/components/ui/skeleton";
+import { PanelAlarmList } from "@/components/live-panel/panel-alarm-list";
+import { apiFetch, apiUrl } from "@/lib/apiClient";
 
 const PAGE_ICONS = {
   Fire: Flame,
@@ -58,202 +56,19 @@ const EMPTY_LABELS = {
   Supervisory: "No active supervisory alarms.",
 };
 
-function setsEqual(left, right) {
-  if (left.size !== right.size) return false;
-  for (const value of left) {
-    if (!right.has(value)) return false;
-  }
-  return true;
-}
-
-const ROW_HIGHLIGHT_CLASSES = {
-  fire: "panel-row-highlight-fire",
-  trouble: "panel-row-highlight-trouble",
-  supervisory: "panel-row-highlight-supervisory",
+const LIST_CMD_BY_LABEL = {
+  Fire: "list f",
+  Trouble: "list t",
+  Supervisory: "list s",
 };
 
-function statusBadgeClass(status) {
-  const key = String(status || "").replace(/\*$/, "").toUpperCase();
-  return STATUS_BADGE_CLASSES[key] || "border-muted bg-muted/40 text-muted-foreground";
-}
+const CATEGORY_BY_LABEL = {
+  Fire: "fire",
+  Trouble: "trouble",
+  Supervisory: "supervisory",
+};
 
-// Time | Address | Location | Device type | Status
-const LIST_GRID = "md:grid-cols-[160px_140px_minmax(0,1fr)_150px_90px]";
-
-function PanelAlarmList({
-  rows,
-  emptyLabel,
-  pending = false,
-  tone = "trouble",
-  highlightedAddresses = new Set(),
-  onRowAck,
-  acknowledgingAddress = null,
-  listComplete = true,
-  expectedCount = null,
-  listMessageCount = 0,
-  // When this list response was received (date + time).
-  responseTimeLabel = "",
-}) {
-  const highlightClass = ROW_HIGHLIGHT_CLASSES[tone] || ROW_HIGHLIGHT_CLASSES.trouble;
-
-  // Keep newly highlighted rows at the top of the list.
-  const displayRows = useMemo(() => {
-    if (!highlightedAddresses.size) return rows;
-
-    const highlighted = rows.filter((row) => highlightedAddresses.has(row.fullAddress));
-    const rest = rows.filter((row) => !highlightedAddresses.has(row.fullAddress));
-    return [...highlighted, ...rest];
-  }, [rows, highlightedAddresses]);
-
-  if (!rows.length) {
-    // Prefer "receiving…" over a false empty state while CVAL says points exist
-    // or the panel list is still streaming.
-    if (pending || (expectedCount != null && expectedCount > 0)) {
-      return (
-        <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border">
-          <div
-            className={cn(
-              "hidden shrink-0 md:grid gap-3 border-b bg-muted/50 px-4 py-2 text-xs font-medium text-muted-foreground",
-              LIST_GRID,
-            )}
-          >
-            <span>Time</span>
-            <span>Address</span>
-            <span>Location</span>
-            <span>Device type</span>
-            <span>Status</span>
-          </div>
-          <div className="flex flex-1 items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            {expectedCount != null && expectedCount > 0
-              ? `Receiving list — ${listMessageCount}/${expectedCount}`
-              : "Receiving list from panel…"}
-          </div>
-        </div>
-      );
-    }
-
-    return (
-      <div className="py-10 text-center text-sm text-muted-foreground">{emptyLabel}</div>
-    );
-  }
-
-  return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border">
-      <div
-        className={cn(
-          "hidden shrink-0 md:grid gap-3 border-b bg-muted/50 px-4 py-2 text-xs font-medium text-muted-foreground",
-          LIST_GRID,
-        )}
-      >
-        <span>Time</span>
-        <span>Address</span>
-        <span>Location</span>
-        <span>Device type</span>
-        <span>Status</span>
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        <ul className="divide-y">
-          {displayRows.map((row, index) => {
-            const isHighlighted = highlightedAddresses.has(row.fullAddress);
-            const isAcknowledging = acknowledgingAddress === row.fullAddress;
-            // Prefer the list response received time; fall back to panel clock if present.
-            const timeLabel =
-              responseTimeLabel ||
-              formatPanelListTime(row.panelTimeText) ||
-              "—";
-
-            return (
-              <li
-                key={`${row.fullAddress}-${index}`}
-                className={cn(
-                  "px-4 py-3 transition-colors animate-in fade-in slide-in-from-bottom-1 duration-200",
-                  onRowAck && "cursor-pointer hover:bg-muted/40",
-                  !onRowAck && "hover:bg-muted/30",
-                  isHighlighted && highlightClass,
-                  isAcknowledging && "opacity-60",
-                )}
-                onClick={onRowAck ? () => onRowAck(row) : undefined}
-                onKeyDown={
-                  onRowAck
-                    ? (event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          onRowAck(row);
-                        }
-                      }
-                    : undefined
-                }
-                role={onRowAck ? "button" : undefined}
-                tabIndex={onRowAck ? 0 : undefined}
-                title={
-                  onRowAck
-                    ? tone === "fire"
-                      ? "Click to acknowledge and open floor plan"
-                      : "Click to acknowledge"
-                    : undefined
-                }
-              >
-                <div className={cn("grid gap-2 md:items-center md:gap-3", LIST_GRID)}>
-                  <div>
-                    <p className="text-xs text-muted-foreground whitespace-nowrap">
-                      {timeLabel}
-                    </p>
-                    <p className="mt-0.5 font-mono text-sm font-medium md:hidden">
-                      {row.fullAddress}
-                    </p>
-                  </div>
-
-                  <div className="hidden md:block">
-                    <p className="font-mono text-sm font-medium">{row.fullAddress}</p>
-                  </div>
-
-                  <div className="md:contents">
-                    <p className="text-sm leading-snug break-words">{row.location || "—"}</p>
-
-                    <p className="hidden text-sm text-muted-foreground md:block">
-                      {row.deviceType || "—"}
-                    </p>
-
-                    <div>
-                      {row.status ? (
-                        <Badge
-                          variant="outline"
-                          className={cn("font-mono text-[11px]", statusBadgeClass(row.status))}
-                        >
-                          {row.status}
-                        </Badge>
-                      ) : (
-                        <span className="text-sm text-muted-foreground">—</span>
-                      )}
-                      <p className="mt-0.5 text-[11px] text-muted-foreground md:hidden">
-                        {row.deviceType || "—"}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      </div>
-
-      <div className="shrink-0 border-t bg-muted/30 px-4 py-2 text-xs text-muted-foreground">
-        {displayRows.length} active {displayRows.length === 1 ? "entry" : "entries"}
-        {!listComplete ? (
-          <span className="ml-2 text-amber-600 dark:text-amber-400">
-            {expectedCount != null
-              ? `(receiving — ${listMessageCount}/${expectedCount})`
-              : "(receiving list from panel…)"}
-          </span>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
-/** Shared layout for live fire / trouble / supervisory list pages. */
+/** Shared wrapper component for live panel list pages. */
 export function LivePanelListPage({ label, title, description, tone }) {
   const router = useRouter();
   const { isReady } = usePageAuth({ redirectIfLoggedOut: true });
@@ -262,7 +77,6 @@ export function LivePanelListPage({ label, title, description, tone }) {
   const {
     firePanelListResponses,
     firePanelState,
-    fetchFirePanelListResponse,
   } = useFirePanelMonitor();
 
   const {
@@ -286,68 +100,73 @@ export function LivePanelListPage({ label, title, description, tone }) {
 
   const [acknowledgingAddress, setAcknowledgingAddress] = useState(null);
   const [ackedAddresses, setAckedAddresses] = useState(() => new Set());
+  const [dbListRows, setDbListRows] = useState([]);
+  const [dbFetchedAt, setDbFetchedAt] = useState("");
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   const Icon = PAGE_ICONS[label] || Flame;
   const cached = firePanelListResponses?.[label] ?? null;
-  // Parse the raw panel list into table rows (address, location, type, status).
-  const parsedRows = useMemo(
-    () => (cached?.response ? parsePanelListResponse(cached.response) : []),
-    [cached?.response],
-  );
-  const listVersion = cached?.fetchedAt ?? "empty";
-  // Date + time when this list response was received from the panel.
+  const rawResponse = cached?.response || "";
+  const fetchedAt = dbFetchedAt || cached?.fetchedAt || "";
+  const newestAddress = cached?.newestAddress || "";
+
+  // Real-time Firestore snapshot listener for the category DB ({fire/trouble/supervisory}-list)
+  useEffect(() => {
+    const docName = `${label.toLowerCase()}-list`;
+    const unsub = onSnapshot(
+      doc(db, docName, "current"),
+      (docSnap) => {
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          if (Array.isArray(data?.rows)) {
+            setDbListRows(data.rows);
+            if (data.updatedAt) setDbFetchedAt(data.updatedAt);
+          } else {
+            setDbListRows([]);
+          }
+        } else {
+          setDbListRows([]);
+        }
+      },
+      (err) => {
+        console.error(`[LivePanelListPage] Error listening to ${docName}:`, err);
+      },
+    );
+
+    return () => unsub();
+  }, [label]);
+
+  const parsedRows = useMemo(() => {
+    if (dbListRows.length > 0) return dbListRows;
+    if (cached?.rows && cached.rows.length > 0) return cached.rows;
+    return rawResponse
+      ? syncPanelListWithTempArray(label, rawResponse, fetchedAt || new Date().toISOString())
+      : [];
+  }, [dbListRows, cached?.rows, rawResponse, fetchedAt, label]);
+
   const responseTimeLabel = useMemo(
-    () => formatPanelListTime(cached?.fetchedAt) || "",
-    [cached?.fetchedAt],
+    () => formatPanelListTime(fetchedAt) || "",
+    [fetchedAt],
   );
 
-  // Highlight the newest address from the last list parse (address appearance only).
   const highlightedAddresses = useMemo(() => {
-    const newest = String(cached?.newestAddress || "").trim();
+    const newest = String(newestAddress || "").trim();
     return newest ? new Set([newest]) : new Set();
-  }, [cached?.newestAddress, listVersion]);
+  }, [newestAddress]);
 
-  const isStreaming = Boolean(cached?.streaming);
+  const isStreaming = isRefreshing || Boolean(cached?.streaming);
   const expectedCount = getExpectedListCountForLabel(label, firePanelState);
-  // Complete when ~CVAL messages arrived, _DNE, or stream finished with rows.
   const listComplete =
     !isStreaming &&
-    (isListResponseReady(cached?.response || "", expectedCount) ||
-      Boolean(cached?.response));
-  const listMessageCount = cached?.response
-    ? countListMessages(cached.response)
-    : 0;
-
-  const effectiveHighlightedAddresses = useMemo(() => {
-    if (!ackedAddresses.size) return highlightedAddresses;
-
-    const next = new Set(highlightedAddresses);
-    for (const address of ackedAddresses) {
-      next.delete(address);
-    }
-    return setsEqual(highlightedAddresses, next) ? highlightedAddresses : next;
-  }, [ackedAddresses, highlightedAddresses]);
+    (isListResponseReady(rawResponse, expectedCount) || parsedRows.length > 0);
+  const listMessageCount = parsedRows.length || (rawResponse ? countListMessages(rawResponse) : 0);
 
   const emptyLabel = EMPTY_LABELS[label] || "No active entries.";
-
-  const rowKey = useMemo(
-    () => parsedRows.map((row) => row.fullAddress).join("|"),
-    [parsedRows],
-  );
-
-  useEffect(() => {
-    const current = new Set(rowKey ? rowKey.split("|").filter(Boolean) : []);
-    setAckedAddresses((prev) => {
-      const next = new Set([...prev].filter((address) => current.has(address)));
-      return next.size === prev.size ? prev : next;
-    });
-  }, [listVersion, rowKey]);
 
   const handleRowAck = useCallback(
     async (row) => {
       if (!connected || acknowledgingAddress) return;
 
-      // Panel address from the list row, e.g. "2:M1-2-0".
       const address = String(row.fullAddress || row.deviceAddress || "").trim();
       if (!address) {
         toast({
@@ -367,7 +186,6 @@ export function LivePanelListPage({ label, title, description, tone }) {
           silenceSupervisoryAlertBeep();
         }
 
-        // Device-specific ack: `ack f 2:M1-2-0` (or ack t/s …).
         await acknowledgeDevice(label, address);
 
         setAckedAddresses((prev) => {
@@ -381,7 +199,6 @@ export function LivePanelListPage({ label, title, description, tone }) {
           description: `ack ${label === "Fire" ? "f" : label === "Trouble" ? "t" : "s"} ${address}`,
         });
 
-        // Live Fire: after device ack, open the nested floor plan for this address.
         if (label === "Fire") {
           const entry = await findAssetsListEntryByPanelAddress(address);
           if (!entry) {
@@ -392,7 +209,6 @@ export function LivePanelListPage({ label, title, description, tone }) {
             });
           } else {
             const asset = { id: entry.id, ...entry.data };
-            // Resolve nested floor / section / subsection placement.
             const url = await resolveAssetNavigationUrl(asset, entry.id);
             const parsed = new URL(url, window.location.origin);
             if (entry.id) parsed.searchParams.set("assetId", entry.id);
@@ -401,11 +217,6 @@ export function LivePanelListPage({ label, title, description, tone }) {
             return;
           }
         }
-
-        // Refresh list in the background — do not keep the row spinner on a full list dump.
-        void fetchFirePanelListResponse(label).catch((error) => {
-          console.error("[live-panel] post-ack list refresh failed:", error);
-        });
       } catch (error) {
         toast({
           title: "Acknowledge failed",
@@ -419,7 +230,6 @@ export function LivePanelListPage({ label, title, description, tone }) {
     [
       acknowledgingAddress,
       connected,
-      fetchFirePanelListResponse,
       label,
       router,
       toast,
@@ -436,56 +246,52 @@ export function LivePanelListPage({ label, title, description, tone }) {
       return;
     }
 
+    const cmd = LIST_CMD_BY_LABEL[label] || "list f";
+    setIsRefreshing(true);
     try {
-      await fetchFirePanelListResponse(label);
+      const res = await sendPriorityPanelCommand(cmd, 25000);
+      const rows = parsePanelListResponse(res);
+      const addresses = extractPanelDeviceAddresses(res);
+
+      syncPanelListWithTempArray(label, rows);
+      await saveListToCategoryDb(label, rows);
+      void syncAssetsListWithPanelList(label, addresses);
+
+      toast({
+        title: "List refreshed",
+        description: `${rows.length} ${label.toLowerCase()} entries updated.`,
+      });
     } catch (error) {
       toast({
         title: "List command failed",
         description: error?.message || "Could not fetch panel list response.",
         variant: "destructive",
       });
+    } finally {
+      setIsRefreshing(false);
     }
-  }, [connected, fetchFirePanelListResponse, label, toast]);
-
-  const fetchListRef = useRef(fetchFirePanelListResponse);
-  fetchListRef.current = fetchFirePanelListResponse;
-  const toastRef = useRef(toast);
-  toastRef.current = toast;
-  const initialListLoadedRef = useRef(null);
-
-  useEffect(() => {
-    if (!isReady || !connected) return;
-    if (initialListLoadedRef.current === label) return;
-
-    initialListLoadedRef.current = label;
-    let cancelled = false;
-
-    const loadList = async () => {
-      try {
-        await fetchListRef.current(label);
-      } catch (error) {
-        if (!cancelled) {
-          toastRef.current({
-            title: "List command failed",
-            description: error?.message || "Could not fetch panel list response.",
-            variant: "destructive",
-          });
-        }
-      }
-    };
-
-    void loadList();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [isReady, connected, label]);
+  }, [connected, label, toast]);
 
   if (!isReady) {
     return (
-      <div className="flex min-h-screen items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-      </div>
+      <SidebarProvider>
+        <AppSidebar />
+        <SidebarInset className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <DashboardTopBar headerClassName="flex h-16 shrink-0 items-center gap-2 border-b px-4" />
+          <main className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden p-4 md:p-6">
+            <div className="flex items-center gap-3">
+              <Skeleton className="h-8 w-8 rounded-full" />
+              <div className="space-y-1">
+                <Skeleton className="h-6 w-32" />
+                <Skeleton className="h-4 w-48" />
+              </div>
+            </div>
+            <div className="flex-1">
+              <PanelAlarmList pending={true} tone={tone} />
+            </div>
+          </main>
+        </SidebarInset>
+      </SidebarProvider>
     );
   }
 
@@ -554,12 +360,9 @@ export function LivePanelListPage({ label, title, description, tone }) {
               <PanelAlarmList
                 rows={parsedRows}
                 emptyLabel={emptyLabel}
-                pending={
-                  isStreaming ||
-                  (connected && expectedCount != null && expectedCount > 0 && parsedRows.length === 0)
-                }
+                pending={isStreaming && parsedRows.length === 0}
                 tone={tone}
-                highlightedAddresses={effectiveHighlightedAddresses}
+                highlightedAddresses={highlightedAddresses}
                 onRowAck={(row) => void handleRowAck(row)}
                 acknowledgingAddress={acknowledgingAddress}
                 listComplete={listComplete}

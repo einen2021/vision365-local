@@ -22,7 +22,7 @@ export function getStoredSessionUser() {
   if (!isUserLoggedIn(user) || !user?.email) return null;
   const role =
     extractLoginRole(user) ||
-    String(user.role || "")
+    String(user.role || user.designation || "")
       .trim()
       .toLowerCase();
   return {

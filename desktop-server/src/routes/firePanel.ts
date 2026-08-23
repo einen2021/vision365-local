@@ -8,9 +8,13 @@ import {
   sendFirePanelCommandPriority,
   sendFirePanelCommandStreaming,
 } from "../services/firePanelService";
+import { createPanelLogRoutes } from "./panelLogs";
 
 export function createFirePanelRoutes() {
   const app = new Hono();
+
+  // Panel TCP stream logs (GET /logs, GET /logs/stream)
+  app.route("/", createPanelLogRoutes());
 
   app.post("/connect", async (c) => {
     const body = await c.req.json();

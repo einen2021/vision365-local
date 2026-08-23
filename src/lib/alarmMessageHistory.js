@@ -39,7 +39,21 @@ function rowsFromDocData(data, fieldCandidates) {
 export function rowsForAlarmMessagesSnap(snap) {
   if (!snap.exists()) return [];
   const data = snap.data() || {};
-  return rowsFromDocData(data, ["alarmMessages", "alarmMessage", "messages"]);
+  const rows = rowsFromDocData(data, ["alarmMessages", "alarmMessage", "messages"]);
+  // Ensure only fire messages appear in the Alarm messages tab
+  return rows.filter((r) => {
+    const msg = String(r.message || "").toUpperCase();
+    if (
+      msg.includes("TRBL") ||
+      msg.startsWith("TROUBLE") ||
+      msg.includes("SUPERVISORY") ||
+      msg.includes("SUPV") ||
+      msg.includes("SUPR")
+    ) {
+      return false;
+    }
+    return true;
+  });
 }
 
 export function rowsForLiveFireSnap(snap) {

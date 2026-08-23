@@ -92,5 +92,19 @@ export function runMigrations(): void {
     db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)").run("revision", "0");
   }
 
+  // panel_logs: disposable ring-buffer cache — always recreate to fix schema drift.
+  db.exec(`DROP TABLE IF EXISTS panel_logs;`);
+  db.exec(`
+    CREATE TABLE panel_logs (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind      TEXT    NOT NULL,
+      raw       TEXT    NOT NULL,
+      data      TEXT    NOT NULL DEFAULT '{}',
+      at        TEXT    NOT NULL DEFAULT ''
+    );
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_panel_logs_at   ON panel_logs(at);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_panel_logs_kind ON panel_logs(kind);`);
+
   console.log("[migrate] SQLite schema ready");
 }

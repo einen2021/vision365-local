@@ -1,10 +1,13 @@
 "use client";
 
+import { useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
 import {
   AlertTriangle,
   Building2,
   Clock,
   Flame,
+  Loader2,
   MapPin,
   VolumeX,
 } from "lucide-react";
@@ -18,6 +21,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { useFirePanelMonitor } from "@/contexts/AppContext";
+import { useFireAlert } from "@/contexts/FireModalContext";
+import { useFirePanelStore } from "@/stores/firePanelStore";
+import { useToast } from "@/hooks/use-toast";
+import { LIVE_FIRE_ROUTE } from "@/config/live-panel-routes";
+import { normalizePathname } from "@/lib/roleAccess";
 
 /** Placeholder alarm details shown until real data is wired up. */
 const PLACEHOLDER_ALERT = {
@@ -31,7 +40,86 @@ const PLACEHOLDER_ALERT = {
 
 /** Global fire alert modal UI — open/close state lives in AppContext. */
 export function FireAlertModal({ open, onClose }) {
+  const router = useRouter();
+  const pathname = normalizePathname(usePathname());
+  const { toast } = useToast();
+  const connected = useFirePanelStore((s) => s.connected);
+  const { acknowledge, silenceAlarm, fetchFirePanelListResponse } = useFirePanelMonitor();
+  const fireAlertCtx = useFireAlert();
+  const muteSiren = fireAlertCtx?.muteSiren;
+
+  const [ackLoading, setAckLoading] = useState(false);
+  const [silenceLoading, setSilenceLoading] = useState(false);
+
   const alert = PLACEHOLDER_ALERT;
+
+  const handleAcknowledge = () => {
+    if (!connected) {
+      toast({
+        title: "Not connected",
+        description: "Connect to the fire panel before sending acknowledge commands.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // 1. Stop audio siren immediately & close modal
+    muteSiren?.();
+    onClose();
+
+    if (pathname !== LIVE_FIRE_ROUTE) {
+      router.push(LIVE_FIRE_ROUTE);
+    }
+
+    // 2. Priority ACK command (`ack f`) & list sync run in background
+    void (async () => {
+      try {
+        await acknowledge("Fire");
+      } catch (error) {
+        console.error("Fire Ack failed:", error);
+      }
+
+      if (pathname === LIVE_FIRE_ROUTE) {
+        void fetchFirePanelListResponse?.("Fire").catch((err) => {
+          console.error("Post-ack Fire list fetch failed:", err);
+        });
+      }
+    })();
+  };
+
+  const handleSilenceAlarm = async () => {
+    if (!connected) {
+      toast({
+        title: "Not connected",
+        description: "Connect to the fire panel before sending silence commands.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setSilenceLoading(true);
+    try {
+      muteSiren?.();
+      await silenceAlarm();
+      toast({
+        title: "Silence Alarm sent",
+        description: "Silence alarm command sent to the fire panel.",
+      });
+    } catch (error) {
+      toast({
+        title: "Silence Alarm failed",
+        description: error?.message || "Could not silence the alarm.",
+        variant: "destructive",
+      });
+    } finally {
+      setSilenceLoading(false);
+    }
+  };
+
+  const handleViewOnMap = () => {
+    onClose();
+    router.push(LIVE_FIRE_ROUTE);
+  };
 
   return (
     <Dialog
@@ -121,19 +209,50 @@ export function FireAlertModal({ open, onClose }) {
         </div>
 
         <DialogFooter className="flex-col gap-2 border-t bg-muted/30 px-6 py-4 sm:flex-row sm:justify-end">
-          <Button type="button" variant="outline" onClick={onClose}>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={onClose}
+            disabled={ackLoading || silenceLoading}
+          >
             Close
           </Button>
-          <Button type="button" variant="outline" disabled>
-            <MapPin className="h-4 w-4" />
+          <Button
+            type="button"
+            variant="outline"
+            onClick={handleViewOnMap}
+            disabled={ackLoading || silenceLoading}
+          >
+            <MapPin className="mr-1.5 h-4 w-4" />
             View on Map
           </Button>
-          <Button type="button" variant="outline" disabled>
-            <VolumeX className="h-4 w-4" />
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void handleSilenceAlarm()}
+            disabled={!connected || ackLoading || silenceLoading}
+          >
+            {silenceLoading ? (
+              <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+            ) : (
+              <VolumeX className="mr-1.5 h-4 w-4" />
+            )}
             Silence Alarm
           </Button>
-          <Button type="button" variant="destructive" disabled>
-            Acknowledge
+          <Button
+            type="button"
+            variant="destructive"
+            onClick={() => void handleAcknowledge()}
+            disabled={!connected || ackLoading || silenceLoading}
+          >
+            {ackLoading ? (
+              <>
+                <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+                Acknowledging…
+              </>
+            ) : (
+              "Acknowledge"
+            )}
           </Button>
         </DialogFooter>
       </DialogContent>

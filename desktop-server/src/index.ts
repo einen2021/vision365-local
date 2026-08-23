@@ -28,6 +28,7 @@ import { createExportRoutes } from "./routes/export";
 import { createSettingsRoutes } from "./routes/settings";
 import { createFirePanelRoutes } from "./routes/firePanel";
 import { shutdownFirePanelWorkers } from "./services/firePanelService";
+import { flushPendingDbSnapshotBackup } from "./services/dbSnapshotBackup";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.VISION365_PORT || 47821);
@@ -154,6 +155,11 @@ async function main() {
   });
 
   const shutdown = async () => {
+    try {
+      flushPendingDbSnapshotBackup(appDataPath);
+    } catch {
+      // ignore
+    }
     server.close();
     await shutdownFirePanelWorkers();
     closeDatabase();
@@ -162,6 +168,16 @@ async function main() {
 
   process.on("SIGTERM", () => {
     shutdown().catch(() => process.exit(1));
+  });
+  process.on("SIGINT", () => {
+    shutdown().catch(() => process.exit(1));
+  });
+  process.on("beforeExit", () => {
+    try {
+      flushPendingDbSnapshotBackup(appDataPath);
+    } catch {
+      // ignore
+    }
   });
 }
 

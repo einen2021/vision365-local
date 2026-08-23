@@ -60,29 +60,61 @@ export function isDbEssentiallyEmpty(data: DbRecord | null | undefined): boolean
   return countProductiveData(data).score === 0;
 }
 
-/** Minimum time between automatic backups (keeps write path fast). */
-const BACKUP_THROTTLE_MS = 30_000;
+function parseSnapshotTimestamp(filename: string, mtimeMs: number): number {
+  const match = filename.match(/db_snapshot_(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})(?:-(\d{3}))?Z?\.json$/i);
+  if (match) {
+    const [_, datePart, hh, mm, ss, ms] = match;
+    const isoString = `${datePart}T${hh}:${mm}:${ss}${ms ? `.${ms}` : ".000"}Z`;
+    const parsed = Date.parse(isoString);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+  return mtimeMs;
+}
+
+/** Minimum debounce time for writes before saving snapshot (ms). */
+const BACKUP_DEBOUNCE_MS = 1000;
 
 let pendingBackupData: DbRecord | null = null;
-let backupFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let backupFlushTimer: NodeJS.Timeout | null = null;
 let backupInFlight = false;
 let lastBackupAt = 0;
 
 /**
- * Queue a backup off the DB write path.
- * JSON.stringify of a large AssetsList must not block every setDoc/batch.
+ * Queue a backup off the DB write path so SQLite updates stay fast.
+ * Saves latest snapshot to AppData/Roaming/com.vision365.desktop backups.
  */
 export function queueDbSnapshotBackup(data: DbRecord): void {
   if (countProductiveData(data).score === 0) return;
-  // Keep latest object only — readDb returns a fresh copy each write.
   pendingBackupData = data;
-  if (backupFlushTimer || backupInFlight) return;
 
-  const wait = Math.max(0, BACKUP_THROTTLE_MS - (Date.now() - lastBackupAt));
+  if (backupFlushTimer) {
+    clearTimeout(backupFlushTimer);
+    backupFlushTimer = null;
+  }
+
   backupFlushTimer = setTimeout(() => {
     backupFlushTimer = null;
     void flushQueuedBackup();
-  }, wait);
+  }, BACKUP_DEBOUNCE_MS);
+}
+
+/** Flush any pending backup immediately (e.g. on shutdown). */
+export function flushPendingDbSnapshotBackup(appDataPath = resolveAppDataPath()): void {
+  if (backupFlushTimer) {
+    clearTimeout(backupFlushTimer);
+    backupFlushTimer = null;
+  }
+  if (pendingBackupData) {
+    const data = pendingBackupData;
+    pendingBackupData = null;
+    try {
+      saveDbSnapshotBackup(data, appDataPath);
+    } catch (err) {
+      console.warn("[db] Synchronous snapshot backup flush failed:", (err as Error).message);
+    }
+  }
 }
 
 async function flushQueuedBackup(): Promise<void> {
@@ -99,12 +131,11 @@ async function flushQueuedBackup(): Promise<void> {
     console.warn("[db] queued snapshot backup failed:", (error as Error).message);
   } finally {
     backupInFlight = false;
-    // New writes arrived while we were saving — schedule another pass.
     if (pendingBackupData && !backupFlushTimer) {
       backupFlushTimer = setTimeout(() => {
         backupFlushTimer = null;
         void flushQueuedBackup();
-      }, BACKUP_THROTTLE_MS);
+      }, BACKUP_DEBOUNCE_MS);
     }
   }
 }
@@ -142,7 +173,6 @@ export async function saveDbSnapshotBackupAsync(
   if (stats.score === 0) return null;
 
   const dir = snapshotsDir(appDataPath);
-  // stringify off the hot withDb lock (caller already released it).
   const payload = JSON.stringify(data);
   if (payload.length < MIN_BACKUP_BYTES) return null;
 
@@ -187,11 +217,24 @@ function readSnapshotFile(filePath: string): DbRecord | null {
   }
 }
 
-/** Best available JSON backup with the most productive data. */
-export function findBestDbSnapshotBackup(
+export interface CandidateSnapshot {
+  path: string;
+  data: DbRecord;
+  score: number;
+  timestamp: number;
+  isPrimary: boolean;
+}
+
+/**
+ * Find all available JSON backups, prioritized by AppData/Roaming/com.vision365.desktop
+ * and sorted by latest timestamp.
+ */
+export function listAllDbSnapshotBackups(
   appDataPath = resolveAppDataPath(),
-): { path: string; data: DbRecord; score: number } | null {
+): CandidateSnapshot[] {
+  const primaryRoot = resolveAppDataPath();
   const searchRoots = [
+    primaryRoot,
     appDataPath,
     ...listVision365AppDataRoots(),
   ].filter((root, index, all) =>
@@ -199,29 +242,53 @@ export function findBestDbSnapshotBackup(
     all.findIndex((item) => path.resolve(item) === path.resolve(root)) === index,
   );
 
-  const candidates: string[] = [];
+  const candidates: { path: string; isPrimary: boolean; timestamp: number }[] = [];
+  const seenPaths = new Set<string>();
 
   for (const root of searchRoots) {
     if (!fs.existsSync(root)) continue;
+    const isPrimary = path.resolve(root) === path.resolve(primaryRoot);
 
     const dir = snapshotsDirReadOnly(root);
     const latest = path.join(dir, LATEST_NAME);
-    if (fs.existsSync(latest)) candidates.push(latest);
+    if (fs.existsSync(latest)) {
+      try {
+        const stat = fs.statSync(latest);
+        const resolved = path.resolve(latest);
+        if (!seenPaths.has(resolved)) {
+          seenPaths.add(resolved);
+          candidates.push({
+            path: latest,
+            isPrimary,
+            timestamp: stat.mtimeMs,
+          });
+        }
+      } catch {}
+    }
 
     try {
       if (fs.existsSync(dir)) {
         for (const name of fs.readdirSync(dir)) {
           if (!name.endsWith(".json")) continue;
           const full = path.join(dir, name);
-          if (full === latest) continue;
-          candidates.push(full);
+          const resolved = path.resolve(full);
+          if (seenPaths.has(resolved)) continue;
+          seenPaths.add(resolved);
+          try {
+            const stat = fs.statSync(full);
+            candidates.push({
+              path: full,
+              isPrimary,
+              timestamp: parseSnapshotTimestamp(name, stat.mtimeMs),
+            });
+          } catch {}
         }
       }
     } catch {
       // ignore missing dirs
     }
 
-    // Also accept a manually placed recovery file in backups/.
+    // Also accept manually placed recovery files in backups/.
     const backupsRoot = path.join(root, "backups");
     for (const name of [
       "recovered_snapshot.json",
@@ -229,27 +296,65 @@ export function findBestDbSnapshotBackup(
       "manual_restore.json",
     ]) {
       const full = path.join(backupsRoot, name);
-      if (fs.existsSync(full)) candidates.push(full);
+      if (fs.existsSync(full)) {
+        const resolved = path.resolve(full);
+        if (seenPaths.has(resolved)) continue;
+        seenPaths.add(resolved);
+        try {
+          const stat = fs.statSync(full);
+          candidates.push({
+            path: full,
+            isPrimary,
+            timestamp: stat.mtimeMs,
+          });
+        } catch {}
+      }
     }
   }
 
-  let best: { path: string; data: DbRecord; score: number } | null = null;
-  for (const filePath of candidates) {
-    const data = readSnapshotFile(filePath);
+  const results: CandidateSnapshot[] = [];
+  for (const c of candidates) {
+    const data = readSnapshotFile(c.path);
     if (!data) continue;
     const score = countProductiveData(data).score;
     if (score <= 0) continue;
-    if (!best || score > best.score) {
-      best = { path: filePath, data, score };
-    }
+    results.push({
+      path: c.path,
+      data,
+      score,
+      timestamp: c.timestamp,
+      isPrimary: c.isPrimary,
+    });
   }
 
-  return best;
+  // Sort: primary AppData root first, then newest timestamp descending, then score descending.
+  results.sort((a, b) => {
+    if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
+    if (b.timestamp !== a.timestamp) return b.timestamp - a.timestamp;
+    return b.score - a.score;
+  });
+
+  return results;
+}
+
+/** Always use the latest backup from AppData/Roaming/com.vision365.desktop backups */
+export function findLatestDbSnapshotBackup(
+  appDataPath = resolveAppDataPath(),
+): CandidateSnapshot | null {
+  const list = listAllDbSnapshotBackups(appDataPath);
+  return list.length > 0 ? list[0] : null;
+}
+
+/** Backward compatibility alias for findLatestDbSnapshotBackup */
+export function findBestDbSnapshotBackup(
+  appDataPath = resolveAppDataPath(),
+): CandidateSnapshot | null {
+  return findLatestDbSnapshotBackup(appDataPath);
 }
 
 /**
  * If the live DB looks empty but a JSON backup has communities/assets,
- * return that backup data for restore.
+ * return that latest backup data for restore.
  */
 export function maybeLoadRestoreSnapshot(
   liveData: DbRecord,
@@ -257,7 +362,7 @@ export function maybeLoadRestoreSnapshot(
 ): { data: DbRecord; path: string } | null {
   if (!isDbEssentiallyEmpty(liveData)) return null;
 
-  const best = findBestDbSnapshotBackup(appDataPath);
-  if (!best) return null;
-  return { data: best.data, path: best.path };
+  const latest = findLatestDbSnapshotBackup(appDataPath);
+  if (!latest) return null;
+  return { data: latest.data, path: latest.path };
 }

@@ -7,10 +7,12 @@ import {
   collectDeviceAddressKeys,
   FIRE_ACTIVE_ALARM,
   FIRE_ACTIVE_NORMAL,
+  FIRE_ACTIVE_SUPERVISORY,
   FIRE_ACTIVE_TROUBLE,
   indexStatusByAddressKeys,
   indexStatusByAssetIdKeys,
   markerVisualFromFT,
+  markerVisualFromFTS,
   normalizeSimplexStatus,
   resolveMarkerActive,
   resolveMarkerActiveFromMapping,
@@ -283,33 +285,46 @@ export const useAssetFireStatusStore = create((set, get) => ({
 
     set((state) => {
       const panelLiveByAddress = { ...state.panelLiveByAddress };
+      const byDeviceAddress = { ...state.byDeviceAddress };
       let changed = false;
 
       for (const address of addresses) {
         for (const addrKey of collectDeviceAddressKeys(address)) {
           const current = normalizeSimplexStatus(panelLiveByAddress[addrKey]);
-          if (Number(current[statusKey]) === value) continue;
-          panelLiveByAddress[addrKey] = { ...current, [statusKey]: value };
-          changed = true;
+          if (Number(current[statusKey]) !== value) {
+            panelLiveByAddress[addrKey] = { ...current, [statusKey]: value };
+            changed = true;
+          }
+          const listCur = normalizeSimplexStatus(byDeviceAddress[addrKey]);
+          if (Number(listCur[statusKey]) !== value) {
+            byDeviceAddress[addrKey] = { ...listCur, [statusKey]: value };
+            changed = true;
+          }
         }
       }
 
       if (!changed) return state;
-      return { panelLiveByAddress, lastSync: Date.now() };
+      return { panelLiveByAddress, byDeviceAddress, lastSync: Date.now() };
     });
   },
 
   /**
    * Replace one category (F/T/S) from a full panel list:
    * active addresses → 1, previously active addresses not in the list → 0.
+  /**
+   * Fast in-memory update (in milliseconds) of one category (F/T/S) from a panel list response:
+   * active addresses → statusKey=1, excluded addresses (in previous or state but not active) → statusKey=0.
    */
-  syncPanelLiveFlagsForCategory: (statusKey, activeAddresses = []) => {
+  syncPanelLiveFlagsForCategory: (statusKey, activeAddresses = [], previousAddresses = []) => {
     if (!["F", "T", "S"].includes(statusKey)) return;
 
     set((state) => {
+      const byDeviceAddress = { ...state.byDeviceAddress };
+      const byAssetId = { ...state.byAssetId };
       const panelLiveByAddress = { ...state.panelLiveByAddress };
-      const activeKeys = new Set();
+      const showStatusByAddress = { ...state.showStatusByAddress };
 
+      const activeKeys = new Set();
       for (const address of activeAddresses) {
         for (const addrKey of collectDeviceAddressKeys(address)) {
           activeKeys.add(addrKey);
@@ -318,23 +333,79 @@ export const useAssetFireStatusStore = create((set, get) => ({
 
       let changed = false;
 
-      for (const addrKey of activeKeys) {
-        const current = normalizeSimplexStatus(panelLiveByAddress[addrKey]);
-        if (Number(current[statusKey]) === 1) continue;
-        panelLiveByAddress[addrKey] = { ...current, [statusKey]: 1 };
-        changed = true;
+      // 1. Set statusKey = 1 for all active/new addresses
+      for (const address of activeAddresses) {
+        for (const addrKey of collectDeviceAddressKeys(address)) {
+          const liveCur = normalizeSimplexStatus(panelLiveByAddress[addrKey]);
+          if (Number(liveCur[statusKey]) !== 1) {
+            panelLiveByAddress[addrKey] = { ...liveCur, [statusKey]: 1 };
+            changed = true;
+          }
+          const listCur = normalizeSimplexStatus(byDeviceAddress[addrKey]);
+          if (Number(listCur[statusKey]) !== 1) {
+            byDeviceAddress[addrKey] = { ...listCur, [statusKey]: 1 };
+            changed = true;
+          }
+          if (showStatusByAddress[addrKey]) {
+            const showCur = normalizeSimplexStatus(showStatusByAddress[addrKey]);
+            if (Number(showCur[statusKey]) !== 1) {
+              showStatusByAddress[addrKey] = { ...showCur, [statusKey]: 1 };
+              changed = true;
+            }
+          }
+        }
       }
 
-      for (const [addrKey, status] of Object.entries(panelLiveByAddress)) {
-        const current = normalizeSimplexStatus(status);
-        if (Number(current[statusKey]) !== 1) continue;
-        if (activeKeys.has(addrKey)) continue;
-        panelLiveByAddress[addrKey] = { ...current, [statusKey]: 0 };
-        changed = true;
+      // Helper to reset statusKey to 0 for an excluded address key
+      const clearFlagForKey = (addrKey) => {
+        if (activeKeys.has(addrKey)) return;
+
+        if (panelLiveByAddress[addrKey]) {
+          const cur = normalizeSimplexStatus(panelLiveByAddress[addrKey]);
+          if (Number(cur[statusKey]) === 1) {
+            panelLiveByAddress[addrKey] = { ...cur, [statusKey]: 0 };
+            changed = true;
+          }
+        }
+        if (showStatusByAddress[addrKey]) {
+          const cur = normalizeSimplexStatus(showStatusByAddress[addrKey]);
+          if (Number(cur[statusKey]) === 1) {
+            showStatusByAddress[addrKey] = { ...cur, [statusKey]: 0 };
+            changed = true;
+          }
+        }
+        if (byDeviceAddress[addrKey]) {
+          const cur = normalizeSimplexStatus(byDeviceAddress[addrKey]);
+          if (Number(cur[statusKey]) === 1) {
+            byDeviceAddress[addrKey] = { ...cur, [statusKey]: 0 };
+            changed = true;
+          }
+        }
+      };
+
+      // 2. Clear statusKey for addresses in previousAddresses that are excluded in activeAddresses
+      for (const prevAddress of previousAddresses) {
+        for (const addrKey of collectDeviceAddressKeys(prevAddress)) {
+          clearFlagForKey(addrKey);
+        }
+      }
+
+      // 3. Clear statusKey for any address in store that is not active
+      for (const addrKey of Object.keys(panelLiveByAddress)) {
+        clearFlagForKey(addrKey);
+      }
+      for (const addrKey of Object.keys(byDeviceAddress)) {
+        clearFlagForKey(addrKey);
       }
 
       if (!changed) return state;
-      return { panelLiveByAddress, lastSync: Date.now() };
+      return {
+        byDeviceAddress,
+        byAssetId,
+        panelLiveByAddress,
+        showStatusByAddress,
+        lastSync: Date.now(),
+      };
     });
   },
 
@@ -349,15 +420,18 @@ export const useAssetFireStatusStore = create((set, get) => ({
       const byDeviceAddress = { ...state.byDeviceAddress };
       const byAssetId = { ...state.byAssetId };
       const panelLiveByAddress = { ...state.panelLiveByAddress };
+      const showStatusByAddress = { ...state.showStatusByAddress };
       indexStatusByAddressKeys(byDeviceAddress, deviceAddress, normalized);
       indexStatusByAssetIdKeys(byAssetId, assetId, normalized);
       for (const addrKey of collectDeviceAddressKeys(deviceAddress)) {
         panelLiveByAddress[addrKey] = { ...normalized };
+        showStatusByAddress[addrKey] = { ...normalized };
       }
       return {
         byDeviceAddress,
         byAssetId,
         panelLiveByAddress,
+        showStatusByAddress,
         lastSync: Date.now(),
       };
     });
@@ -374,6 +448,7 @@ export const useAssetFireStatusStore = create((set, get) => ({
       const byDeviceAddress = { ...state.byDeviceAddress };
       const byAssetId = { ...state.byAssetId };
       const panelLiveByAddress = { ...state.panelLiveByAddress };
+      const showStatusByAddress = { ...state.showStatusByAddress };
       const resolvedAddress = resolveAssetDeviceAddress(data) || data.deviceAddress || "";
 
       indexStatusByAddressKeys(byDeviceAddress, resolvedAddress, normalized);
@@ -387,6 +462,7 @@ export const useAssetFireStatusStore = create((set, get) => ({
       for (const address of [resolvedAddress, data.deviceAddress, extraAddress]) {
         for (const addrKey of collectDeviceAddressKeys(address)) {
           panelLiveByAddress[addrKey] = { ...normalized };
+          showStatusByAddress[addrKey] = { ...normalized };
         }
       }
 
@@ -402,7 +478,7 @@ export const useAssetFireStatusStore = create((set, get) => ({
         byDeviceAddress,
         byAssetId,
         panelLiveByAddress,
-        showStatusByAddress: state.showStatusByAddress,
+        showStatusByAddress,
         lastSync: Date.now(),
       };
     });
@@ -478,8 +554,8 @@ export function useAssetFireActiveFromMapping(
 }
 
 /**
- * Live F/T + visual style for a floor-map marker.
- * F=1 → red + ripple; F=0 T=1 → yellow; F=0 T=0 → green.
+ * Live F/T/S + visual style for a floor-map marker.
+ * F=1 → red + ripple; F=0 T=1 → yellow; F=0 T=0 S=1 → purple; F=0 T=0 S=0 → green.
  */
 export function useAssetMarkerVisualFromMapping(
   mapping,
@@ -487,14 +563,15 @@ export function useAssetMarkerVisualFromMapping(
   fallback = 0,
   enabled = true,
 ) {
-  // Subscribe only to F:T so we do not return a new object every render.
-  const ftKey = useAssetFireStatusStore((s) => {
+  // Subscribe to F:T:S so we do not return a new object every render unless status changes.
+  const ftsKey = useAssetFireStatusStore((s) => {
     void s.lastSync;
     if (!enabled) {
       const fb = Number(fallback ?? FIRE_ACTIVE_NORMAL);
-      if (fb >= FIRE_ACTIVE_ALARM) return "1:0";
-      if (fb >= FIRE_ACTIVE_TROUBLE) return "0:1";
-      return "0:0";
+      if (fb >= FIRE_ACTIVE_ALARM) return "1:0:0";
+      if (fb >= FIRE_ACTIVE_TROUBLE) return "0:1:0";
+      if (fb >= FIRE_ACTIVE_SUPERVISORY) return "0:0:1";
+      return "0:0:0";
     }
     const status = resolveMarkerStatusFromMapping(
       mapping,
@@ -502,11 +579,11 @@ export function useAssetMarkerVisualFromMapping(
       fallback,
       s,
     );
-    return `${status.F}:${status.T}`;
+    return `${status.F}:${status.T}:${status.S}`;
   });
 
-  const [fPart, tPart] = String(ftKey || "0:0").split(":");
-  return markerVisualFromFT(Number(fPart), Number(tPart));
+  const [fPart, tPart, sPart] = String(ftsKey || "0:0:0").split(":");
+  return markerVisualFromFTS(Number(fPart), Number(tPart), Number(sPart));
 }
 
 /** Stable shallow selector — avoids infinite re-render loop */

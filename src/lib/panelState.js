@@ -41,3 +41,31 @@ export function applyPanelStateCounts(db, counts) {
   setDocument(db, ["firePanelState"], payload, false);
   return { changed: true, ...payload };
 }
+
+/**
+ * Parse `show counts` output from the fire panel.
+ * Example input:
+ * - show counts
+ * FIRE = 0           PRIORITY2 = 0      SUPERVISORY = 0    TROUBLE = 217
+ * -
+ * -
+ */
+export function parseShowCountsResponse(text = "") {
+  const clean = String(text || "");
+  const fireMatch = /FIRE\s*=\s*(\d+)/i.exec(clean);
+  const supervisoryMatch = /SUPERVISORY\s*=\s*(\d+)/i.exec(clean);
+  const troubleMatch = /TROUBLE\s*=\s*(\d+)/i.exec(clean);
+  const priority2Match = /PRIORITY2\s*=\s*(\d+)/i.exec(clean);
+
+  if (!fireMatch && !supervisoryMatch && !troubleMatch) {
+    return null;
+  }
+
+  return {
+    totalFire: fireMatch ? Number(fireMatch[1]) : 0,
+    totalSupervisory: supervisoryMatch ? Number(supervisoryMatch[1]) : 0,
+    totalTrouble: troubleMatch ? Number(troubleMatch[1]) : 0,
+    priority2: priority2Match ? Number(priority2Match[1]) : 0,
+  };
+}
+

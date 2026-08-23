@@ -552,6 +552,7 @@ export async function enrichAssetMappingsFromAssetsList(db, mappings = []) {
 
       if (!fromList) return mapping
 
+      const listAddress = resolveAssetDeviceAddress(fromList) || fromList.deviceAddress || fromList.partNumber || ""
       const listLocation = fromList.deviceLocation || ""
       const listDescription = fromList.deviceDescription || fromList.description || ""
 

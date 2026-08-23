@@ -10,7 +10,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
 const API_PORT: u16 = 47821;
 
-const STARTUP_TOTAL: u32 = 5;
+const STARTUP_TOTAL: u32 = 12;
 
 fn emit_progress(handle: &AppHandle, step: u32, message: &str) {
     let percent = ((step as f32 / STARTUP_TOTAL as f32) * 100.0).round() as u32;
@@ -30,7 +30,7 @@ fn finish_startup(handle: &AppHandle, port: u16) {
         *state.port.lock().unwrap() = Some(port);
         *state.ready.lock().unwrap() = true;
     }
-    emit_progress(handle, STARTUP_TOTAL, "Application ready");
+    emit_progress(handle, 5, "Database ready");
     let _ = handle.emit("vision365-api-ready", port);
     log_message(handle, &format!("Database ready on port {port}"));
     if let Some(window) = handle.get_webview_window("main") {

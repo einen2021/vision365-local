@@ -70,6 +70,8 @@ async function appendArrayField(buildingDb, docId, fieldKey, row) {
  * Append alarm archive + live feed rows for a building when panel CVAL increases.
  * Prefer `message` (already-formatted panel text). Fall back to description.
  */
+import { appendLiveLogToCategoryList } from "@/lib/recordAlarmHistory";
+
 export async function appendBuildingAlarmFeed({
   building,
   label,
@@ -85,6 +87,15 @@ export async function appendBuildingAlarmFeed({
   const detail = String(description || "Unknown device").trim() || "Unknown device";
   const ts = toTimestamp(time);
   const formatted = String(message || "").trim();
+
+  // Add to category list (fire-list, trouble-list, or supervisory-list) based on category
+  void appendLiveLogToCategoryList(label, {
+    raw: formatted || `${label} at ${detail}`,
+    rawMessage: formatted || `${label} at ${detail}`,
+    description: detail,
+    time: ts,
+    timestamp: new Date(ts).toISOString(),
+  }).catch(() => {});
 
   if (label === "Fire") {
     await appendArrayField(
