@@ -1,38 +1,42 @@
-import { collection, doc, getDocs, updateDoc } from "firebase/firestore";
+import { doc, updateDoc } from "firebase/firestore";
 import { db } from "@/config/firebase";
-import { findAssetsListEntryByPanelAddress } from "@/lib/assetsListSimplexStatus";
 import {
-  collectDeviceAddressKeys,
-} from "@/lib/assetFireStatus";
+  expandPanelAddressMatchKeys,
+  findAssetsListEntryByPanelAddress,
+} from "@/lib/assetsListSimplexStatus";
 import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets";
 import { readSimplexStatus, simplexKeyForCategoryLabel } from "@/lib/firePanelMonitor";
-import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
 
-function buildActiveAddressKeys(deviceAddresses = []) {
-  const activeKeys = new Set();
+// Per-category temp array of addresses seen in the last list response — diffed
+// against the next response so only devices that actually changed (added or
+// removed) touch Firestore, instead of scanning the whole AssetsList collection.
+// `null` means "no previous run yet for this category" (first run this session).
+const previousAddressesByLabel = {
+  Fire: null,
+  Trouble: null,
+  Supervisory: null,
+};
 
-  for (const address of deviceAddresses) {
-    for (const key of collectDeviceAddressKeys(address)) {
-      activeKeys.add(key);
-    }
-    const raw = String(address || "").trim().toUpperCase();
-    if (raw) activeKeys.add(raw);
+/** Clear the temp address array (call alongside a full simplexStatus reset). */
+export function clearPanelListAssetSyncTempArray(label) {
+  if (label && Object.prototype.hasOwnProperty.call(previousAddressesByLabel, label)) {
+    previousAddressesByLabel[label] = null;
+  } else {
+    previousAddressesByLabel.Fire = null;
+    previousAddressesByLabel.Trouble = null;
+    previousAddressesByLabel.Supervisory = null;
   }
-
-  return activeKeys;
 }
 
-function assetMatchesActiveList(data, activeKeys) {
-  const resolved = resolveAssetDeviceAddress(data) || data.deviceAddress || "";
-  for (const key of collectDeviceAddressKeys(resolved)) {
-    if (activeKeys.has(key)) return true;
+function buildAddressKeySet(addresses = []) {
+  const keys = new Set();
+  for (const address of addresses) {
+    for (const key of expandPanelAddressMatchKeys(address)) {
+      keys.add(key);
+    }
   }
-
-  const docId = String(data?.id || "").trim().toUpperCase();
-  if (docId && activeKeys.has(docId)) return true;
-
-  return false;
+  return keys;
 }
 
 function patchStoreFromEntry(entryId, data, status, extraAddress = "") {
@@ -43,13 +47,14 @@ function patchStoreFromEntry(entryId, data, status, extraAddress = "") {
 
 /**
  * Sync AssetsList F/T/S flags with the latest panel list output.
- * Sets the category flag on active devices and clears it on stale ones.
+ * Diffs the new address list against the temp array from the previous list
+ * run for this category: newly-added addresses get the flag set to 1, and
+ * addresses that dropped out get the flag reset to 0.
  */
 export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
   invalidateAssetsListSnapshotCache();
 
   const statusKey = simplexKeyForCategoryLabel(label);
-  const activeKeys = buildActiveAddressKeys(deviceAddresses);
   const now = new Date().toISOString();
   let updatedCount = 0;
   let clearedCount = 0;
@@ -59,15 +64,31 @@ export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
     .getState()
     .syncPanelLiveFlagsForCategory(statusKey, deviceAddresses);
 
-  // 2. Resolve entries and prepare parallel Firestore writes
-  const updatePromises = [];
-  const matchedDocIds = new Set();
+  // 2. Diff against the temp array of addresses from the previous run
+  const previousAddresses = previousAddressesByLabel[label];
+  let addedAddresses = deviceAddresses;
+  let removedAddresses = [];
 
-  for (const deviceAddress of deviceAddresses) {
+  if (previousAddresses !== null) {
+    const previousKeys = buildAddressKeySet(previousAddresses);
+    const currentKeys = buildAddressKeySet(deviceAddresses);
+
+    addedAddresses = deviceAddresses.filter((address) =>
+      [...expandPanelAddressMatchKeys(address)].every((key) => !previousKeys.has(key)),
+    );
+    removedAddresses = previousAddresses.filter((address) =>
+      [...expandPanelAddressMatchKeys(address)].every((key) => !currentKeys.has(key)),
+    );
+  }
+  // else: first run this session for this category — treat every address as
+  // newly added, nothing to remove (a full reset already zeroed everything).
+
+  const updatePromises = [];
+
+  for (const deviceAddress of addedAddresses) {
     const entry = await findAssetsListEntryByPanelAddress(deviceAddress);
     if (!entry) continue;
 
-    matchedDocIds.add(entry.id);
     const data = { ...entry.data, id: entry.id };
     const current = readSimplexStatus(data);
     if (Number(current[statusKey]) === 1) {
@@ -86,19 +107,18 @@ export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
     updatedCount += 1;
   }
 
-  // 3. Clear stale assets in AssetsList
-  const snapshot = await getDocs(collection(db, "AssetsList"));
-  for (const docSnap of snapshot.docs) {
-    if (matchedDocIds.has(docSnap.id)) continue;
-    const data = { ...docSnap.data(), id: docSnap.id };
+  for (const deviceAddress of removedAddresses) {
+    const entry = await findAssetsListEntryByPanelAddress(deviceAddress);
+    if (!entry) continue;
+
+    const data = { ...entry.data, id: entry.id };
     const current = readSimplexStatus(data);
     if (Number(current[statusKey]) !== 1) continue;
-    if (assetMatchesActiveList(data, activeKeys)) continue;
 
     const next = { ...current, [statusKey]: 0 };
-    patchStoreFromEntry(docSnap.id, data, next);
+    patchStoreFromEntry(entry.id, data, next);
     updatePromises.push(
-      updateDoc(doc(db, "AssetsList", docSnap.id), {
+      updateDoc(doc(db, "AssetsList", entry.id), {
         simplexStatus: next,
         updatedAt: now,
       }),
@@ -106,10 +126,13 @@ export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
     clearedCount += 1;
   }
 
-  // 4. Concurrently execute all writes
+  // 3. Concurrently execute all writes
   if (updatePromises.length > 0) {
     await Promise.all(updatePromises);
   }
+
+  // 4. Save this run's addresses as the temp array for next comparison
+  previousAddressesByLabel[label] = deviceAddresses.slice();
 
   return { updatedCount, clearedCount, statusKey };
 }

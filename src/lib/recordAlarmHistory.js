@@ -2,7 +2,6 @@ import { collection, doc, getDoc, getDocs, setDoc } from "firebase/firestore";
 import { db } from "@/config/firebase";
 import { normalizeBuildingName } from "@/lib/buildingNames";
 import { syncPanelListWithTempArray, getTempPanelList } from "@/lib/firePanelListHistory";
-import { findDeviceAddressByLocationText } from "@/lib/assetsListSimplexStatus";
 
 /**
  * Normalizes building name into {BuildingName}BuildingDB collection name.
@@ -182,13 +181,8 @@ export async function saveListToCategoryDb(label, parsedRows = []) {
  * adds it directly to fire-list, trouble-list, or supervisory-list based on category.
  * Does not alter or add anything extra to the entry.
  *
- * If the raw log line has no address, resolves it via findDeviceAddressByLocationText
- * (matching entry.location against AssetsList deviceLocation/deviceDescription) instead
- * of falling back to a `list f/t/s` panel command.
- *
  * @param {"Fire"|"Trouble"|"Supervisory"|string} label
  * @param {Object|string} entry
- * @returns {Promise<Object|undefined>} the saved list-response-shaped row
  */
 export async function appendLiveLogToCategoryList(label, entry) {
   if (!entry || !label) return;
@@ -202,7 +196,7 @@ export async function appendLiveLogToCategoryList(label, entry) {
       ? entry
       : String(entry.raw || entry.rawMessage || entry.message || "");
 
-  let addr =
+  const addr =
     typeof entry === "object" && entry
       ? entry.fullAddress ||
         entry.deviceAddress ||
@@ -210,13 +204,6 @@ export async function appendLiveLogToCategoryList(label, entry) {
         rawText.match(/\b(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)\b/i)?.[0] ||
         ""
       : rawText.match(/\b(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)\b/i)?.[0] || "";
-
-  // No address on the raw log line — resolve it from the location text instead
-  // of running a `list f/t/s` command against the panel.
-  const locationText = typeof entry === "object" && entry ? entry.location || "" : "";
-  if (!addr && locationText) {
-    addr = await findDeviceAddressByLocationText(locationText);
-  }
 
   const timeVal =
     typeof entry === "object" && entry
@@ -281,8 +268,6 @@ export async function appendLiveLogToCategoryList(label, entry) {
   } catch (err) {
     console.error(`[appendLiveLogToCategoryList] Failed appending to ${docName}:`, err);
   }
-
-  return row;
 }
 
 /** Alias for appendLiveLogToCategoryList */

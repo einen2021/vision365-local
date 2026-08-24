@@ -227,45 +227,6 @@ export async function findAssetsForPanelAddresses(panelAddresses = []) {
   return results
 }
 
-/** Uppercase, whitespace-collapsed comparison key for panel location text. */
-function normalizeLocationText(value) {
-  return String(value || "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ")
-}
-
-/**
- * Find the AssetsList doc whose deviceLocation / deviceDescription matches a
- * fire-panel-printed location string (e.g. "SUB BS CORRIDOR COS 21 SB/L1/2").
- * Returns { id, data } or null.
- */
-export async function findAssetsListDocByLocationText(locationText) {
-  const target = normalizeLocationText(locationText)
-  if (!target) return null
-
-  const snapshot = await getAssetsListSnapshot(db)
-  for (const docSnap of snapshot.docs) {
-    const data = docSnap.data()
-    const candidates = [data.deviceLocation, data.deviceDescription, data.description]
-    const matched = candidates.some((candidate) => normalizeLocationText(candidate) === target)
-    if (matched) return { id: docSnap.id, data }
-  }
-
-  return null
-}
-
-/**
- * Match a fire-panel-printed location string against AssetsList and return the
- * matched asset's device address, or "" when nothing matches.
- */
-export async function findDeviceAddressByLocationText(locationText) {
-  const match = await findAssetsListDocByLocationText(locationText)
-  if (!match) return ""
-  return resolveAssetDeviceAddress(match.data) || match.data.deviceAddress || match.id || ""
-}
-
 /** Set simplexStatus.F, .T, or .S to 0 on the AssetsList record. */
 export async function resetSimplexFlag(asset, deviceAddress, flag) {
   if (flag !== "F" && flag !== "T" && flag !== "S") {

@@ -72,6 +72,7 @@ export default function LiveSupervisoryPage() {
   const [ackedAddresses, setAckedAddresses] = useState(() => new Set());
   const [, setTick] = useState(0);
   const [dbListRows, setDbListRows] = useState([]);
+  const [dbListLoaded, setDbListLoaded] = useState(false);
   const [dbFetchedAt, setDbFetchedAt] = useState("");
 
   const cached = firePanelListResponses?.Supervisory ?? null;
@@ -103,9 +104,11 @@ export default function LiveSupervisoryPage() {
         } else {
           setDbListRows([]);
         }
+        setDbListLoaded(true);
       },
       (err) => {
         console.error("[LiveSupervisoryPage] Error listening to supervisory-list:", err);
+        setDbListLoaded(true);
       },
     );
     return () => unsub();
@@ -113,15 +116,21 @@ export default function LiveSupervisoryPage() {
 
   const parsedRows = useMemo(() => {
     let sourceList = [];
-    const tempRows = getTempPanelList("Supervisory");
-    if (dbListRows.length > 0) {
+    if (dbListLoaded) {
+      // supervisory-list is written atomically (single setDoc) once the full
+      // list response is confirmed — trust it completely, including a
+      // genuinely empty list, instead of the temp cache (which updates before
+      // the save completes and would otherwise flash incomplete data).
       sourceList = dbListRows;
-    } else if (tempRows && tempRows.length > 0) {
-      sourceList = tempRows;
-    } else if (cached?.rows && cached.rows.length > 0) {
-      sourceList = cached.rows;
-    } else if (rawResponse) {
-      sourceList = syncPanelListWithTempArray("Supervisory", rawResponse, fetchedAt || new Date().toISOString());
+    } else {
+      const tempRows = getTempPanelList("Supervisory");
+      if (tempRows && tempRows.length > 0) {
+        sourceList = tempRows;
+      } else if (cached?.rows && cached.rows.length > 0) {
+        sourceList = cached.rows;
+      } else if (rawResponse) {
+        sourceList = syncPanelListWithTempArray("Supervisory", rawResponse, fetchedAt || new Date().toISOString());
+      }
     }
 
     const dedupMap = new Map();
@@ -144,7 +153,7 @@ export default function LiveSupervisoryPage() {
     }
 
     return Array.from(dedupMap.values());
-  }, [dbListRows, cached?.rows, rawResponse, fetchedAt, ackedAddresses]);
+  }, [dbListLoaded, dbListRows, cached?.rows, rawResponse, fetchedAt, ackedAddresses]);
 
   const responseTimeLabel = useMemo(
     () => formatPanelListTime(fetchedAt) || "",

@@ -27,7 +27,12 @@ import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 import { apiUrl } from "@/lib/apiClient";
 import { parseShowCountsResponse } from "@/lib/panelState";
-import { handleSystemResetCompleteWorkflow } from "@/lib/systemResetWorkflow";
+import {
+  handleSystemResetCompleteWorkflow,
+  syncFireListAssets,
+  syncTroubleListAssets,
+  syncSupervisoryListAssets,
+} from "@/lib/systemResetWorkflow";
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
 import { appendLiveLogToCategoryList } from "@/lib/recordAlarmHistory";
 
@@ -194,6 +199,7 @@ export function FireAlertProvider({ children }) {
   const [ackLoading, setAckLoading] = useState(false);
   const [activeAlarmInfo, setActiveAlarmInfo] = useState(null);
   const stopSirenRef = useRef(null);
+  const previousCountsRef = useRef({ totalFire: 0, totalTrouble: 0, totalSupervisory: 0 });
 
   const showFireAlert = useCallback((alarmInfo = null) => {
     if (alarmInfo) {
@@ -242,6 +248,8 @@ export function FireAlertProvider({ children }) {
       const counts = parseShowCountsResponse(rawText);
       if (!counts) return;
 
+      const previous = previousCountsRef.current;
+
       // 1. Save to backend database
       const stateUrl = apiUrl("/api/telnet/fire-panel/panel-state");
       await fetch(stateUrl, {
@@ -260,6 +268,25 @@ export function FireAlertProvider({ children }) {
           new CustomEvent("vision365:firePanelStateUpdated", { detail: counts }),
         );
       }
+
+      // 3. If a category count decreased (something resolved/acked off-panel),
+      // re-sync that category: run its list command, update {category}-list DB,
+      // and sync device F/T/S status — same as startupListSync, nothing extra.
+      if (counts.totalFire < previous.totalFire) {
+        await syncFireListAssets();
+      }
+      if (counts.totalTrouble < previous.totalTrouble) {
+        await syncTroubleListAssets();
+      }
+      if (counts.totalSupervisory < previous.totalSupervisory) {
+        await syncSupervisoryListAssets();
+      }
+
+      previousCountsRef.current = {
+        totalFire: counts.totalFire,
+        totalTrouble: counts.totalTrouble,
+        totalSupervisory: counts.totalSupervisory,
+      };
     } catch (err) {
       console.error("[FireModalContext] fetchAndSyncCounts failed:", err);
     }
@@ -281,9 +308,7 @@ export function FireAlertProvider({ children }) {
     closeFireAlertModal();
     router.push(LIVE_FIRE_ROUTE);
 
-    // Run `ack f` and count sync non-blockingly in background.
-    // No `list f` here — the fire-list category is kept in sync via the live
-    // event stream (appendLiveLogToCategoryList), not a panel list command.
+    // Run `ack f`, count sync, and `list f` asset updates non-blockingly in background
     void (async () => {
       try {
         await acknowledgeCategory("Fire");
@@ -294,6 +319,11 @@ export function FireAlertProvider({ children }) {
         await fetchAndSyncCounts();
       } catch (err) {
         console.error("[FireModalContext] fetchAndSyncCounts failed:", err);
+      }
+      try {
+        await syncFireListAssets();
+      } catch (err) {
+        console.error("[FireModalContext] syncFireListAssets failed:", err);
       }
     })();
   }, [closeFireAlertModal, fetchAndSyncCounts, muteSiren, router, toast]);
@@ -406,15 +436,12 @@ export function FireAlertProvider({ children }) {
         });
 
         void (async () => {
-          // appendLiveLogToCategoryList resolves the address via
-          // findDeviceAddressByLocationText (matching entry.location against
-          // AssetsList) when the raw log line has none — no `list f` needed.
-          const savedRow = await appendLiveLogToCategoryList("Fire", entry);
-          const resolvedAddr = savedRow?.deviceAddress || fireAddr;
-          if (resolvedAddr) {
-            console.log(`[FireModalContext] Updating F value for fire device: ${resolvedAddr}`);
-            await syncAssetsListWithPanelList("Fire", [resolvedAddr]);
+          await appendLiveLogToCategoryList("Fire", entry);
+          if (fireAddr) {
+            console.log(`[FireModalContext] Updating F value for fire device: ${fireAddr}`);
+            await syncAssetsListWithPanelList("Fire", [fireAddr]);
           }
+          await syncFireListAssets();
         })();
       }
 
@@ -426,12 +453,19 @@ export function FireAlertProvider({ children }) {
           rawText.match(/\b(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)\b/i)?.[0] ||
           "";
 
+        // LivePanelAlertProvider owns the trouble beep/modal but sits below this
+        // provider in the tree, so signal it via a window event (same pattern as
+        // vision365:firePanelStateUpdated) instead of calling its hook directly.
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("vision365:newTroubleEvent"));
+        }
+
         void (async () => {
-          const savedRow = await appendLiveLogToCategoryList("Trouble", entry);
-          const resolvedAddr = savedRow?.deviceAddress || trblAddr;
-          if (resolvedAddr) {
-            await syncAssetsListWithPanelList("Trouble", [resolvedAddr]);
+          await appendLiveLogToCategoryList("Trouble", entry);
+          if (trblAddr) {
+            await syncAssetsListWithPanelList("Trouble", [trblAddr]);
           }
+          await syncTroubleListAssets();
         })();
       }
 
@@ -443,12 +477,16 @@ export function FireAlertProvider({ children }) {
           rawText.match(/\b(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)\b/i)?.[0] ||
           "";
 
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("vision365:newSupervisoryEvent"));
+        }
+
         void (async () => {
-          const savedRow = await appendLiveLogToCategoryList("Supervisory", entry);
-          const resolvedAddr = savedRow?.deviceAddress || supAddr;
-          if (resolvedAddr) {
-            await syncAssetsListWithPanelList("Supervisory", [resolvedAddr]);
+          await appendLiveLogToCategoryList("Supervisory", entry);
+          if (supAddr) {
+            await syncAssetsListWithPanelList("Supervisory", [supAddr]);
           }
+          await syncSupervisoryListAssets();
         })();
       }
 
@@ -459,15 +497,17 @@ export function FireAlertProvider({ children }) {
         return;
       }
 
-      // If fire acknowledged log arrives: run show counts once (no `list f` —
-      // fire-list stays in sync via the live event stream, not a panel list command).
+      // If fire acknowledged log arrives: run show counts then list f once, and update F value to 1 for matched devices
       const isFireAck =
         entry.kind === "fire-acknowledged" ||
         /FIRE\s+ALARM\s+ACKED/i.test(statusText) ||
         /FIRE\s+ALARM\s+ACKED/i.test(rawText);
 
       if (isFireAck) {
-        void fetchAndSyncCounts();
+        void (async () => {
+          await fetchAndSyncCounts();
+          await syncFireListAssets();
+        })();
         return;
       }
 

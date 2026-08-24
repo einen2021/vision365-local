@@ -98,13 +98,18 @@ export function simplexKeyForCategoryLabel(label) {
   return "F";
 }
 
-/** Parse panel list command output into unique device addresses. */
+/**
+ * Parse panel list command output into unique device addresses.
+ * Reuses the same row parser as the display list (parsePanelListResponse) so
+ * every address format it recognizes (M-address, P-address, bare loop-device)
+ * is included here too — otherwise devices using those formats parse fine for
+ * display but silently drop out of F/T/S status sync.
+ */
 export function extractPanelDeviceAddresses(response) {
-  const text = String(response || "").replace(/\0/g, " ");
-  // Accept both "1:M1-2-3" and bare "M1-2-3".
-  const regex = /\b(?:\d+:)?M\d+-\d+(?:-\d+)?\b/gi;
-  const matches = text.match(regex) ?? [];
-  return [...new Set(matches.map((value) => value.trim().toUpperCase()))];
+  const addresses = parsePanelListResponse(response)
+    .map((row) => String(row.fullAddress || row.deviceAddress || "").trim().toUpperCase())
+    .filter(Boolean);
+  return [...new Set(addresses)];
 }
 
 /** Known device type suffixes in panel list output (longest first). */

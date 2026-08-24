@@ -1,11 +1,10 @@
 "use client";
 
-import { useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
+import { useFireAlert } from "@/contexts/FireModalContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 import { LIVE_PANEL_ROUTE_BY_LABEL } from "@/config/live-panel-routes";
@@ -47,9 +46,9 @@ export function FirePanelAckButtons() {
   const router = useRouter();
   const pathname = normalizePathname(usePathname());
   const { acknowledge, firePanelState } = useFirePanelMonitor();
+  const { muteSiren } = useFireAlert();
   const connected = useFirePanelStore((s) => s.connected);
   const { toast } = useToast();
-  const [loadingLabel, setLoadingLabel] = useState(null);
 
   // Returns true when ack was sent successfully.
   const handleAck = async (label, title) => {
@@ -62,7 +61,6 @@ export function FirePanelAckButtons() {
       return false;
     }
 
-    setLoadingLabel(label);
     try {
       await acknowledge(label);
       await acknowledge(label);
@@ -78,14 +76,15 @@ export function FirePanelAckButtons() {
         variant: "destructive",
       });
       return false;
-    } finally {
-      setLoadingLabel(null);
     }
   };
 
   const handleButtonClick = (label, title) => {
     const route = LIVE_PANEL_ROUTE_BY_LABEL[label];
 
+    if (label === "Fire") {
+      muteSiren?.();
+    }
     if (label === "Trouble") {
       silenceTroubleAlertBeep();
     }
@@ -125,7 +124,7 @@ export function FirePanelAckButtons() {
               HEADER_ACTION_BUTTON_CLASS,
               active && variant === "outline" ? activeClassName : undefined,
             )}
-            disabled={!connected || loadingLabel !== null}
+            disabled={!connected}
             title={
               onLivePage
                 ? `${title} on this page`
@@ -135,20 +134,14 @@ export function FirePanelAckButtons() {
             }
             onClick={() => handleButtonClick(label, title)}
           >
-            {loadingLabel === label ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <>
-                {title}
-                <span
-                  className={`ml-1 rounded px-1 font-mono text-[11px] font-semibold tabular-nums ${
-                    active ? "" : "text-muted-foreground"
-                  }`}
-                >
-                  {cval}
-                </span>
-              </>
-            )}
+            {title}
+            <span
+              className={`ml-1 rounded px-1 font-mono text-[11px] font-semibold tabular-nums ${
+                active ? "" : "text-muted-foreground"
+              }`}
+            >
+              {cval}
+            </span>
           </Button>
         );
       })}

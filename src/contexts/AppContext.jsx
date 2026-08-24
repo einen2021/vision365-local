@@ -39,10 +39,8 @@ import {
   simplexKeyForCategoryLabel,
 } from "@/lib/firePanelMonitor";
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
-import {
-  findAssetsListDocByLocationText,
-  findDeviceAddressByLocationText as findDeviceAddressByLocationTextLib,
-} from "@/lib/assetsListSimplexStatus";
+import { getAssetsListSnapshot } from "@/lib/floorMapAssets";
+import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
 import { extractFloorDetailsFromAsset } from "@/lib/assetAddressFloorIndex";
 import { streamFirePanelListCommand } from "@/lib/firePanelListStream";
 import { pickNewestAppearedAddresses } from "@/lib/livePanelListHighlight";
@@ -648,16 +646,45 @@ export const AppProvider = ({ children }) => {
     });
   }, [sendFirePanelCommand]);
 
+  /** Uppercase, whitespace-collapsed comparison key for panel location text. */
+  const normalizeLocationText = (value) =>
+    String(value || "")
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, " ")
+      .trim()
+      .replace(/\s+/g, " ");
+
   /**
-   * Match a fire-panel-printed location string (e.g. "SUB BS CORRIDOR COS 21 SB/L1/2")
-   * against AssetsList and return the matched asset's device address, or "" when
-   * nothing matches. Shared with src/lib/recordAlarmHistory.js so live fire/trouble/
-   * supervisory log entries can resolve an address without a `list f/t/s` round-trip.
+   * Find the AssetsList doc whose deviceLocation / deviceDescription matches a
+   * fire-panel-printed location string (e.g. "SUB BS CORRIDOR COS 21 SB/L1/2").
+   * Returns { id, data } or null.
    */
-  const findDeviceAddressByLocationText = useCallback(
-    (locationText) => findDeviceAddressByLocationTextLib(locationText),
-    [],
-  );
+  const findAssetsListDocByLocationText = useCallback(async (locationText) => {
+    const target = normalizeLocationText(locationText);
+    if (!target) return null;
+
+    const snapshot = await getAssetsListSnapshot(db);
+    for (const docSnap of snapshot.docs) {
+      const data = docSnap.data();
+      const candidates = [data.deviceLocation, data.deviceDescription, data.description];
+      const matched = candidates.some(
+        (candidate) => normalizeLocationText(candidate) === target,
+      );
+      if (matched) return { id: docSnap.id, data };
+    }
+
+    return null;
+  }, []);
+
+  /**
+   * Match a fire-panel-printed location string against AssetsList and return the
+   * matched asset's device address, or "" when nothing matches.
+   */
+  const findDeviceAddressByLocationText = useCallback(async (locationText) => {
+    const match = await findAssetsListDocByLocationText(locationText);
+    if (!match) return "";
+    return resolveAssetDeviceAddress(match.data) || match.data.deviceAddress || match.id || "";
+  }, [findAssetsListDocByLocationText]);
 
   /**
    * Match a fire-panel-printed location string against AssetsList and return the
@@ -668,7 +695,7 @@ export const AppProvider = ({ children }) => {
     const match = await findAssetsListDocByLocationText(locationText);
     if (!match) return null;
     return extractFloorDetailsFromAsset(match.data, match.id);
-  }, []);
+  }, [findAssetsListDocByLocationText]);
 
   const waitWhileMonitorPaused = useCallback(async () => {
     while (isMonitorLoopPaused() && isMonitorLoopActive()) {

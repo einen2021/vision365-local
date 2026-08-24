@@ -71,6 +71,7 @@ export default function LiveTroublePage() {
   const [ackedAddresses, setAckedAddresses] = useState(() => new Set());
   const [, setTick] = useState(0);
   const [dbListRows, setDbListRows] = useState([]);
+  const [dbListLoaded, setDbListLoaded] = useState(false);
   const [dbFetchedAt, setDbFetchedAt] = useState("");
 
   const cached = firePanelListResponses?.Trouble ?? null;
@@ -102,9 +103,11 @@ export default function LiveTroublePage() {
         } else {
           setDbListRows([]);
         }
+        setDbListLoaded(true);
       },
       (err) => {
         console.error("[LiveTroublePage] Error listening to trouble-list:", err);
+        setDbListLoaded(true);
       },
     );
     return () => unsub();
@@ -112,15 +115,21 @@ export default function LiveTroublePage() {
 
   const parsedRows = useMemo(() => {
     let sourceList = [];
-    const tempRows = getTempPanelList("Trouble");
-    if (dbListRows.length > 0) {
+    if (dbListLoaded) {
+      // trouble-list is written atomically (single setDoc) once the full list
+      // response is confirmed — trust it completely, including a genuinely
+      // empty list, instead of the temp cache (which updates before the save
+      // completes and would otherwise flash incomplete/in-progress data).
       sourceList = dbListRows;
-    } else if (tempRows && tempRows.length > 0) {
-      sourceList = tempRows;
-    } else if (cached?.rows && cached.rows.length > 0) {
-      sourceList = cached.rows;
-    } else if (rawResponse) {
-      sourceList = syncPanelListWithTempArray("Trouble", rawResponse, fetchedAt || new Date().toISOString());
+    } else {
+      const tempRows = getTempPanelList("Trouble");
+      if (tempRows && tempRows.length > 0) {
+        sourceList = tempRows;
+      } else if (cached?.rows && cached.rows.length > 0) {
+        sourceList = cached.rows;
+      } else if (rawResponse) {
+        sourceList = syncPanelListWithTempArray("Trouble", rawResponse, fetchedAt || new Date().toISOString());
+      }
     }
 
     const dedupMap = new Map();
@@ -143,7 +152,7 @@ export default function LiveTroublePage() {
     }
 
     return Array.from(dedupMap.values());
-  }, [dbListRows, cached?.rows, rawResponse, fetchedAt, ackedAddresses]);
+  }, [dbListLoaded, dbListRows, cached?.rows, rawResponse, fetchedAt, ackedAddresses]);
 
   const responseTimeLabel = useMemo(
     () => formatPanelListTime(fetchedAt) || "",

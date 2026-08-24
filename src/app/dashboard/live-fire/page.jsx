@@ -9,6 +9,7 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { DashboardTopBar } from "@/components/dashboard-header";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
+import { useFireAlert } from "@/contexts/FireModalContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { usePageAuth } from "@/hooks/usePageAuth";
 import { useToast } from "@/hooks/use-toast";
@@ -64,6 +65,7 @@ export default function LiveFirePage() {
     firePanelListResponses,
     firePanelState,
   } = useFirePanelMonitor();
+  const { muteSiren } = useFireAlert();
 
   const [acknowledgingAddress, setAcknowledgingAddress] = useState(null);
   const [ackedAddresses, setAckedAddresses] = useState(() => new Set());
@@ -168,6 +170,7 @@ export default function LiveFirePage() {
       const targetKey = address !== "—" ? address : (row.key || row.id);
       setAcknowledgingAddress(targetKey);
       try {
+        muteSiren?.();
         await acknowledgeDevice("Fire", address);
 
         setAckedAddresses((prev) => {
@@ -205,7 +208,7 @@ export default function LiveFirePage() {
         setAcknowledgingAddress(null);
       }
     },
-    [acknowledgingAddress, connected, router, toast],
+    [acknowledgingAddress, connected, muteSiren, router, toast],
   );
 
   if (!isReady) {

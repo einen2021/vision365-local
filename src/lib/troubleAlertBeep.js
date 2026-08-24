@@ -23,8 +23,8 @@ export function playPanelAlertBeep() {
   const audio = createPanelAlertAudio();
   if (!audio) return;
 
-  void audio.play().catch(() => {
-    // Ignore autoplay / device audio errors; the next user action can unlock audio.
+  void audio.play().catch((err) => {
+    console.error("[troubleAlertBeep] audio.play() failed:", err);
   });
 }
 

@@ -232,20 +232,23 @@ export function LivePanelAlertProvider({ children }) {
     setAckLoading(false);
   }, []);
 
+  // Sound always plays on a new trouble/supervisory event (fire alarm still
+  // takes priority and suppresses it). The popup itself is opt-in via the
+  // "Show popup when new alarms occur" toggle — it must not gate the sound.
   const showTroubleAlert = useCallback(() => {
-    if (!usePanelAlertSettingsStore.getState().isTroubleModalEnabled()) return;
     if (isAlarmActive) return;
     resetTroubleAlertSilence();
     startTroubleAlertBeep();
+    if (!usePanelAlertSettingsStore.getState().isTroubleModalEnabled()) return;
     setIsMuted(false);
     setOpenLabel("Trouble");
   }, [isAlarmActive]);
 
   const showSupervisoryAlert = useCallback(() => {
-    if (!usePanelAlertSettingsStore.getState().isSupervisoryModalEnabled()) return;
     if (isAlarmActive) return;
     resetSupervisoryAlertSilence();
     startSupervisoryAlertBeep();
+    if (!usePanelAlertSettingsStore.getState().isSupervisoryModalEnabled()) return;
     setIsMuted(false);
     setOpenLabel("Supervisory");
   }, [isAlarmActive]);
@@ -256,6 +259,21 @@ export function LivePanelAlertProvider({ children }) {
       dismissForFirePriority();
     }
   }, [dismissForFirePriority, isAlarmActive]);
+
+  // New live trouble/supervisory events are detected in FireModalContext's SSE
+  // handler (above this provider in the tree), which signals here via window
+  // events instead of calling these hooks directly.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleNewTrouble = () => showTroubleAlert();
+    const handleNewSupervisory = () => showSupervisoryAlert();
+    window.addEventListener("vision365:newTroubleEvent", handleNewTrouble);
+    window.addEventListener("vision365:newSupervisoryEvent", handleNewSupervisory);
+    return () => {
+      window.removeEventListener("vision365:newTroubleEvent", handleNewTrouble);
+      window.removeEventListener("vision365:newSupervisoryEvent", handleNewSupervisory);
+    };
+  }, [showTroubleAlert, showSupervisoryAlert]);
 
   const handleTroubleCountChange = useCallback((count) => {
     if (count === 0) {

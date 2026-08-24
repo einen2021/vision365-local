@@ -1,8 +1,8 @@
 "use client";
 
 import { memo, useMemo } from "react";
-import { Loader2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { formatPanelListTime } from "@/lib/firePanelMonitor";
 
@@ -146,6 +146,7 @@ export function PanelAlarmList({
 
   if (!rows.length) {
     if (pending || (expectedCount != null && expectedCount > 0)) {
+      const skeletonRowCount = Math.min(Math.max(expectedCount || 6, 3), 8);
       return (
         <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border">
           <div
@@ -160,11 +161,20 @@ export function PanelAlarmList({
             <span>Device type</span>
             <span>Status</span>
           </div>
-          <div className="flex flex-1 items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            {expectedCount != null && expectedCount > 0
-              ? `Receiving list — ${listMessageCount}/${expectedCount}`
-              : "Receiving list from panel…"}
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <ul className="divide-y">
+              {Array.from({ length: skeletonRowCount }).map((_, index) => (
+                <li key={index} className="px-4 py-3">
+                  <div className={cn("grid gap-2 md:items-center md:gap-3", LIST_GRID)}>
+                    <Skeleton className="h-4 w-24" />
+                    <Skeleton className="h-4 w-20" />
+                    <Skeleton className="h-4 w-full max-w-[220px]" />
+                    <Skeleton className="hidden h-4 w-28 md:block" />
+                    <Skeleton className="h-5 w-14 rounded-full" />
+                  </div>
+                </li>
+              ))}
+            </ul>
           </div>
         </div>
       );
