@@ -550,8 +550,11 @@ export function FireAlertProvider({ children }) {
                 const rawListText = result?.response ?? "";
                 const parsedRows = parsePanelListResponse(rawListText);
                 await saveListToCategoryDb("Fire", parsedRows);
+                const deviceAddresses = extractPanelDeviceAddresses(rawListText);
+                await syncAssetsListWithPanelList("Fire", deviceAddresses);
+                useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
                 console.log(
-                  `[FireModalContext] fire-list saved from list f: ${parsedRows.length} row(s)`,
+                  `[FireModalContext] fire-list saved from list f: ${parsedRows.length} row(s), synced ${deviceAddresses.length} device address(es)`,
                 );
               } catch (err) {
                 console.error("[FireModalContext] list f failed:", err);
@@ -566,6 +569,7 @@ export function FireAlertProvider({ children }) {
               console.log("[FireModalContext] new fire as list f item:", listFItem);
               const parsedRows = parsePanelListResponse(listFItem);
               await saveListToCategoryDb("Fire", parsedRows);
+              useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([resolvedAddress], "F", 1);
             }
 
 
