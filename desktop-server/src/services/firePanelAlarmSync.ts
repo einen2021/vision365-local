@@ -12,6 +12,7 @@ import {
   withDbMutate,
 } from "../db/documentStore";
 import { serverLog } from "../log";
+import { sendFirePanelCommand } from "./firePanelService";
 
 export type AlarmCategory = "fire" | "trouble" | "supervisory";
 
@@ -77,14 +78,18 @@ export async function savePanelCategoryCount(
   category: AlarmCategory,
   count: number,
 ): Promise<void> {
+  let decreased = false;
   await withDbMutate((db, { markDirty }) => {
     const existing =
       (getDocument(db, [PANEL_STATE_DOC]) as Record<string, unknown>) || {};
     const totalField = totalFieldForCategory(category);
-    console.log({ totalField })
+    const prevCount = Number(existing[totalField]) || 0;
     const now = new Date().toISOString();
 
-    if (Number(existing[totalField]) === count) return;
+    if (prevCount === count) return;
+    if (count < prevCount && category !== "fire") {
+      decreased = true;
+    }
 
     setDocument(
       db,
@@ -99,9 +104,19 @@ export async function savePanelCategoryCount(
     markDirty();
 
     serverLog(
-      `[fire-panel] firePanelState → ${totalField}=${count} (previous panel count)`,
+      `[fire-panel] firePanelState → ${totalField}=${count} (previous panel count: ${prevCount})`,
     );
   });
+
+  if (decreased && (category === "trouble" || category === "supervisory")) {
+    try {
+      await syncCategoryOnCountDecrease(category, count);
+    } catch (error) {
+      serverLog(
+        `[fire-panel] Error executing startup list sync for decreased category ${category}: ${(error as Error).message}`,
+      );
+    }
+  }
 }
 
 /** Persist all three CVAL totals to firePanelState (e.g. after monitor cycle). */
@@ -111,6 +126,10 @@ export async function savePanelStateCounts(counts: {
   totalSupervisory: number;
 }): Promise<PanelCategoryCounts & { unchanged?: boolean }> {
   let result: PanelCategoryCounts & { unchanged?: boolean };
+  const decreasedCategories: Array<{
+    category: "trouble" | "supervisory";
+    nextCount: number;
+  }> = [];
 
   await withDbMutate((db, { markDirty }) => {
     const existing = panelCountsFromDb(db);
@@ -151,9 +170,21 @@ export async function savePanelStateCounts(counts: {
     }
     if (existing.totalSupervisory !== next.totalSupervisory) {
       changes.push(`supervisory ${existing.totalSupervisory}→${next.totalSupervisory}`);
+      if (next.totalSupervisory < existing.totalSupervisory) {
+        decreasedCategories.push({
+          category: "supervisory",
+          nextCount: next.totalSupervisory,
+        });
+      }
     }
     if (existing.totalTrouble !== next.totalTrouble) {
       changes.push(`trouble ${existing.totalTrouble}→${next.totalTrouble}`);
+      if (next.totalTrouble < existing.totalTrouble) {
+        decreasedCategories.push({
+          category: "trouble",
+          nextCount: next.totalTrouble,
+        });
+      }
     }
     if (changes.length > 0) {
       serverLog(`[fire-panel] firePanelState → ${changes.join(", ")}`);
@@ -162,7 +193,332 @@ export async function savePanelStateCounts(counts: {
     result = payload;
   });
 
+  // If any category count decreased from previous (except fire), do all the steps in startUpListSync for that category
+  for (const { category, nextCount } of decreasedCategories) {
+    try {
+      await syncCategoryOnCountDecrease(category, nextCount);
+    } catch (error) {
+      serverLog(
+        `[fire-panel] Error executing startup list sync for decreased category ${category}: ${(error as Error).message}`,
+      );
+    }
+  }
+
   return result!;
+}
+
+const PANEL_DEVICE_TYPES = [
+  "SMOKE DETECTOR",
+  "HEAT DETECTOR",
+  "DUCT DETECTOR",
+  "BEAM DETECTOR",
+  "PULL STATION",
+  "MANUAL STATION",
+  "WATER FLOW",
+  "FLOW SWITCH",
+  "MONITOR MODULE",
+  "CONTROL MODULE",
+  "RELAY MODULE",
+  "AUXILIARY RELAY",
+  "ALARM RELAY",
+  "TROUBLE POINT",
+  "HORN STROBE",
+  "SPEAKER STROBE",
+  "TAMPER SWITCH",
+  "GATE VALVE",
+  "FIRE MONITOR",
+  "SUPERVISORY",
+  "MONITOR ZN",
+  "HORN",
+  "STROBE",
+  "SPEAKER",
+  "MODULE",
+  "DETECTOR",
+  "STATION",
+  "RELAY",
+  "SWITCH",
+  "VALVE",
+];
+
+const KNOWN_STATUS_TOKENS = new Set([
+  "TRBL",
+  "TRBL*",
+  "TROUBLE",
+  "TROUBLE*",
+  "FIRE",
+  "FIRE*",
+  "ALARM",
+  "ALARM*",
+  "SUPV",
+  "SUPV*",
+  "SUPERVISORY",
+  "SUPERVISORY*",
+  "PRI2",
+  "PRI2*",
+  "DISABLE",
+  "DISABLED",
+  "DISAB",
+  "NORMAL",
+  "NORMAL*",
+  "ACKED",
+  "TEST",
+  "OPEN",
+  "SHORT",
+  "ACTIVE",
+  "OFF",
+  "ON",
+]);
+
+function stripListCommandEcho(line: string) {
+  return String(line || "")
+    .replace(/\0/g, " ")
+    .replace(/^list\s+[fts]\s*/i, "")
+    .replace(/^list\s+[fts](?=\d*:?M\d)/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export interface DetailedPanelListEntry {
+  fullAddress: string;
+  deviceAddress: string;
+  location: string;
+  deviceType: string;
+  status: string;
+  label: string;
+  panelTimeText: string;
+  time: number;
+  timestamp: string;
+  raw: string;
+  rawMessage: string;
+}
+
+export function parseDetailedPanelListLine(line: string): DetailedPanelListEntry | null {
+  const trimmed = stripListCommandEcho(line);
+  if (!trimmed) return null;
+  if (/_DNE|_END\b/i.test(trimmed)) return null;
+  if (trimmed === "-") return null;
+  if (/^list\s/i.test(trimmed)) return null;
+  if (/FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+|PRIORITY2\s*=\s*\d+/i.test(trimmed)) return null;
+  if (/^show\s+counts/i.test(trimmed)) return null;
+
+  const match = trimmed.match(
+    /^(?:(\d+):)?(M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+|\d+-\d+(?:-\d+)?)(?:\s+(.*))?$/i,
+  );
+  if (!match) return null;
+
+  const node = match[1] || "";
+  const deviceAddress = match[2].toUpperCase();
+  const fullAddress = node ? `${node}:${deviceAddress}` : deviceAddress;
+  let remainder = String(match[3] || "").trim();
+  let panelTimeText = "";
+
+  const leadingDateTime = remainder.match(
+    /^(\d{1,2}-[A-Za-z]{3}-\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)\s+/,
+  );
+  const leadingTime = remainder.match(/^(\d{1,2}:\d{2}(?::\d{2})?)\s+/);
+
+  if (leadingDateTime) {
+    panelTimeText = leadingDateTime[1];
+    remainder = remainder.slice(leadingDateTime[0].length).trim();
+  } else if (leadingTime) {
+    panelTimeText = leadingTime[1];
+    remainder = remainder.slice(leadingTime[0].length).trim();
+  }
+
+  let status = "";
+  const words = remainder.split(/\s+/);
+  if (words.length > 0) {
+    const lastWord = words[words.length - 1].toUpperCase();
+    if (KNOWN_STATUS_TOKENS.has(lastWord)) {
+      status = lastWord;
+      words.pop();
+      remainder = words.join(" ").trim();
+    }
+  }
+
+  if (!panelTimeText) {
+    const trailingDateTime = remainder.match(
+      /\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)\s*$/,
+    );
+    const trailingTime = remainder.match(/\s+(\d{1,2}:\d{2}(?::\d{2})?)\s*$/);
+    if (trailingDateTime) {
+      panelTimeText = trailingDateTime[1];
+      remainder = remainder.slice(0, trailingDateTime.index).trim();
+    } else if (trailingTime) {
+      panelTimeText = trailingTime[1];
+      remainder = remainder.slice(0, trailingTime.index).trim();
+    }
+  }
+
+  let deviceType = "";
+  let location = remainder;
+  const upperRemainder = remainder.toUpperCase();
+
+  const cardMatch = upperRemainder.match(/\bCARD\s*[-]?\s*(\d+)\b/i);
+  if (cardMatch) {
+    deviceType = `CARD ${cardMatch[1]}`;
+    location = remainder.replace(/\bCARD\s*[-]?\s*\d+\b/i, "").trim();
+  } else {
+    for (const type of PANEL_DEVICE_TYPES) {
+      if (upperRemainder.endsWith(type)) {
+        deviceType = type;
+        location = remainder.slice(0, remainder.length - type.length).trim();
+        break;
+      }
+    }
+  }
+
+  if (!deviceType && remainder) {
+    if (/^P\d+$/i.test(deviceAddress)) {
+      deviceType = "TROUBLE POINT";
+      location = remainder;
+    } else {
+      const remWords = remainder.split(/\s+/);
+      if (remWords.length >= 3) {
+        deviceType = remWords.slice(-2).join(" ").toUpperCase();
+        location = remWords.slice(0, -2).join(" ");
+      } else if (remWords.length === 2) {
+        deviceType = remWords[1].toUpperCase();
+        location = remWords[0];
+      } else {
+        location = remainder;
+        deviceType = "—";
+      }
+    }
+  }
+
+  if (!status) {
+    status = "TRBL";
+  }
+
+  const nowMs = Date.now();
+  return {
+    fullAddress,
+    deviceAddress,
+    location: location || "—",
+    deviceType: deviceType || "—",
+    status,
+    label: status.replace(/\*$/, ""),
+    panelTimeText,
+    time: nowMs,
+    timestamp: new Date(nowMs).toISOString(),
+    raw: trimmed,
+    rawMessage: trimmed,
+  };
+}
+
+export function parseDetailedPanelListResponse(
+  text: string,
+): DetailedPanelListEntry[] {
+  if (!text) return [];
+  const lines = String(text).split(/\r?\n/);
+  const rows: DetailedPanelListEntry[] = [];
+  for (const line of lines) {
+    const parsed = parseDetailedPanelListLine(line);
+    if (parsed) rows.push(parsed);
+  }
+  return rows;
+}
+
+/**
+ * Execute all steps in startUpListSync for a category (trouble or supervisory)
+ * when its count decreases from previous.
+ */
+export async function syncCategoryOnCountDecrease(
+  category: "trouble" | "supervisory",
+  expectedCount: number,
+): Promise<void> {
+  const normLabel = category === "trouble" ? "Trouble" : "Supervisory";
+  const listCmd = category === "trouble" ? "list t" : "list s";
+  const docName = `${category}-list`;
+
+  let parsedRows: DetailedPanelListEntry[] = [];
+  let rawRes = "";
+
+  if (expectedCount === 0) {
+    serverLog(
+      `[fire-panel] [startupSync] ${normLabel} count dropped to 0, saving empty list to database...`,
+    );
+    parsedRows = [];
+  } else {
+    serverLog(
+      `[fire-panel] [startupSync] ${normLabel} count decreased to ${expectedCount}. Running ${listCmd} (expecting ~${expectedCount} items)...`,
+    );
+    const maxAttempts = 10;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const timeoutMs = Math.max(30000, Math.min(120000, expectedCount * 250 + 15000));
+      try {
+        const res = await sendFirePanelCommand(listCmd, timeoutMs, expectedCount);
+        rawRes = res?.response || "";
+      } catch (err) {
+        serverLog(
+          `[fire-panel] [startupSync] Error sending ${listCmd}: ${(err as Error).message}`,
+        );
+        break;
+      }
+
+      parsedRows = parseDetailedPanelListResponse(rawRes);
+      const isCountConfirmed =
+        parsedRows.length >= expectedCount ||
+        (parsedRows.length >= Math.floor(expectedCount * 0.95) &&
+          /_DNE|_END|\n-\s*$/i.test(rawRes));
+
+      if (isCountConfirmed) {
+        break;
+      }
+
+      if (attempt === maxAttempts) {
+        serverLog(
+          `[fire-panel] [startupSync] ${listCmd} completed with ${parsedRows.length}/${expectedCount} items after ${attempt} attempts. Proceeding to save...`,
+        );
+        break;
+      }
+
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+
+  // Save to DB and sync assets / building totals
+  await withDbMutate((db, { markDirty }) => {
+    const now = new Date().toISOString();
+    const payload = {
+      label: normLabel,
+      count: parsedRows.length,
+      rows: parsedRows,
+      updatedAt: now,
+    };
+
+    // 1. Save complete list to category DB ({fire/trouble/supervisory}-list)
+    setDocument(db, [docName, "current"], payload, true);
+    setDocument(db, ["panel-lists", docName], payload, true);
+    markDirty();
+
+    // 2. Sync AssetsList and building alarmDetails category totals
+    const assetsList = getAssetsList(db);
+    if (Object.keys(assetsList).length > 0) {
+      const statusKey = statusKeyForCategory(category);
+      applyCategoryListToAssets(
+        assetsList,
+        category,
+        { total: parsedRows.length, list: rawRes },
+        markDirty,
+      );
+
+      const buildingCounts = recountCategoryPerBuilding(assetsList, statusKey);
+      const buildingsWithAssets = collectBuildingsWithAssets(assetsList);
+      updateBuildingCategoryTotal(
+        db,
+        category,
+        buildingCounts,
+        buildingsWithAssets,
+        markDirty,
+      );
+    }
+  });
+
+  serverLog(
+    `[fire-panel] [startupSync] Saving ${docName} to DB complete (${parsedRows.length} items).`,
+  );
 }
 
 export interface PanelListEntry {

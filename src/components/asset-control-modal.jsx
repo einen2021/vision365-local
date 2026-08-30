@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react"
 import { db } from "@/config/firebase"
-import { doc, getDoc, updateDoc } from "firebase/firestore"
+import { doc, getDoc, updateDoc, onSnapshot } from "firebase/firestore"
 import { useToast } from "@/hooks/use-toast"
 import { useFirePanelMonitor } from "@/contexts/AppContext"
 import { useFirePanelStore } from "@/stores/firePanelStore"
@@ -21,13 +21,13 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Loader2, Edit, MapPin, CheckCircle, XCircle, RefreshCcw, Hash, FileText, Save } from "lucide-react"
 import { FirestoreService } from "@/services/firestoreService"
-import { resolveAssetsListDocId, resetSimplexFlag } from "@/lib/assetsListSimplexStatus"
+import { resolveAssetsListDocId } from "@/lib/assetsListSimplexStatus"
 import { clearAllAppCaches } from "@/lib/cacheUtils"
 import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets"
 import { updateAssetInAddressFloorIndex } from "@/lib/assetAddressFloorIndex"
 import { useDeviceEnabledStore } from "@/stores/deviceEnabledStore"
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
-import { useShallow } from "zustand/react/shallow"
+import { normalizeSimplexStatus } from "@/lib/assetFireStatus"
 import {
   getPrimaryStatusTone,
   parsePanelShowResponse,
@@ -136,7 +136,8 @@ export function AssetControlModal({
   const [enabledState, setEnabledState] = useState("")
   const [enabled, setEnabled] = useState(true)
   const [selectedAsset, setSelectedAsset] = useState(null)
-  const [resettingFlag, setResettingFlag] = useState(null)
+  // Live AssetsList simplexStatus (F/T/S) — read directly via onSnapshot, never from the in-memory cache.
+  const [liveSimplexStatus, setLiveSimplexStatus] = useState({ F: 0, T: 0, S: 0 })
 
   // Bump this to ignore late responses from a previous open / asset / refresh.
   const statusRequestIdRef = useRef(0)
@@ -151,7 +152,7 @@ export function AssetControlModal({
       // Do not wait for an in-flight list dump — worker preempts list for show.
       const result = await withMonitorPausedForPriority(async () => {
         return sendPanelCommand(`show ${trimmedAddress}`)
-      })
+      }, `show ${trimmedAddress}`)
       if (!result?.ok) {
         throw new Error(useFirePanelStore.getState().lastError || "Panel show command failed")
       }
@@ -269,8 +270,8 @@ export function AssetControlModal({
     }
   }, [isOpen, assetKey])
 
-  // Hold monitor pause for the whole time this modal is open.
-  // Otherwise CVAL polling resumes between show attempts and corrupts the telnet reply.
+  // Hold monitor pause for the whole time this modal is open, so no other
+  // background panel command interleaves with this modal's show attempts.
   useEffect(() => {
     if (!isOpen) return
 
@@ -427,6 +428,27 @@ export function AssetControlModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: avoid reload on new object refs
   }, [isOpen, assetKey, selectedBuilding, toast])
 
+  // Live F/T/S badge — subscribe directly to the AssetsList doc so values always
+  // reflect the current database state instead of the polled/optimistic store cache.
+  useEffect(() => {
+    if (!isOpen || !selectedAsset?.assetsListId) {
+      setLiveSimplexStatus({ F: 0, T: 0, S: 0 })
+      return
+    }
+
+    const unsubscribe = onSnapshot(
+      doc(db, "AssetsList", selectedAsset.assetsListId),
+      (snap) => {
+        setLiveSimplexStatus(normalizeSimplexStatus(snap.data()?.simplexStatus))
+      },
+      (error) => {
+        console.warn("[asset-control-modal] live simplexStatus listener failed:", error)
+      },
+    )
+
+    return () => unsubscribe()
+  }, [isOpen, selectedAsset?.assetsListId])
+
   // If the panel connects while this modal is already open, fetch status then.
   useEffect(() => {
     const wasConnected = prevConnectedRef.current
@@ -452,7 +474,6 @@ export function AssetControlModal({
       setEnabled(true)
       setSelectedAsset(null)
       setIsLoadingPanelStatus(false)
-      setResettingFlag(null)
     }
   }, [isOpen])
 
@@ -562,50 +583,6 @@ export function AssetControlModal({
         variant: "destructive",
       })
     } finally {
-      setIsUpdatingAsset(false)
-    }
-  }
-
-  const handleResetFlag = async (flag) => {
-    if (!selectedAsset || userRole !== "admin") {
-      toast({
-        title: "Unauthorized",
-        description: "Only admins can reset status flags",
-        variant: "destructive",
-      })
-      return
-    }
-
-    const flagNames = {
-      F: "Fire",
-      T: "Trouble",
-      S: "Supervisory",
-    }
-    const label = flagNames[flag] || flag
-
-    setResettingFlag(flag)
-    setIsUpdatingAsset(true)
-    try {
-      const address = deviceAddress.trim()
-      await resetSimplexFlag(selectedAsset, address, flag)
-
-      toast({
-        title: "Status Reset",
-        description: `${label} status flag (${flag}) reset to 0`,
-      })
-
-      if (address && useFirePanelStore.getState().connected) {
-        void fetchPanelShowStatus(address, selectedAsset)
-      }
-    } catch (error) {
-      console.error(`Error resetting ${label} status:`, error)
-      toast({
-        title: "Reset Failed",
-        description: error.message || `Failed to reset ${label} status`,
-        variant: "destructive",
-      })
-    } finally {
-      setResettingFlag(null)
       setIsUpdatingAsset(false)
     }
   }
@@ -781,30 +758,8 @@ export function AssetControlModal({
     }
   }
 
-  // Resolve F/T/S the same way floor markers do (AssetsList + live panel).
-  const assetIdForStatus =
-    selectedAsset?.buildingAssetId ||
-    selectedAsset?.assetsListId ||
-    selectedAsset?.id ||
-    asset?.buildingAssetId ||
-    asset?.id ||
-    ""
-  const addressForStatus = String(deviceAddress || "").trim()
-
-  // Re-read when cache maps change so values stay live while the modal is open.
-  const simplexFTS = useAssetFireStatusStore(
-    useShallow((s) => {
-      void s.byDeviceAddress
-      void s.byAssetId
-      void s.panelLiveByAddress
-      const status = s.getSimplexStatus(assetIdForStatus, addressForStatus)
-      return {
-        F: Number(status?.F ?? 0),
-        T: Number(status?.T ?? 0),
-        S: Number(status?.S ?? 0),
-      }
-    }),
-  )
+  // Sourced live from the AssetsList doc via onSnapshot (see effect above) — never from cache.
+  const simplexFTS = liveSimplexStatus
 
   if (!asset) return null
 
@@ -955,54 +910,6 @@ export function AssetControlModal({
                       {Number(simplexFTS.S) || 0}
                     </span>
                   </div>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 pt-1">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-8 text-xs border-red-500/30 text-red-700 hover:bg-red-500/10 dark:text-red-300 disabled:opacity-40"
-                    disabled={isUpdatingAsset || Number(simplexFTS.F) !== 1}
-                    onClick={() => handleResetFlag("F")}
-                  >
-                    {resettingFlag === "F" ? (
-                      <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <RefreshCcw className="mr-1 h-3.5 w-3.5 shrink-0" />
-                    )}
-                    <span className="truncate">Reset Fire</span>
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-8 text-xs border-yellow-500/30 text-yellow-700 hover:bg-yellow-500/10 dark:text-yellow-300 disabled:opacity-40"
-                    disabled={isUpdatingAsset || Number(simplexFTS.T) !== 1}
-                    onClick={() => handleResetFlag("T")}
-                  >
-                    {resettingFlag === "T" ? (
-                      <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <RefreshCcw className="mr-1 h-3.5 w-3.5 shrink-0" />
-                    )}
-                    <span className="truncate">Reset Trouble</span>
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-8 text-xs border-purple-500/30 text-purple-700 hover:bg-purple-500/10 dark:text-purple-300 disabled:opacity-40"
-                    disabled={isUpdatingAsset || Number(simplexFTS.S) !== 1}
-                    onClick={() => handleResetFlag("S")}
-                  >
-                    {resettingFlag === "S" ? (
-                      <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <RefreshCcw className="mr-1 h-3.5 w-3.5 shrink-0" />
-                    )}
-                    <span className="truncate">Reset Supervisory</span>
-                  </Button>
                 </div>
               </div>
 

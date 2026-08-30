@@ -1,7 +1,6 @@
 /** Shared constants and parsers for fire-panel CVAL monitoring. */
 
 export const PANEL_STATE_REFRESH_MS = 5000;
-export const MONITOR_INTERVAL_MS = 500;
 /**
  * Soft wait for list f/t/s: keep listening until a real list message dump ends
  * with the panel prompt ("\n -") or _DNE. Soft timer resets on each telnet chunk.
@@ -422,8 +421,13 @@ export function buildPanelAckCommand(label, deviceAddress = null) {
   if (address) {
     return `ack ${type} ${address}`;
   }
-
-  return `ack ${type}`;
+  if(label === "Supervisory"){
+    return   `ack ${type}`;
+  }
+  else {
+    return `ack`;
+  }
+  
 }
 
 export function readSimplexStatus(asset) {

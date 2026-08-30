@@ -116,7 +116,7 @@ export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
     if (Number(current[statusKey]) !== 1) continue;
 
     const next = { ...current, [statusKey]: 0 };
-    patchStoreFromEntry(entry.id, data, next);
+    patchStoreFromEntry(entry.id, data, next, deviceAddress);
     updatePromises.push(
       updateDoc(doc(db, "AssetsList", entry.id), {
         simplexStatus: next,

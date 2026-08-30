@@ -3,11 +3,13 @@ import { db } from "@/config/firebase";
 import { apiUrl } from "@/lib/apiClient";
 import { clearAssetsListAddressIndex } from "@/lib/assetsListSimplexStatus";
 import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets";
+import { withMonitorPaused } from "@/lib/firePanelMonitorSession";
 import {
   clearTempPanelList,
   extractPanelDeviceAddresses,
   parsePanelListResponse,
   readSimplexStatus,
+  simplexKeyForCategoryLabel,
   syncPanelListWithTempArray,
 } from "@/lib/firePanelMonitor";
 import { parseShowCountsResponse } from "@/lib/panelState";
@@ -55,6 +57,47 @@ export async function resetAllAssetsSimplexStatus() {
   await Promise.all(updates);
 }
 
+/**
+ * Reset just one category's flag (F, T, or S) to 0 for every device that has
+ * it set, and clear that category's list doc — a clean slate for the category
+ * whose count just decreased (something cleared off-panel), instead of relying
+ * on the list-diff cache in syncAssetsListWithPanelList to catch it correctly.
+ */
+export async function resetCategorySimplexStatus(label) {
+  const statusKey = simplexKeyForCategoryLabel(label);
+  invalidateAssetsListSnapshotCache();
+  clearPanelListAssetSyncTempArray(label);
+  syncPanelListWithTempArray(label, []);
+
+  const snapshot = await getDocs(collection(db, "AssetsList"));
+  const now = new Date().toISOString();
+
+  const updates = [];
+  for (const docSnap of snapshot.docs) {
+    const data = docSnap.data();
+    const current = readSimplexStatus(data);
+    if (Number(current[statusKey]) !== 1) continue;
+
+    const next = { ...current, [statusKey]: 0 };
+    updates.push(
+      updateDoc(doc(db, "AssetsList", docSnap.id), {
+        simplexStatus: next,
+        updatedAt: now,
+      }).then(() => {
+        useAssetFireStatusStore.getState().patchSimplexStatusFromEntry(
+          docSnap.id,
+          data,
+          next,
+        );
+      }),
+    );
+  }
+
+  await Promise.all(updates);
+  await saveListToCategoryDb(label, []);
+  useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
+}
+
 let workflowInProgress = false;
 
 /**
@@ -70,11 +113,11 @@ export async function handleSystemResetCompleteWorkflow() {
   workflowInProgress = true;
 
   try {
-    const sendCommand = async (command) => {
+    const sendCommand = async (command, timeoutMs = 8000) => {
       const res = await fetch(apiUrl("/api/telnet/fire-panel/command"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command, timeoutMs: 8000 }),
+        body: JSON.stringify({ command, timeoutMs }),
       });
       if (!res.ok) return "";
       const data = await res.json();
@@ -84,75 +127,81 @@ export async function handleSystemResetCompleteWorkflow() {
     // 1. Reset all devices with F or T or S > 0 to 0
     await resetAllAssetsSimplexStatus();
 
-    // 2. Run `list f` and update F value to 1 (or clear the category if the response is empty)
-    try {
-      const resF = await sendCommand("list f", 15000);
-      const parsedRows = parsePanelListResponse(resF);
-      const fireAddresses = extractPanelDeviceAddresses(resF);
-      syncPanelListWithTempArray("Fire", parsedRows);
-      await saveListToCategoryDb("Fire", parsedRows);
-      await syncAssetsListWithPanelList("Fire", fireAddresses);
-    } catch (err) {
-      console.error("[systemResetWorkflow] list f failed:", err);
-      syncPanelListWithTempArray("Fire", []);
-      await saveListToCategoryDb("Fire", []);
-      await syncAssetsListWithPanelList("Fire", []);
-    }
-
-    // 3. Run `list t` and update T value to 1 (or clear the category if the response is empty)
-    try {
-      const resT = await sendCommand("list t", 20000);
-      const parsedRows = parsePanelListResponse(resT);
-      const troubleAddresses = extractPanelDeviceAddresses(resT);
-      syncPanelListWithTempArray("Trouble", parsedRows);
-      await saveListToCategoryDb("Trouble", parsedRows);
-      await syncAssetsListWithPanelList("Trouble", troubleAddresses);
-    } catch (err) {
-      console.error("[systemResetWorkflow] list t failed:", err);
-      syncPanelListWithTempArray("Trouble", []);
-      await saveListToCategoryDb("Trouble", []);
-      await syncAssetsListWithPanelList("Trouble", []);
-    }
-
-    // 4. Run `list s` and update S value to 1 (or clear the category if the response is empty)
-    try {
-      const resS = await sendCommand("list s", 15000);
-      const parsedRows = parsePanelListResponse(resS);
-      const supAddresses = extractPanelDeviceAddresses(resS);
-      syncPanelListWithTempArray("Supervisory", parsedRows);
-      await saveListToCategoryDb("Supervisory", parsedRows);
-      await syncAssetsListWithPanelList("Supervisory", supAddresses);
-    } catch (err) {
-      console.error("[systemResetWorkflow] list s failed:", err);
-      syncPanelListWithTempArray("Supervisory", []);
-      await saveListToCategoryDb("Supervisory", []);
-      await syncAssetsListWithPanelList("Supervisory", []);
-    }
-
-    // 5. Run `show counts` and sync counts to DB & UI
-    try {
-      const resCounts = await sendCommand("show counts");
-      const counts = parseShowCountsResponse(resCounts);
-      if (counts) {
-        await fetch(apiUrl("/api/telnet/fire-panel/panel-state"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            totalFire: counts.totalFire,
-            totalSupervisory: counts.totalSupervisory,
-            totalTrouble: counts.totalTrouble,
-          }),
-        });
-
-        if (typeof window !== "undefined") {
-          window.dispatchEvent(
-            new CustomEvent("vision365:firePanelStateUpdated", { detail: counts }),
-          );
-        }
+    // Pause CVAL polling for the whole list f/t/s + show counts sequence — otherwise
+    // the monitor loop keeps sending its own non-priority commands on the same
+    // single-connection queue, interleaving with these and delaying every step
+    // (and, downstream, how long the Live Fire page's Firestore listener stays stale).
+    await withMonitorPaused(async () => {
+      // 2. Run `list f` and update F value to 1 (or clear the category if the response is empty)
+      try {
+        const resF = await sendCommand("list f", 15000);
+        const parsedRows = parsePanelListResponse(resF);
+        const fireAddresses = extractPanelDeviceAddresses(resF);
+        syncPanelListWithTempArray("Fire", parsedRows);
+        await saveListToCategoryDb("Fire", parsedRows);
+        await syncAssetsListWithPanelList("Fire", fireAddresses);
+      } catch (err) {
+        console.error("[systemResetWorkflow] list f failed:", err);
+        syncPanelListWithTempArray("Fire", []);
+        await saveListToCategoryDb("Fire", []);
+        await syncAssetsListWithPanelList("Fire", []);
       }
-    } catch (err) {
-      console.error("[systemResetWorkflow] show counts failed:", err);
-    }
+
+      // 3. Run `list t` and update T value to 1 (or clear the category if the response is empty)
+      try {
+        const resT = await sendCommand("list t", 20000);
+        const parsedRows = parsePanelListResponse(resT);
+        const troubleAddresses = extractPanelDeviceAddresses(resT);
+        syncPanelListWithTempArray("Trouble", parsedRows);
+        await saveListToCategoryDb("Trouble", parsedRows);
+        await syncAssetsListWithPanelList("Trouble", troubleAddresses);
+      } catch (err) {
+        console.error("[systemResetWorkflow] list t failed:", err);
+        syncPanelListWithTempArray("Trouble", []);
+        await saveListToCategoryDb("Trouble", []);
+        await syncAssetsListWithPanelList("Trouble", []);
+      }
+
+      // 4. Run `list s` and update S value to 1 (or clear the category if the response is empty)
+      try {
+        const resS = await sendCommand("list s", 15000);
+        const parsedRows = parsePanelListResponse(resS);
+        const supAddresses = extractPanelDeviceAddresses(resS);
+        syncPanelListWithTempArray("Supervisory", parsedRows);
+        await saveListToCategoryDb("Supervisory", parsedRows);
+        await syncAssetsListWithPanelList("Supervisory", supAddresses);
+      } catch (err) {
+        console.error("[systemResetWorkflow] list s failed:", err);
+        syncPanelListWithTempArray("Supervisory", []);
+        await saveListToCategoryDb("Supervisory", []);
+        await syncAssetsListWithPanelList("Supervisory", []);
+      }
+
+      // 5. Run `show counts` and sync counts to DB & UI
+      try {
+        const resCounts = await sendCommand("show counts");
+        const counts = parseShowCountsResponse(resCounts);
+        if (counts) {
+          await fetch(apiUrl("/api/telnet/fire-panel/panel-state"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              totalFire: counts.totalFire,
+              totalSupervisory: counts.totalSupervisory,
+              totalTrouble: counts.totalTrouble,
+            }),
+          });
+
+          if (typeof window !== "undefined") {
+            window.dispatchEvent(
+              new CustomEvent("vision365:firePanelStateUpdated", { detail: counts }),
+            );
+          }
+        }
+      } catch (err) {
+        console.error("[systemResetWorkflow] show counts failed:", err);
+      }
+    });
   } catch (error) {
     console.error("[systemResetWorkflow] workflow failed:", error);
   } finally {

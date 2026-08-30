@@ -97,13 +97,12 @@ export function FireAlertModal({ open, onClose }) {
       return;
     }
 
-    setSilenceLoading(true);
+    // setSilenceLoading(true);
     try {
       muteSiren?.();
       await silenceAlarm();
       toast({
         title: "Silence Alarm sent",
-        description: "Silence alarm command sent to the fire panel.",
       });
     } catch (error) {
       toast({
@@ -111,8 +110,6 @@ export function FireAlertModal({ open, onClose }) {
         description: error?.message || "Could not silence the alarm.",
         variant: "destructive",
       });
-    } finally {
-      setSilenceLoading(false);
     }
   };
 

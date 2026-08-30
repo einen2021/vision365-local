@@ -1408,7 +1408,7 @@ export default function AssetsPage() {
     `${asset.id || asset.assetId || asset.buildingAssetId || "unknown"}::${asset.categoryKey || "global"}`
 
   const filteredAssets = useMemo(() => {
-    return existingAssets.filter((asset) => {
+    const filtered = existingAssets.filter((asset) => {
       if (searchTerm) {
         const searchLower = searchTerm.toLowerCase()
         const matchesSearch =
@@ -1429,6 +1429,15 @@ export default function AssetsPage() {
       if (filterSystem !== "all" && asset.system !== filterSystem) return false
 
       return true
+    })
+
+    return filtered.sort((a, b) => {
+      const addrA = resolveAssetDeviceAddress(a) || a.deviceAddress || ""
+      const addrB = resolveAssetDeviceAddress(b) || b.deviceAddress || ""
+      if (!addrA && !addrB) return 0
+      if (!addrA) return 1
+      if (!addrB) return -1
+      return addrA.localeCompare(addrB, undefined, { numeric: true, sensitivity: "base" })
     })
   }, [existingAssets, searchTerm, filterBrand, filterCategory, filterSystem])
 
@@ -3498,7 +3507,6 @@ export default function AssetsPage() {
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">System</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Category</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Device Address</TableHead>
-                              <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Part Number</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Description</TableHead>
                               <TableHead className="px-2 py-1.5 text-right w-10">
                                 <span className="sr-only">Actions</span>
@@ -3510,7 +3518,7 @@ export default function AssetsPage() {
                       <TableBody>
                         {filteredAssets.length === 0 ? (
                           <TableRow>
-                            <TableCell colSpan={isBuildingAsset ? 9 : 9} className="text-center py-8 text-muted-foreground">
+                            <TableCell colSpan={isBuildingAsset ? 9 : 8} className="text-center py-8 text-muted-foreground">
                               No assets found matching your filters
                             </TableCell>
                           </TableRow>
@@ -3700,9 +3708,6 @@ export default function AssetsPage() {
                                     title={resolveAssetDeviceAddress(asset) || asset.deviceAddress || ""}
                                   >
                                     {resolveAssetDeviceAddress(asset) || asset.deviceAddress || "-"}
-                                  </TableCell>
-                                  <TableCell className="px-2 py-1.5 max-w-[140px] truncate" title={asset.partNumber || ""}>
-                                    {asset.partNumber || "-"}
                                   </TableCell>
                                   <TableCell className="px-2 py-1.5 max-w-[200px] truncate" title={asset.description || ""}>
                                     {asset.description || "-"}

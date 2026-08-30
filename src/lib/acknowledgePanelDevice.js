@@ -45,8 +45,11 @@ export async function acknowledgeDevice(label, deviceAddress) {
   const cmd = buildPanelAckCommand(label, address);
 
   // Pause CVAL/list monitoring and send via the priority worker queue.
+  // commandKey = cmd so repeated clicks on the same device while a priority
+  // gate is open (e.g. post-ack list f) coalesce into a single queued run.
   return withMonitorPausedForPriority(() =>
     sendPriorityPanelCommand(cmd, 5000),
+    cmd,
   );
 }
 
@@ -64,5 +67,6 @@ export async function acknowledgeCategory(label) {
   console.log("cmd", cmd);
   return withMonitorPausedForPriority(() =>
     sendPriorityPanelCommand(cmd, 5000),
+    cmd,
   );
 }

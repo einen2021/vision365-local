@@ -1,4 +1,7 @@
 mod commands;
+mod siren;
+#[cfg(windows)]
+mod winaudio;
 
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::{BufRead, BufReader, Write};
@@ -76,6 +79,9 @@ pub fn run() {
             commands::show_notification,
             commands::save_window_state,
             commands::load_window_state,
+            siren::start_fire_siren,
+            siren::stop_fire_siren,
+            siren::play_panel_alert_beep,
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();

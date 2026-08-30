@@ -210,34 +210,25 @@ export function collectDeviceAddressKeys(deviceAddress) {
   const raw = String(deviceAddress || "").trim().toUpperCase();
   if (!raw) return keys;
 
+  // Trailing "-0" (implicit sub-address) is optional on the SAME device, so we
+  // normalize it away — but only within the same panel-prefix scope. A panel
+  // prefix ("2:", "3:", "4:") identifies a physically distinct panel/loop, so
+  // "M4-1-0", "2:M4-1-0", "3:M4-1-0", and "4:M4-1-0" are four different
+  // devices and must never share a cache/match key.
   const addVariations = (val) => {
     const str = String(val || "").trim().toUpperCase();
     if (!str) return;
     keys.add(str);
 
-    const stripped = stripPanelAddressPrefix(str).toUpperCase();
-    if (stripped) {
-      keys.add(stripped);
-      if (/-\d+$/.test(stripped)) {
-        keys.add(stripped.replace(/-\d+$/, ""));
-      }
-      if (/^M\d+-\d+$/i.test(stripped)) {
-        keys.add(`${stripped}-0`);
-      }
-    }
+    const prefixMatch = str.match(/^(\d+:)(.+)$/);
+    const prefix = prefixMatch ? prefixMatch[1] : "";
+    const rest = prefixMatch ? prefixMatch[2] : str;
 
-    if (/^(\d+:)(.+)$/.test(str)) {
-      const match = str.match(/^(\d+:)(.+)$/);
-      if (match) {
-        const prefix = match[1];
-        const rest = match[2];
-        if (/-\d+$/.test(rest)) {
-          keys.add(`${prefix}${rest.replace(/-\d+$/, "")}`);
-        }
-        if (/^M\d+-\d+$/i.test(rest)) {
-          keys.add(`${prefix}${rest}-0`);
-        }
-      }
+    if (/-\d+$/.test(rest)) {
+      keys.add(`${prefix}${rest.replace(/-\d+$/, "")}`);
+    }
+    if (/^M\d+-\d+$/i.test(rest)) {
+      keys.add(`${prefix}${rest}-0`);
     }
   };
 

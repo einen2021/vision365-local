@@ -32,11 +32,18 @@ export function parsePanelShowResponse(text = "") {
   const primaryStatus = matchShowField(raw, "PRIMARY STATUS");
   const enabledState = matchShowField(raw, "ENABLED STATE");
 
-  let enabled = null;
+  const primaryUpper = primaryStatus.toUpperCase();
   const enabledUpper = enabledState.toUpperCase();
-  if (enabledUpper.includes("DISABLED")) {
+
+  // PRIMARY STATUS reports "DISABLE ..." (e.g. DISABLE TROUBLE, DISABLE ALARM) when
+  // the point itself is disabled — treat that the same as ENABLED STATE: DISABLED.
+  const stateIndicatesDisabled = /\bDISABLE/.test(primaryUpper);
+  const stateIndicatesEnabled = /\bENABLE/.test(primaryUpper) && !stateIndicatesDisabled;
+
+  let enabled = null;
+  if (enabledUpper.includes("DISABLED") || stateIndicatesDisabled) {
     enabled = false;
-  } else if (enabledUpper.includes("ENABLED")) {
+  } else if (enabledUpper.includes("ENABLED") || stateIndicatesEnabled) {
     enabled = true;
   }
 

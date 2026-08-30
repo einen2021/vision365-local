@@ -66,7 +66,6 @@ export function FirePanelAckButtons() {
       await acknowledge(label);
       toast({
         title: `${title} sent`,
-        description: "Acknowledge command sent to the fire panel.",
       });
       return true;
     } catch (error) {

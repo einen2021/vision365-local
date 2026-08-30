@@ -22,7 +22,7 @@ import {
 import { cn } from "@/lib/utils";
 import { LIVE_FIRE_ROUTE } from "@/config/live-panel-routes";
 import { startFireAlertSiren } from "@/lib/fireAlertSiren";
-import { acknowledgeCategory } from "@/lib/acknowledgePanelDevice";
+import { acknowledgeCategory, sendPriorityPanelCommand } from "@/lib/acknowledgePanelDevice";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 import { apiUrl } from "@/lib/apiClient";
@@ -32,9 +32,24 @@ import {
   syncFireListAssets,
   syncTroubleListAssets,
   syncSupervisoryListAssets,
+  resetCategorySimplexStatus,
 } from "@/lib/systemResetWorkflow";
+import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
+import { appendLiveLogToCategoryList, saveListToCategoryDb } from "@/lib/recordAlarmHistory";
+import { findAllDeviceAddressesByLocationText } from "@/lib/assetAddressFloorIndex";
+import {
+  LIST_COMMAND_TIMEOUT_MS,
+  getListCmdForLabel,
+  parsePanelListResponse,
+  extractPanelDeviceAddresses,
+  simplexKeyForCategoryLabel,
+} from "@/lib/firePanelMonitor";
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
-import { appendLiveLogToCategoryList } from "@/lib/recordAlarmHistory";
+import {
+  withMonitorPaused,
+  openPriorityGate,
+  closePriorityGate,
+} from "@/lib/firePanelMonitorSession";
 
 const FireAlertContext = createContext();
 
@@ -54,14 +69,14 @@ function FireAlertModalView({
     <Dialog open={open} onOpenChange={(isOpen) => { if (!isOpen) onClose?.(); }}>
       <DialogContent
         className={cn(
-          "gap-0 overflow-hidden border-red-500/60 p-0 shadow-2xl shadow-red-950/40 sm:max-w-[540px]",
+          "flex flex-col gap-0 overflow-hidden border-red-500/60 p-0 shadow-2xl shadow-red-950/40 sm:max-w-[560px] min-h-[480px] max-h-[90vh]",
           "ring-2 ring-red-500/40 ring-offset-2 ring-offset-background",
           "[&>button]:hidden",
         )}
         onPointerDownOutside={(e) => e.preventDefault()}
         onEscapeKeyDown={(e) => e.preventDefault()}
       >
-        <div className="relative overflow-hidden bg-gradient-to-br from-red-700 via-red-600 to-red-700 px-6 py-6 text-white">
+        <div className="relative shrink-0 overflow-hidden bg-gradient-to-br from-red-700 via-red-600 to-red-700 px-7 py-6 text-white">
           <div
             className="pointer-events-none absolute inset-0 opacity-30"
             aria-hidden
@@ -93,62 +108,64 @@ function FireAlertModalView({
           </DialogHeader>
         </div>
 
-        <div className="bg-background px-6 py-6 space-y-4">
-          <div className="flex items-start gap-2 text-red-600 dark:text-red-400">
-            <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5" />
-            <div>
-              <p className="text-xs font-bold uppercase tracking-wide">
-                Live Alarm Notification
-              </p>
-              <p className="text-base font-semibold leading-snug text-foreground">
-                A new fire alarm condition was detected on the panel stream.
-              </p>
-            </div>
-          </div>
-
-          {alarmInfo ? (
-            <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-4 space-y-2 text-left shadow-inner">
-              {alarmInfo.location ? (
-                <div className="flex items-start gap-2 text-foreground font-bold text-sm">
-                  <MapPin className="h-4 w-4 text-red-500 shrink-0 mt-0.5" />
-                  <span>{alarmInfo.location}</span>
-                </div>
-              ) : null}
-
-              <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-muted-foreground pt-1.5 border-t border-red-500/20">
-                {alarmInfo.deviceType ? (
-                  <span className="inline-flex items-center gap-1 font-semibold text-red-600 dark:text-red-400">
-                    <Radio className="h-3 w-3" />
-                    {alarmInfo.deviceType}
-                  </span>
-                ) : null}
-
-                {alarmInfo.deviceAddress ? (
-                  <span className="bg-red-500/20 text-red-700 dark:text-red-300 px-1.5 py-0.5 rounded font-bold">
-                    {alarmInfo.deviceAddress}
-                  </span>
-                ) : null}
-
-                {alarmInfo.panelTime ? (
-                  <span className="text-zinc-500">
-                    • {alarmInfo.panelTime}
-                  </span>
-                ) : null}
+        <div className="bg-background px-7 pt-6 pb-7 space-y-5 overflow-y-auto flex-1 flex flex-col justify-between">
+          <div className="space-y-4">
+            <div className="flex items-start gap-2.5 text-red-600 dark:text-red-400">
+              <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5" />
+              <div>
+                <p className="text-xs font-bold uppercase tracking-wide">
+                  Live Alarm Notification
+                </p>
+                <p className="text-sm font-semibold leading-snug text-foreground">
+                  A new fire alarm condition was detected on the panel stream.
+                </p>
               </div>
             </div>
-          ) : null}
 
-          <div className="pt-2 flex flex-wrap items-center justify-center gap-3">
+            {alarmInfo ? (
+              <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-5 space-y-3.5 text-left shadow-inner min-h-[105px]">
+                {alarmInfo.location ? (
+                  <div className="flex items-start gap-2.5 text-foreground font-bold text-base">
+                    <MapPin className="h-5 w-5 text-red-500 shrink-0 mt-0.5" />
+                    <span className="leading-snug">{alarmInfo.location}</span>
+                  </div>
+                ) : null}
+
+                <div className="flex flex-wrap items-center gap-2.5 text-xs font-mono text-muted-foreground pt-3 border-t border-red-500/20">
+                  {alarmInfo.deviceType ? (
+                    <span className="inline-flex items-center gap-1 font-semibold text-red-600 dark:text-red-400">
+                      <Radio className="h-3.5 w-3.5" />
+                      {alarmInfo.deviceType}
+                    </span>
+                  ) : null}
+
+                  {alarmInfo.deviceAddress ? (
+                    <span className="bg-red-500/20 text-red-700 dark:text-red-300 px-2 py-0.5 rounded font-bold">
+                      {alarmInfo.deviceAddress}
+                    </span>
+                  ) : null}
+
+                  {alarmInfo.panelTime ? (
+                    <span className="text-zinc-500">
+                      • {alarmInfo.panelTime}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="pt-4 flex flex-wrap items-center justify-center gap-3">
             <Button
               type="button"
               variant="destructive"
-              className="min-w-[140px] font-semibold"
+              className="min-w-[140px] h-10 font-semibold shadow-md"
               onClick={onAcknowledge}
               disabled={ackLoading}
             >
               {ackLoading ? (
                 <>
-                  <Loader2 className="h-4 w-4 animate-spin mr-1" />
+                  <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
                   Acknowledging…
                 </>
               ) : (
@@ -158,6 +175,7 @@ function FireAlertModalView({
             <Button
               type="button"
               variant="outline"
+              className="h-10 font-medium"
               onClick={onToggleMute}
               disabled={ackLoading}
               aria-pressed={isMuted}
@@ -165,12 +183,12 @@ function FireAlertModalView({
             >
               {isMuted ? (
                 <>
-                  <VolumeX className="h-4 w-4 mr-1" />
+                  <VolumeX className="h-4 w-4 mr-1.5" />
                   Unmute Siren
                 </>
               ) : (
                 <>
-                  <Volume2 className="h-4 w-4 mr-1" />
+                  <Volume2 className="h-4 w-4 mr-1.5" />
                   Mute Siren
                 </>
               )}
@@ -178,6 +196,7 @@ function FireAlertModalView({
             <Button
               type="button"
               variant="outline"
+              className="h-10 font-medium min-w-[90px]"
               onClick={onClose}
               disabled={ackLoading}
             >
@@ -199,6 +218,12 @@ export function FireAlertProvider({ children }) {
   const [ackLoading, setAckLoading] = useState(false);
   const [activeAlarmInfo, setActiveAlarmInfo] = useState(null);
   const stopSirenRef = useRef(null);
+  // Set per-category when a new message's location text resolves to more
+  // than one AssetsList device — resolved with a `list f/t/s` dump once
+  // that category's acknowledge succeeds (see runPostAckListSync).
+  const ambiguousLocationRef = useRef({ Fire: false, Trouble: false, Supervisory: false });
+  // Last known counts from any "show counts" call — used by the "NORMAL ACKED"
+  // handler to detect a per-category decrease (see fetchAndSyncCounts).
   const previousCountsRef = useRef({ totalFire: 0, totalTrouble: 0, totalSupervisory: 0 });
 
   const showFireAlert = useCallback((alarmInfo = null) => {
@@ -234,7 +259,7 @@ export function FireAlertProvider({ children }) {
     setIsSirenMuted(false);
   }, []);
 
-  const fetchAndSyncCounts = useCallback(async () => {
+  const fetchAndSyncCounts = useCallback(async ({ checkDecrease = false } = {}) => {
     try {
       const cmdUrl = apiUrl("/api/telnet/fire-panel/command");
       const res = await fetch(cmdUrl, {
@@ -247,8 +272,6 @@ export function FireAlertProvider({ children }) {
       const rawText = typeof data === "string" ? data : (data?.response || data?.raw || "");
       const counts = parseShowCountsResponse(rawText);
       if (!counts) return;
-
-      const previous = previousCountsRef.current;
 
       // 1. Save to backend database
       const stateUrl = apiUrl("/api/telnet/fire-panel/panel-state");
@@ -269,17 +292,24 @@ export function FireAlertProvider({ children }) {
         );
       }
 
-      // 3. If a category count decreased (something resolved/acked off-panel),
-      // re-sync that category: run its list command, update {category}-list DB,
-      // and sync device F/T/S status — same as startupListSync, nothing extra.
-      if (counts.totalFire < previous.totalFire) {
-        await syncFireListAssets();
-      }
-      if (counts.totalTrouble < previous.totalTrouble) {
-        await syncTroubleListAssets();
-      }
-      if (counts.totalSupervisory < previous.totalSupervisory) {
-        await syncSupervisoryListAssets();
+      // 3. Only when explicitly asked (the "NORMAL ACKED" handler): if a
+      // category's total decreased since the last known counts, something
+      // cleared off-panel — hard-reset that category's F/T/S flags and list,
+      // then re-list from the panel. No list command otherwise.
+      if (checkDecrease) {
+        const previous = previousCountsRef.current;
+        if (counts.totalFire < previous.totalFire) {
+          await resetCategorySimplexStatus("Fire");
+          await syncFireListAssets();
+        }
+        if (counts.totalTrouble < previous.totalTrouble) {
+          await resetCategorySimplexStatus("Trouble");
+          await syncTroubleListAssets();
+        }
+        if (counts.totalSupervisory < previous.totalSupervisory) {
+          await resetCategorySimplexStatus("Supervisory");
+          await syncSupervisoryListAssets();
+        }
       }
 
       previousCountsRef.current = {
@@ -289,6 +319,57 @@ export function FireAlertProvider({ children }) {
       };
     } catch (err) {
       console.error("[FireModalContext] fetchAndSyncCounts failed:", err);
+    }
+  }, []);
+
+  /**
+   * Runs only when a message in this category had an ambiguous (multi-device)
+   * location AND that category's acknowledge just succeeded. Sends `list f/t/s`,
+   * waits for the full response, saves it to {label}-list so the live page
+   * (which reads that doc via onSnapshot) picks it up, and logs the response.
+   *
+   * Ack/silence/reset/etc. issued while this runs are held behind it (see
+   * openPriorityGate) instead of preempting it — same-command retries coalesce.
+   */
+  const runPostAckListSync = useCallback(async (label) => {
+    if (!ambiguousLocationRef.current[label]) return;
+    ambiguousLocationRef.current[label] = false;
+
+    const listCmd = getListCmdForLabel(label);
+    if (!listCmd) return;
+
+    const gate = openPriorityGate();
+    try {
+      const result = await withMonitorPaused(() =>
+        sendPriorityPanelCommand(listCmd, LIST_COMMAND_TIMEOUT_MS),
+      );
+      const rawText = result?.response ?? "";
+      console.log(
+        `[FireModalContext] post-ack ${listCmd} response (ambiguous location resolved):`,
+        rawText,
+      );
+      const parsedRows = parsePanelListResponse(rawText);
+      await saveListToCategoryDb(label, parsedRows);
+      console.log(
+        `[FireModalContext] ${label.toLowerCase()}-list saved: ${parsedRows.length} row(s)`,
+      );
+
+      // Update each listed device's F/T/S flag in AssetsList (and the live
+      // floor-map marker store) — saving to {label}-list alone does not
+      // touch device status, only the list page's row data.
+      const deviceAddresses = extractPanelDeviceAddresses(rawText);
+      const { updatedCount, clearedCount } = await syncAssetsListWithPanelList(
+        label,
+        deviceAddresses,
+      );
+      console.log(
+        `[FireModalContext] ${label} device status synced → set ${simplexKeyForCategoryLabel(label)}=1: ${updatedCount}, cleared: ${clearedCount}`,
+      );
+      useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
+    } catch (error) {
+      console.error(`[FireModalContext] post-ack ${listCmd} failed:`, error);
+    } finally {
+      closePriorityGate(gate);
     }
   }, []);
 
@@ -308,10 +389,14 @@ export function FireAlertProvider({ children }) {
     closeFireAlertModal();
     router.push(LIVE_FIRE_ROUTE);
 
-    // Run `ack f`, count sync, and `list f` asset updates non-blockingly in background
+    // Run `ack f` and count sync non-blockingly in background. No unconditional
+    // `list f` here — only run one afterward if a fire message this alarm had
+    // an ambiguous (multi-device) location, and only once ack has succeeded.
     void (async () => {
+      let ackSucceeded = false;
       try {
-        await acknowledgeCategory("Fire");
+        await sendPriorityPanelCommand("ack", 2000);
+        ackSucceeded = true;
       } catch (err) {
         console.error("[FireModalContext] ack f failed:", err);
       }
@@ -320,13 +405,12 @@ export function FireAlertProvider({ children }) {
       } catch (err) {
         console.error("[FireModalContext] fetchAndSyncCounts failed:", err);
       }
-      try {
-        await syncFireListAssets();
-      } catch (err) {
-        console.error("[FireModalContext] syncFireListAssets failed:", err);
+
+      if (ackSucceeded) {
+        void runPostAckListSync("Fire");
       }
     })();
-  }, [closeFireAlertModal, fetchAndSyncCounts, muteSiren, router, toast]);
+  }, [closeFireAlertModal, fetchAndSyncCounts, muteSiren, router, runPostAckListSync, toast]);
 
   // Siren runs while alarm is active (even after modal is closed)
   useEffect(() => {
@@ -419,7 +503,9 @@ export function FireAlertProvider({ children }) {
         entry.kind === "reset-aborted" ||
         entry.kind === "reset";
 
-      // If new unacknowledged fire alarm detected -> popup fire modal, append to fire-list, & update device F value to 1!
+      // If new unacknowledged fire alarm detected -> popup fire modal & update device F value to 1!
+      // No fire-list DB write here — the fire-list DB is only ever updated
+      // from handleSystemResetCompleteWorkflow's reset-complete path now.
       if (isFire && !isAck) {
         const fireAddr =
           entry.pointId ||
@@ -435,13 +521,57 @@ export function FireAlertProvider({ children }) {
           raw: entry.raw,
         });
 
+        if (fireAddr) {
+          console.log(`[FireModalContext] Updating F value for fire device: ${fireAddr}`);
+          // Optimistic single-device patch only — this in-memory store update
+          // does not touch the fire-list DB.
+          useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([fireAddr], "F", 1);
+        }
+
+        // Resolve the device address(es) from the fire message's location text
+        // (via AssetsList) and log it as a `list f` dump row would read.
+        const fireLocation = entry.location || "";
+        const fireDeviceType =
+          entry.device || entry.deviceType || entry.description || "";
         void (async () => {
-          await appendLiveLogToCategoryList("Fire", entry);
-          if (fireAddr) {
-            console.log(`[FireModalContext] Updating F value for fire device: ${fireAddr}`);
-            await syncAssetsListWithPanelList("Fire", [fireAddr]);
+          try {
+            const resolvedAddresses = await findAllDeviceAddressesByLocationText(fireLocation);
+            if (resolvedAddresses.length > 1) {
+              ambiguousLocationRef.current.Fire = true;
+              console.log(
+                "[FireModalContext] fire location matches multiple devices — fetching list f now:",
+                fireLocation,
+                resolvedAddresses,
+              );
+              try {
+                const result = await withMonitorPaused(() =>
+                  sendPriorityPanelCommand("list f", LIST_COMMAND_TIMEOUT_MS),
+                );
+                const rawListText = result?.response ?? "";
+                const parsedRows = parsePanelListResponse(rawListText);
+                await saveListToCategoryDb("Fire", parsedRows);
+                console.log(
+                  `[FireModalContext] fire-list saved from list f: ${parsedRows.length} row(s)`,
+                );
+              } catch (err) {
+                console.error("[FireModalContext] list f failed:", err);
+              }
+            } else {
+              const resolvedAddress = resolvedAddresses[0] || "";
+              if (!resolvedAddress) return;
+              console.log(fireLocation, fireDeviceType);
+              const listFItem = [resolvedAddress, fireLocation, fireDeviceType, "FIRE*"]
+                .filter(Boolean)
+                .join("   ");
+              console.log("[FireModalContext] new fire as list f item:", listFItem);
+              const parsedRows = parsePanelListResponse(listFItem);
+              await saveListToCategoryDb("Fire", parsedRows);
+            }
+
+
+          } catch (error) {
+            console.error("[FireModalContext] findAllDeviceAddressesByLocationText failed:", error);
           }
-          await syncFireListAssets();
         })();
       }
 
@@ -461,11 +591,32 @@ export function FireAlertProvider({ children }) {
         }
 
         void (async () => {
-          await appendLiveLogToCategoryList("Trouble", entry);
           if (trblAddr) {
-            await syncAssetsListWithPanelList("Trouble", [trblAddr]);
+            await appendLiveLogToCategoryList("Trouble", entry);
+            // Optimistic single-device patch only — see Fire branch above for why
+            // syncAssetsListWithPanelList cannot be called with just this one address.
+            useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([trblAddr], "T", 1);
           }
           await syncTroubleListAssets();
+        })();
+
+        // Same ambiguous-location detection as Fire — resolved with a real
+        // `list t` once this trouble alert is acknowledged.
+        const troubleLocation = entry.location || "";
+        void (async () => {
+          try {
+            const resolvedAddresses = await findAllDeviceAddressesByLocationText(troubleLocation);
+            if (resolvedAddresses.length > 1) {
+              ambiguousLocationRef.current.Trouble = true;
+              console.log(
+                "[FireModalContext] trouble location matches multiple devices — will re-list after ack:",
+                troubleLocation,
+                resolvedAddresses,
+              );
+            }
+          } catch (error) {
+            console.error("[FireModalContext] findAllDeviceAddressesByLocationText failed:", error);
+          }
         })();
       }
 
@@ -482,11 +633,32 @@ export function FireAlertProvider({ children }) {
         }
 
         void (async () => {
-          await appendLiveLogToCategoryList("Supervisory", entry);
           if (supAddr) {
-            await syncAssetsListWithPanelList("Supervisory", [supAddr]);
+            await appendLiveLogToCategoryList("Supervisory", entry);
+            // Optimistic single-device patch only — see Fire branch above for why
+            // syncAssetsListWithPanelList cannot be called with just this one address.
+            useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([supAddr], "S", 1);
           }
           await syncSupervisoryListAssets();
+        })();
+
+        // Same ambiguous-location detection as Fire — resolved with a real
+        // `list s` once this supervisory alert is acknowledged.
+        const supervisoryLocation = entry.location || "";
+        void (async () => {
+          try {
+            const resolvedAddresses = await findAllDeviceAddressesByLocationText(supervisoryLocation);
+            if (resolvedAddresses.length > 1) {
+              ambiguousLocationRef.current.Supervisory = true;
+              console.log(
+                "[FireModalContext] supervisory location matches multiple devices — will re-list after ack:",
+                supervisoryLocation,
+                resolvedAddresses,
+              );
+            }
+          } catch (error) {
+            console.error("[FireModalContext] findAllDeviceAddressesByLocationText failed:", error);
+          }
         })();
       }
 
@@ -497,17 +669,27 @@ export function FireAlertProvider({ children }) {
         return;
       }
 
-      // If fire acknowledged log arrives: run show counts then list f once, and update F value to 1 for matched devices
+      // If fire acknowledged log arrives: run show counts only.
+      // No list f here — the fire list is only refreshed via
+      // handleSystemResetCompleteWorkflow's reset-complete path.
       const isFireAck =
         entry.kind === "fire-acknowledged" ||
         /FIRE\s+ALARM\s+ACKED/i.test(statusText) ||
         /FIRE\s+ALARM\s+ACKED/i.test(rawText);
 
       if (isFireAck) {
-        void (async () => {
-          await fetchAndSyncCounts();
-          await syncFireListAssets();
-        })();
+        void fetchAndSyncCounts();
+        return;
+      }
+
+      // If the panel reports "NORMAL ACKED": something was acknowledged/cleared
+      // off-panel. Check show counts and, per category, if that category's
+      // total decreased, hard-reset its F/T/S flags + list and re-list it.
+      const isNormalAcked =
+        statusText === "NORMAL ACKED" || /NORMAL\s+ACKED/i.test(rawText);
+
+      if (isNormalAcked) {
+        void fetchAndSyncCounts({ checkDecrease: true });
         return;
       }
 
@@ -577,6 +759,7 @@ export function FireAlertProvider({ children }) {
       muteSiren,
       unmuteSiren,
       activeAlarmInfo,
+      runPostAckListSync,
     }),
     [
       isFireAlertOpen,
@@ -589,6 +772,7 @@ export function FireAlertProvider({ children }) {
       muteSiren,
       unmuteSiren,
       activeAlarmInfo,
+      runPostAckListSync,
     ],
   );
 

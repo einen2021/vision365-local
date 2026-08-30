@@ -93,7 +93,7 @@ function LivePanelAlertModalView({
     <Dialog open={open}>
       <DialogContent
         className={cn(
-          "gap-0 overflow-hidden p-0 shadow-2xl sm:max-w-[500px]",
+          "flex flex-col gap-0 overflow-hidden p-0 shadow-2xl sm:max-w-[500px] max-h-[90vh]",
           "ring-2 ring-offset-2 ring-offset-background",
           config.borderClass,
           "[&>button]:hidden",
@@ -101,7 +101,7 @@ function LivePanelAlertModalView({
         onPointerDownOutside={(e) => e.preventDefault()}
         onEscapeKeyDown={(e) => e.preventDefault()}
       >
-        <div className={cn("relative overflow-hidden px-6 py-5", config.headerClass)}>
+        <div className={cn("relative shrink-0 overflow-hidden px-6 py-5", config.headerClass)}>
           <DialogHeader className="relative space-y-0 text-left">
             <div className="flex items-center gap-4">
               <div className="relative flex h-14 w-14 shrink-0 items-center justify-center">
@@ -201,7 +201,7 @@ export function LivePanelAlertProvider({ children }) {
   const router = useRouter();
   const pathname = usePathname();
   const { toast } = useToast();
-  const { isAlarmActive } = useFireAlert();
+  const { isAlarmActive, runPostAckListSync } = useFireAlert();
   const troubleModalEnabled = usePanelAlertSettingsStore((s) => s.troubleModalEnabled);
   const supervisoryModalEnabled = usePanelAlertSettingsStore(
     (s) => s.supervisoryModalEnabled,
@@ -343,6 +343,10 @@ export function LivePanelAlertProvider({ children }) {
         silenceSupervisoryAlertBeep();
       }
 
+      // Only run once ack has actually succeeded. Non-blocking — same pattern
+      // as the Fire modal's post-ack list sync, for an ambiguous location.
+      void runPostAckListSync?.(openLabel);
+
       closeAlert();
     } catch (error) {
       toast({
@@ -353,7 +357,7 @@ export function LivePanelAlertProvider({ children }) {
     } finally {
       setAckLoading(false);
     }
-  }, [closeAlert, openLabel, toast]);
+  }, [closeAlert, openLabel, runPostAckListSync, toast]);
 
   useEffect(() => {
     if (!openLabel) return;

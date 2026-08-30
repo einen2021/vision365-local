@@ -642,6 +642,35 @@ function processNextCommand() {
   }
 }
 
+/**
+ * Ack/silence commands must reach the panel immediately — waiting behind a
+ * slow in-flight command (e.g. a hundreds-of-rows "list" dump) would delay a
+ * life-safety acknowledgement by many seconds. Cancel whatever is currently
+ * active so the priority command can be sent right away; the cancelled
+ * command's caller gets a "deferred for priority command" error and can
+ * retry on its own next cycle instead of blocking the ack.
+ */
+function cancelActiveCommandForPriority() {
+  if (!activeCommand) return;
+  const cmd = activeCommand;
+  activeCommand = null;
+
+  if (cmd.timeoutTimer) clearTimeout(cmd.timeoutTimer);
+  if (cmd.silenceTimer) clearTimeout(cmd.silenceTimer);
+
+  // Unblock streaming callers (list commands) waiting on a final chunk.
+  if (cmd.command.toLowerCase().startsWith("list")) {
+    post({ type: "chunk", id: cmd.id, response: cmd.buffer, done: true });
+  }
+
+  post({
+    type: "result",
+    id: cmd.id,
+    ok: false,
+    error: `Command deferred for priority command: ${cmd.command}`,
+  });
+}
+
 function executeCommand(msg: Extract<IncomingMessage, { type: "command" }>) {
   if (!isSocketLive(socket)) {
     post({
@@ -959,12 +988,10 @@ parentPort?.on("message", (msg: IncomingMessage) => {
 
   if (msg.type === "command") {
     if (msg.priority) {
-      // Priority commands (ack/silence) jump to front of queue or execute immediately
-      if (!activeCommand) {
-        executeCommand(msg);
-      } else {
-        commandQueue.unshift({ msg });
-      }
+      // Priority commands (ack/silence) must run now — stop whatever else is
+      // in flight instead of waiting behind it.
+      cancelActiveCommandForPriority();
+      executeCommand(msg);
     } else {
       if (!activeCommand) {
         executeCommand(msg);

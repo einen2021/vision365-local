@@ -1,9 +1,12 @@
 import { create } from "zustand";
-import { stripPanelAddressPrefix } from "@/lib/simplexDeviceAddress";
 
-/** Normalize panel addresses so `2:M1-2-0` and `M1-2-0` share one key. */
+/**
+ * Normalize a panel address into a store key. Keeps the panel prefix intact —
+ * "2:M1-2-0", "3:M1-2-0", and unprefixed "M1-2-0" are different physical
+ * devices and must never share an enabled/disabled key.
+ */
 export function normalizeDeviceAddressKey(address) {
-  return stripPanelAddressPrefix(address).toUpperCase();
+  return String(address || "").trim().toUpperCase();
 }
 
 export const useDeviceEnabledStore = create((set, get) => ({

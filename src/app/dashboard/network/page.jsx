@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { AppSidebar } from "@/components/app-sidebar";
 import {
   SidebarProvider,
@@ -20,7 +20,6 @@ import {
   AlertTriangle,
   Eye,
   Unplug,
-  Radio,
   Terminal,
   PauseCircle,
   PlayCircle,
@@ -29,9 +28,11 @@ import {
 import { usePageAuth } from "@/hooks/usePageAuth";
 import { useToast } from "@/hooks/use-toast";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
+import { useFireAlert } from "@/contexts/FireModalContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { DashboardTopBar, DashboardPageContent } from "@/components/dashboard-header";
 import { apiUrl } from "@/lib/apiClient";
+import { getStoredSessionUser } from "@/lib/sessionUser";
 
 const COMMAND_PLACEHOLDER = "cshow a0 cval";
 
@@ -358,16 +359,27 @@ function PanelLogConsole({ connected }) {
 // Page
 // ---------------------------------------------------------------------------
 export default function NetworkTelnetPage() {
-  const { isReady } = usePageAuth({ redirectIfLoggedOut: true });
+  const { isReady, role, userRole, user } = usePageAuth({ redirectIfLoggedOut: true });
   const { toast } = useToast();
-  const {
-    firePanelMonitoring,
-    firePanelMonitorLogs,
-    firePanelState,
-    firePanelStateLoading,
-    toggleFirePanelMonitoring,
-    stopFirePanelMonitoring,
-  } = useFirePanelMonitor();
+  const { showFireAlert } = useFireAlert();
+  const { firePanelState, firePanelStateLoading } = useFirePanelMonitor();
+
+  const isAdmin = useMemo(() => {
+    const session = getStoredSessionUser();
+    const r = String(role || userRole || user?.role || session?.role || "").toLowerCase();
+    const d = String(user?.designation || session?.designation || "").toLowerCase();
+    return r === "admin" || d === "admin" || d === "administrator";
+  }, [role, userRole, user]);
+
+  const handleSimulateFire = () => {
+    showFireAlert({
+      location: "Simulated Fire Alarm (test)",
+      deviceType: "Test Device",
+      deviceAddress: "SIM-TEST",
+      panelTime: new Date().toLocaleString(),
+      raw: "SIMULATED FIRE ALARM",
+    });
+  };
 
   const host = useFirePanelStore((s) => s.host);
   const port = useFirePanelStore((s) => s.port);
@@ -383,17 +395,6 @@ export default function NetworkTelnetPage() {
   const sendCommand = useFirePanelStore((s) => s.sendCommand);
 
   const [command, setCommand] = useState("");
-
-  const handleMonitorData = () => {
-    const result = toggleFirePanelMonitoring();
-    if (!result.ok && result.reason === "not_connected") {
-      toast({
-        title: "Not connected",
-        description: "Connect to the panel first",
-        variant: "destructive",
-      });
-    }
-  };
 
   const displayTotals = {
     fire: firePanelState?.totalFire ?? 0,
@@ -415,7 +416,6 @@ export default function NetworkTelnetPage() {
   };
 
   const handleDisconnect = async () => {
-    stopFirePanelMonitoring();
     const result = await disconnect();
     if (result.ok) {
       toast({ title: "Disconnected", description: "Session closed" });
@@ -452,14 +452,22 @@ export default function NetworkTelnetPage() {
         <DashboardTopBar headerClassName="flex min-h-16 shrink-0 items-center gap-3 py-2 px-4" />
 
         <DashboardPageContent className="gap-4 p-4 md:p-6">
-          <div className="flex items-center gap-2">
-            <Network className="h-6 w-6" />
-            <div>
-              <h1 className="text-2xl font-semibold">Fire Panel Network</h1>
-              <p className="text-sm text-muted-foreground">
-                Connect to the panel and stream live data
-              </p>
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Network className="h-6 w-6" />
+              <div>
+                <h1 className="text-2xl font-semibold">Fire Panel Network</h1>
+                <p className="text-sm text-muted-foreground">
+                  Connect to the panel and stream live data
+                </p>
+              </div>
             </div>
+            {isAdmin ? (
+              <Button variant="destructive" size="sm" onClick={handleSimulateFire}>
+                <Flame className="mr-2 h-4 w-4" />
+                Simulate Fire
+              </Button>
+            ) : null}
           </div>
 
           <div className="grid gap-4 lg:grid-cols-3">
@@ -514,27 +522,15 @@ export default function NetworkTelnetPage() {
                     )}
                   </Button>
                 ) : (
-                  <>
-                    <Button
-                      className="w-full"
-                      type="button"
-                      variant={firePanelMonitoring ? "outline" : "default"}
-                      onClick={handleMonitorData}
-                      disabled={loading}
-                    >
-                      <Radio className="mr-2 h-4 w-4" />
-                      {firePanelMonitoring ? "Stop Monitoring" : "Monitor Data"}
-                    </Button>
-                    <Button
-                      variant="destructive"
-                      className="w-full"
-                      onClick={handleDisconnect}
-                      disabled={loading}
-                    >
-                      <Unplug className="mr-2 h-4 w-4" />
-                      Disconnect
-                    </Button>
-                  </>
+                  <Button
+                    variant="destructive"
+                    className="w-full"
+                    onClick={handleDisconnect}
+                    disabled={loading}
+                  >
+                    <Unplug className="mr-2 h-4 w-4" />
+                    Disconnect
+                  </Button>
                 )}
 
                 {isConnected && connectedAt ? (

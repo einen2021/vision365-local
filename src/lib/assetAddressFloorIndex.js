@@ -192,6 +192,92 @@ export function extractFloorDetailsFromAsset(asset = {}, docId = "") {
   };
 }
 
+/** Uppercase, whitespace-collapsed comparison key for panel location text. */
+function normalizeLocationText(value) {
+  return String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+/**
+ * Find every AssetsList doc whose deviceLocation / deviceDescription matches a
+ * fire-panel-printed location string (e.g. "SUB BS CORRIDOR COS 21 SB/L1/2").
+ * More than one match means the location text is ambiguous (shared by
+ * multiple devices) — callers that only need the first match should prefer
+ * findAssetsListDocByLocationText.
+ * Returns [{ id, data }].
+ */
+export async function findAllAssetsListDocsByLocationText(locationText) {
+  const target = normalizeLocationText(locationText);
+  if (!target) return [];
+
+  const snapshot = await getAssetsListSnapshot(db);
+  const matches = [];
+  for (const docSnap of snapshot.docs) {
+    const data = docSnap.data();
+    const candidates = [data.deviceLocation, data.deviceDescription, data.description];
+    const matched = candidates.some(
+      (candidate) => normalizeLocationText(candidate) === target,
+    );
+    if (matched) matches.push({ id: docSnap.id, data });
+  }
+
+  return matches;
+}
+
+/**
+ * Find the AssetsList doc whose deviceLocation / deviceDescription matches a
+ * fire-panel-printed location string (e.g. "SUB BS CORRIDOR COS 21 SB/L1/2").
+ * Returns { id, data } or null.
+ */
+export async function findAssetsListDocByLocationText(locationText) {
+  const matches = await findAllAssetsListDocsByLocationText(locationText);
+  return matches[0] || null;
+}
+
+/**
+ * Match a fire-panel-printed location string against AssetsList and return the
+ * matched asset's device address, or "" when nothing matches.
+ */
+export async function findDeviceAddressByLocationText(locationText) {
+  const match = await findAssetsListDocByLocationText(locationText);
+  if (!match) return "";
+  return resolveAssetDeviceAddress(match.data) || match.data.deviceAddress || match.id || "";
+}
+
+/**
+ * Match a fire-panel-printed location string against AssetsList and return
+ * every matching device address (deduplicated). More than one entry means
+ * the location text is shared by multiple devices — ambiguous.
+ */
+export async function findAllDeviceAddressesByLocationText(locationText) {
+  const matches = await findAllAssetsListDocsByLocationText(locationText);
+  const addresses = [];
+  const seen = new Set();
+  for (const match of matches) {
+    const address =
+      resolveAssetDeviceAddress(match.data) || match.data.deviceAddress || match.id || "";
+    if (address && !seen.has(address)) {
+      seen.add(address);
+      addresses.push(address);
+    }
+  }
+  return addresses;
+}
+
+/**
+ * Match a fire-panel-printed location string against AssetsList and return the
+ * matched asset's floor-plan placement details (building, floor, section,
+ * subsection, etc.), or null when nothing matches / the asset isn't placed.
+ */
+export async function findFloorDetailsByLocationText(locationText) {
+  const match = await findAssetsListDocByLocationText(locationText);
+  if (!match) return null;
+  return extractFloorDetailsFromAsset(match.data, match.id);
+}
+
 /**
  * Update an asset's location or description in the address → floor details cache in-place.
  */

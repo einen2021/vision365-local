@@ -15,7 +15,7 @@
     "desktop:dev": "npm run desktop:worker:build && concurrently -k -n next,api -c blue,green \"npm run desktop:dev:frontend\" \"npx tsx desktop-server/src/index.ts\"",
     "desktop:build:frontend": "node scripts/desktop-build-frontend.mjs",
     "desktop:build": "npm run desktop:icons && npm run desktop:server:pkg && npm run desktop:build:frontend && cd src-tauri && npx tauri build",
-    "desktop:icons": "cd src-tauri && npx tauri icon ../public/logo.png",
+    "desktop:icons": "node scripts/desktop-generate-icons.mjs",
     "desktop:build:windows": "scripts\\desktop-build-windows.cmd",
     "desktop:build:macos": "npm run desktop:server:build && npm run desktop:build:frontend && cd src-tauri && npx tauri build --target aarch64-apple-darwin",
     "desktop:build:linux": "npm run desktop:server:build && npm run desktop:build:frontend && cd src-tauri && npx tauri build --target x86_64-unknown-linux-gnu",

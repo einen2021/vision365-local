@@ -1,11 +1,9 @@
 "use client";
 
 import { Wifi, WifiOff } from "lucide-react";
-import { useFirePanelMonitor } from "@/contexts/AppContext";
 
 /**
- * Live data status — Online when fire-panel monitoring is active, otherwise Offline.
- * Optional building-level Live/Polling when monitoring is off (floor map pages).
+ * Live data status — Live/Polling per connectionType, otherwise Offline.
  */
 export function MonitoringLiveStatus({
   lastUpdate = null,
@@ -13,33 +11,12 @@ export function MonitoringLiveStatus({
   isConnected = false,
   className = "",
 }) {
-  const { firePanelMonitoring, firePanelState } = useFirePanelMonitor();
-  const lastPanelSync = firePanelState?.lastPanelSync;
-
   const updatedAt =
-    firePanelMonitoring && lastPanelSync
-      ? new Date(lastPanelSync)
-      : lastUpdate instanceof Date
-        ? lastUpdate
-        : lastUpdate
-          ? new Date(lastUpdate)
-          : null;
-
-  if (firePanelMonitoring) {
-    return (
-      <div className={`flex items-center gap-4 ${className}`.trim()}>
-        <div className="flex items-center gap-2 text-green-600">
-          <Wifi className="h-4 w-4" />
-          <span className="text-sm font-medium">Online</span>
-        </div>
-        {updatedAt ? (
-          <span className="text-xs text-muted-foreground">
-            Updated: {updatedAt.toLocaleTimeString()}
-          </span>
-        ) : null}
-      </div>
-    );
-  }
+    lastUpdate instanceof Date
+      ? lastUpdate
+      : lastUpdate
+        ? new Date(lastUpdate)
+        : null;
 
   if (connectionType === "sse" && isConnected) {
     return (

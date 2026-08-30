@@ -1,6 +1,6 @@
 /** Repeating panel alert sound for trouble / supervisory increases. */
 
-import { resolvePublicAssetUrl } from "@/lib/platform";
+import { isDesktop, resolvePublicAssetUrl } from "@/lib/platform";
 
 const BEEP_INTERVAL_MS = 2800;
 const BEEP_SRC = "/beep.mp3";
@@ -18,14 +18,38 @@ function createPanelAlertAudio() {
   return audio;
 }
 
-/** Play the custom panel alert sound once. */
+/**
+ * Play the custom panel alert sound once.
+ *
+ * On desktop this plays natively via the Tauri backend (rodio/cpal) instead
+ * of an HTML5 <audio> element, so it isn't subject to the webview's autoplay
+ * policy. Falls back to an HTML5 Audio element on web.
+ */
 export function playPanelAlertBeep() {
+  if (isDesktop()) {
+    void import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke("play_panel_alert_beep"))
+      .catch((err) => {
+        console.error("[troubleAlertBeep] play_panel_alert_beep failed:", err);
+      });
+    return;
+  }
+
   const audio = createPanelAlertAudio();
   if (!audio) return;
 
-  void audio.play().catch((err) => {
-    console.error("[troubleAlertBeep] audio.play() failed:", err);
-  });
+  // Webviews block unmuted autoplay outside a user gesture. Starting muted
+  // is always allowed; unmuting right after playback begins keeps the beep
+  // audible without needing a fresh gesture.
+  audio.muted = true;
+  void audio
+    .play()
+    .then(() => {
+      audio.muted = false;
+    })
+    .catch((err) => {
+      console.error("[troubleAlertBeep] audio.play() failed:", err);
+    });
 }
 
 /** @deprecated Use playPanelAlertBeep */

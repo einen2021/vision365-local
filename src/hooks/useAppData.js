@@ -19,13 +19,9 @@ export function useAppData(_options = {}) {
   const scopedCommunities = ctx.getScopedCommunities();
 
   const {
-    firePanelMonitoring: _fm,
     firePanelMonitorLogs: _fml,
     firePanelState: _fps,
     firePanelStateLoading: _fpsl,
-    startFirePanelMonitoring: _sfm,
-    stopFirePanelMonitoring: _stopfm,
-    toggleFirePanelMonitoring: _tfm,
     fetchFirePanelState: _ffps,
     ...appData
   } = ctx;

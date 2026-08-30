@@ -13,15 +13,22 @@ import {
 } from "@/lib/apiClient";
 import { useStartupProgressStore } from "@/stores/startupProgressStore";
 
+/** Consecutive telnet connect attempts before giving up and alerting the user. */
+const MAX_PANEL_CONNECT_ATTEMPTS = 3;
+
 /**
  * Runs after the desktop DB/API is confirmed ready:
- * 1. Connects to the fire panel (step 6).
+ * 1. Connects to the fire panel (step 6), retrying up to
+ *    MAX_PANEL_CONNECT_ATTEMPTS times before giving up.
  * 2. Runs the full startup list sync (steps 7-11) in the background — querying counts,
  *    fetching & confirming lists, saving all data to DB, syncing assets,
  *    and recording to history.
  * 3. Step 12: All data saved -> closes splash screen.
+ *
+ * @param {() => void} [onConnectFailed] - Called instead of silently continuing
+ *   when the panel is still unreachable after all retry attempts.
  */
-async function runPanelStartupSync() {
+async function runPanelStartupSync(onConnectFailed) {
   const setProgress = useStartupProgressStore.getState().setProgress;
   setProgress({
     step: 6,
@@ -32,9 +39,28 @@ async function runPanelStartupSync() {
 
   try {
     const { useFirePanelStore } = await import("@/stores/firePanelStore");
-    const connectPromise = useFirePanelStore.getState().ensureConnected();
-    const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(false), 8000));
-    const connected = await Promise.race([connectPromise, timeoutPromise]);
+
+    let connected = false;
+    for (let attempt = 1; attempt <= MAX_PANEL_CONNECT_ATTEMPTS; attempt++) {
+      setProgress({
+        step: 6,
+        total: 12,
+        percent: 50,
+        message:
+          attempt === 1
+            ? "Connecting to fire panel..."
+            : `Connecting to fire panel (attempt ${attempt}/${MAX_PANEL_CONNECT_ATTEMPTS})...`,
+      });
+
+      const connectPromise = useFirePanelStore.getState().ensureConnected();
+      const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(false), 8000));
+      connected = await Promise.race([connectPromise, timeoutPromise]);
+      if (connected) break;
+
+      if (attempt < MAX_PANEL_CONNECT_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
 
     if (connected) {
       setProgress({
@@ -47,7 +73,13 @@ async function runPanelStartupSync() {
       const { runStartupListSync } = await import("@/lib/startupListSync");
       await runStartupListSync();
     } else {
-      console.log("[DesktopProvider] Fire panel offline or unreachable; continuing startup.");
+      console.log(
+        `[DesktopProvider] Fire panel offline or unreachable after ${MAX_PANEL_CONNECT_ATTEMPTS} attempts.`,
+      );
+      if (typeof onConnectFailed === "function") {
+        onConnectFailed();
+        return;
+      }
       setProgress({
         step: 12,
         total: 12,
@@ -71,6 +103,7 @@ async function runPanelStartupSync() {
 export function DesktopProvider({ children }) {
   const [errorMsg, setErrorMsg] = useState("");
   const [logHint, setLogHint] = useState("");
+  const [panelConnectFailed, setPanelConnectFailed] = useState(false);
   const { step, total, percent, message, isSplashOpen } = useStartupProgressStore();
 
   useEffect(() => {
@@ -81,7 +114,7 @@ export function DesktopProvider({ children }) {
     if (!isTauri) {
       primeAssetUrlResolver();
       // On web, run background auto-connect & list sync then close splash
-      runPanelStartupSync();
+      runPanelStartupSync(() => setPanelConnectFailed(true));
       return;
     }
 
@@ -140,7 +173,7 @@ export function DesktopProvider({ children }) {
 
         const ready = await invoke("is_db_ready");
         if (ready === true) {
-          await runPanelStartupSync();
+          await runPanelStartupSync(() => setPanelConnectFailed(true));
           return;
         }
 
@@ -153,7 +186,7 @@ export function DesktopProvider({ children }) {
 
         await waitForDesktopApi(90000);
 
-        await runPanelStartupSync();
+        await runPanelStartupSync(() => setPanelConnectFailed(true));
       } catch (err) {
         console.error("[DesktopProvider]", err);
         try {
@@ -179,7 +212,7 @@ export function DesktopProvider({ children }) {
       {children}
 
       {/* Splash Screen overlay on top while auto-connecting and syncing data */}
-      {isSplashOpen && !errorMsg ? (
+      {isSplashOpen && !errorMsg && !panelConnectFailed ? (
         <div className="fixed inset-0 z-[99999] flex min-h-screen flex-col items-center justify-center gap-6 bg-background px-6">
           <Vision365Logo className="h-20 w-20" />
           <Loader2 className="h-10 w-10 animate-spin text-primary" />
@@ -218,6 +251,23 @@ export function DesktopProvider({ children }) {
             onClick={() => window.location.reload()}
           >
             Retry
+          </button>
+        </div>
+      ) : null}
+
+      {/* Fire panel unreachable after all startup connect retries */}
+      {panelConnectFailed ? (
+        <div className="fixed inset-0 z-[99999] flex min-h-screen flex-col items-center justify-center gap-4 bg-background p-8">
+          <p className="text-lg font-semibold text-destructive">Fire Panel Not Connected</p>
+          <p className="max-w-lg text-center text-sm text-muted-foreground">
+            Cannot connect to panel, ensure it&apos;s connected!
+          </p>
+          <button
+            type="button"
+            className="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground"
+            onClick={() => window.location.reload()}
+          >
+            Restart App
           </button>
         </div>
       ) : null}

@@ -1,19 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { Loader2, Radio, RefreshCcw, Unplug, VolumeX, Wifi } from "lucide-react";
+import { Loader2, RefreshCcw, Unplug, VolumeX, Wifi } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
@@ -27,15 +17,13 @@ const STATUS_BADGE_CLASS =
 
 /** Fire panel header actions shown on every dashboard page. */
 export function FirePanelStatusBadges() {
-  const { silenceAlarm, systemReset, firePanelMonitoring } = useFirePanelMonitor();
+  const { silenceAlarm, systemReset } = useFirePanelMonitor();
   const connected = useFirePanelStore((s) => s.connected);
   const loading = useFirePanelStore((s) => s.loading);
   const connectedHost = useFirePanelStore((s) => s.connectedHost);
   const connectedPort = useFirePanelStore((s) => s.connectedPort);
   const { toast } = useToast();
   const [silencing, setSilencing] = useState(false);
-  const [isSystemResetting, setIsSystemResetting] = useState(false);
-  const [systemResetDialogOpen, setSystemResetDialogOpen] = useState(false);
 
   const handleSilenceAlarm = async () => {
     if (!connected) {
@@ -52,7 +40,6 @@ export function FirePanelStatusBadges() {
       await silenceAlarm();
       toast({
         title: "Silence alarm sent",
-        description: "Silence command sent to the fire panel.",
       });
     } catch (error) {
       toast({
@@ -75,10 +62,8 @@ export function FirePanelStatusBadges() {
       return;
     }
 
-    setIsSystemResetting(true);
     try {
       await systemReset();
-      setSystemResetDialogOpen(false);
       toast({
         title: "System reset successful",
         description:
@@ -91,8 +76,6 @@ export function FirePanelStatusBadges() {
         description: error?.message || "Could not reset asset statuses.",
         variant: "destructive",
       });
-    } finally {
-      setIsSystemResetting(false);
     }
   };
 
@@ -131,24 +114,6 @@ export function FirePanelStatusBadges() {
               Disconnected
             </Badge>
           )}
-
-          {connected && firePanelMonitoring ? (
-            <Badge
-              variant="outline"
-              className={`${STATUS_BADGE_CLASS} border-green-600/40 text-green-600`}
-            >
-              <Radio />
-              Monitoring
-            </Badge>
-          ) : (
-            <Badge
-              variant="outline"
-              className={`${STATUS_BADGE_CLASS} text-muted-foreground`}
-            >
-              <Radio />
-              Not Monitoring
-            </Badge>
-          )}
         </div>
 
         <FirePanelAckButtons />
@@ -157,7 +122,7 @@ export function FirePanelStatusBadges() {
           variant="outline"
           size="sm"
           className={HEADER_ACTION_BUTTON_CLASS}
-          disabled={!connected || silencing || isSystemResetting}
+          disabled={!connected || silencing}
           onClick={() => void handleSilenceAlarm()}
         >
           {silencing ? (
@@ -172,50 +137,15 @@ export function FirePanelStatusBadges() {
           variant="outline"
           size="sm"
           className={HEADER_ACTION_BUTTON_CLASS}
-          onClick={() => setSystemResetDialogOpen(true)}
-          disabled={!connected || isSystemResetting || silencing}
+          onClick={() => void handleSystemReset()}
+          disabled={!connected || silencing}
         >
-          {isSystemResetting ? (
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          ) : (
-            <RefreshCcw className="mr-2 h-4 w-4" />
-          )}
+          <RefreshCcw className="mr-2 h-4 w-4" />
           System Reset
         </Button>
         </div>
         <GraphicsViewNavButton />
       </div>
-
-      <AlertDialog open={systemResetDialogOpen} onOpenChange={setSystemResetDialogOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>System reset</AlertDialogTitle>
-            <AlertDialogDescription>
-              This clears fire (F), trouble (T), and supervisory (S) status on every asset in
-              AssetsList. Floor map markers will return to normal.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={isSystemResetting}>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault();
-                void handleSystemReset();
-              }}
-              disabled={!connected || isSystemResetting}
-            >
-              {isSystemResetting ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Resetting…
-                </>
-              ) : (
-                "Confirm reset"
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </>
   );
 }

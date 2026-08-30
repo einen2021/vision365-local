@@ -1,4 +1,4 @@
-import { doc, getDoc } from "firebase/firestore";
+import { doc, getDoc, updateDoc } from "firebase/firestore";
 import { db } from "@/config/firebase";
 import {
   formatLiveFeedTime,
@@ -102,4 +102,47 @@ export async function fetchBuildingAlarmHistory(buildingName) {
     liveTrouble: rowsForLiveTroubleSnap(liveTroubleSnap),
     liveSupervisory: rowsForLiveSupervisorySnap(liveSupervisorySnap),
   };
+}
+
+/** Empties the same array field(s) that fetchBuildingAlarmHistory reads from, per tab. */
+export async function clearBuildingAlarmHistory(buildingName) {
+  const dbCol = buildingDbCollection(buildingName);
+  if (!dbCol) return;
+
+  const [alarmSnap, fireSnap, troubleSnap, supervisorySnap] = await Promise.all([
+    readFirstExistingDoc(dbCol, ["alarmMessages", "alarmMessage"]),
+    readFirstExistingDoc(dbCol, ["liveFire", "liveAlarm"]),
+    getDoc(doc(db, dbCol, "liveTrouble")),
+    getDoc(doc(db, dbCol, "liveSupervisory")),
+  ]);
+
+  const tasks = [];
+
+  if (alarmSnap) {
+    const data = alarmSnap.data() || {};
+    const fieldKey =
+      ["alarmMessages", "alarmMessage", "messages"].find((key) => Array.isArray(data[key])) ||
+      "alarmMessages";
+    tasks.push(updateDoc(doc(db, dbCol, alarmSnap.id), { [fieldKey]: [] }));
+  }
+
+  if (fireSnap) {
+    const data = fireSnap.data() || {};
+    const fieldKey = Array.isArray(data.liveFire)
+      ? "liveFire"
+      : pickAlarmLikeAppendTarget(data, "liveAlarm").fieldKey;
+    tasks.push(updateDoc(doc(db, dbCol, fireSnap.id), { [fieldKey]: [] }));
+  }
+
+  if (troubleSnap.exists()) {
+    const { fieldKey } = pickTroubleAppendTarget(troubleSnap.data() || {});
+    tasks.push(updateDoc(doc(db, dbCol, "liveTrouble"), { [fieldKey]: [] }));
+  }
+
+  if (supervisorySnap.exists()) {
+    const { fieldKey } = pickAlarmLikeAppendTarget(supervisorySnap.data() || {}, "liveSupervisory");
+    tasks.push(updateDoc(doc(db, dbCol, "liveSupervisory"), { [fieldKey]: [] }));
+  }
+
+  await Promise.all(tasks);
 }

@@ -13,7 +13,6 @@ import {
 import {
   resolveAssetDeviceAddress,
   parseSimplexAddressToken,
-  stripPanelAddressPrefix,
 } from "@/lib/simplexDeviceAddress"
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore"
 
@@ -46,7 +45,9 @@ export async function resolveAssetsListDocId(asset, deviceAddress = "") {
 
 /**
  * Build every address form we might need to match panel ↔ AssetsList.
- * Covers: 2:M1-2-0, M1-2-0, M1-2, trailing -0, loop/device fields.
+ * Covers M1-2-0 vs M1-2 (trailing -0 is optional), staying within the same
+ * panel-prefix scope — "2:M1-2-0", "3:M1-2-0", and unprefixed "M1-2-0" are
+ * different physical devices and must never be treated as the same key.
  */
 export function expandPanelAddressMatchKeys(panelAddress) {
   const keys = new Set()
@@ -57,21 +58,13 @@ export function expandPanelAddressMatchKeys(panelAddress) {
     for (const key of collectDeviceAddressKeys(raw)) {
       keys.add(String(key).toUpperCase())
     }
-    const stripped = stripPanelAddressPrefix(raw).toUpperCase()
-    if (stripped) keys.add(stripped)
-    // Panel often reports M1-2-0 while AssetsList stores M1-2 (or the reverse).
-    if (/-\d+$/.test(stripped)) {
-      keys.add(stripped.replace(/-\d+$/, ""))
-    }
-    if (/^M\d+-\d+$/i.test(stripped)) {
-      keys.add(`${stripped}-0`)
-    }
   }
 
   add(panelAddress)
   const parsed = parseSimplexAddressToken(panelAddress)
   if (parsed?.full) add(parsed.full)
-  if (parsed?.mAddress) add(parsed.mAddress)
+  // Do NOT add parsed.mAddress alone — that strips the panel prefix and would
+  // match this address against a different panel's device of the same number.
 
   return keys
 }

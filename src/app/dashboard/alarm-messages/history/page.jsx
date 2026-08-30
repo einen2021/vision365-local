@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { DashboardHeader } from "@/components/dashboard-header";
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
 import { CommunityBuildingSelect } from "@/components/floor-plan/community-building-select";
 import { ModeToggle } from "@/components/theme-toggle";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Separator } from "@/components/ui/separator";
@@ -17,20 +18,15 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
-import { Bell, Loader2 } from "lucide-react";
+import { Bell, Loader2, Trash2 } from "lucide-react";
 import { usePageAuth } from "@/hooks/usePageAuth";
 import { useAppData } from "@/hooks/useAppData";
-import FirestoreService from "@/services/firestoreService";
-import { fetchBuildingAlarmHistory } from "@/lib/alarmMessageHistory";
+import { useToast } from "@/hooks/use-toast";
+import { clearBuildingAlarmHistory, fetchBuildingAlarmHistory } from "@/lib/alarmMessageHistory";
 import { normalizeBuildingName } from "@/lib/buildingNames";
+import { getStoredSessionUser } from "@/lib/sessionUser";
 
 const TAB_CONFIG = [
-  {
-    value: "alarmMessages",
-    label: "Alarm messages",
-    messageClass: "text-foreground",
-  },
   {
     value: "liveFire",
     label: "Fire History",
@@ -92,13 +88,24 @@ export default function AlarmMessagesHistoryPage() {
     setSelectedBuilding,
     selectedCommunity,
     setSelectedCommunity,
+    role,
+    userRole,
+    user,
   } = useAppData({ toastOnCommunitiesError: true });
+  const { toast } = useToast();
+
+  const isAdmin = useMemo(() => {
+    const session = getStoredSessionUser();
+    const r = String(role || userRole || user?.role || session?.role || "").toLowerCase();
+    const d = String(user?.designation || session?.designation || "").toLowerCase();
+    return r === "admin" || d === "admin" || d === "administrator";
+  }, [role, userRole, user]);
 
   const [buildings, setBuildings] = useState([]);
-  const [activeTab, setActiveTab] = useState("alarmMessages");
+  const [activeTab, setActiveTab] = useState("liveFire");
   const [history, setHistory] = useState(null);
-  const [panelStatus, setPanelStatus] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
 
   // Keep local community/building lists in sync with AppContext selection
   useEffect(() => {
@@ -126,22 +133,16 @@ export default function AlarmMessagesHistoryPage() {
     const buildingName = normalizeBuildingName(selectedBuilding);
     if (!buildingName) {
       setHistory(null);
-      setPanelStatus(null);
       return;
     }
 
     if (showSpinner) setIsLoading(true);
     try {
-      const [data, details] = await Promise.all([
-        fetchBuildingAlarmHistory(buildingName),
-        FirestoreService.getBuildingAlarmDetails(buildingName),
-      ]);
+      const data = await fetchBuildingAlarmHistory(buildingName);
       setHistory(data);
-      setPanelStatus(details?.panelStatus === true);
     } catch (error) {
       console.error("Error loading alarm history:", error);
       setHistory({
-        alarmMessages: [],
         liveFire: [],
         liveTrouble: [],
         liveSupervisory: [],
@@ -156,6 +157,30 @@ export default function AlarmMessagesHistoryPage() {
     const interval = setInterval(() => loadHistory(), 2000);
     return () => clearInterval(interval);
   }, [loadHistory]);
+
+  const handleClearHistory = async () => {
+    if (!selectedBuilding || isClearing) return;
+    const confirmed = window.confirm(
+      `Clear all alarm history for "${selectedBuilding}"? This cannot be undone.`,
+    );
+    if (!confirmed) return;
+
+    setIsClearing(true);
+    try {
+      await clearBuildingAlarmHistory(selectedBuilding);
+      await loadHistory();
+      toast({ title: "History cleared", description: `Alarm history for ${selectedBuilding} was cleared.` });
+    } catch (error) {
+      console.error("Error clearing alarm history:", error);
+      toast({
+        title: "Clear failed",
+        description: error?.message || "Could not clear alarm history.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsClearing(false);
+    }
+  };
 
   if (!isReady) {
     return (
@@ -200,18 +225,24 @@ export default function AlarmMessagesHistoryPage() {
                   Messages refresh every 2 seconds while this page is open.
                 </CardDescription>
               </div>
-              {selectedBuilding ? (
-                <Badge
-                  variant="outline"
-                  className={
-                    panelStatus
-                      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600"
-                      : "border-rose-500/40 bg-rose-500/10 text-rose-600"
-                  }
-                >
-                  Panel {panelStatus ? "ON" : "OFF"}
-                </Badge>
-              ) : null}
+              <div className="flex items-center gap-2">
+                {isAdmin && selectedBuilding ? (
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    className="h-7 text-xs"
+                    disabled={isClearing}
+                    onClick={handleClearHistory}
+                  >
+                    {isClearing ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-3.5 w-3.5" />
+                    )}
+                    Clear History
+                  </Button>
+                ) : null}
+              </div>
             </CardHeader>
             <CardContent>
               {!selectedBuilding ? (
@@ -220,7 +251,7 @@ export default function AlarmMessagesHistoryPage() {
                 </div>
               ) : (
                 <Tabs value={activeTab} onValueChange={setActiveTab}>
-                  <TabsList className="mb-4 grid h-auto w-full grid-cols-2 gap-1 py-1 sm:grid-cols-4">
+                  <TabsList className="mb-4 grid h-auto w-full grid-cols-3 gap-1 py-1">
                     {TAB_CONFIG.map((tab) => (
                       <TabsTrigger
                         key={tab.value}
