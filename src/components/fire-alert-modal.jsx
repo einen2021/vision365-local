@@ -49,7 +49,6 @@ export function FireAlertModal({ open, onClose }) {
   const muteSiren = fireAlertCtx?.muteSiren;
 
   const [ackLoading, setAckLoading] = useState(false);
-  const [silenceLoading, setSilenceLoading] = useState(false);
 
   const alert = PLACEHOLDER_ALERT;
 
@@ -210,7 +209,7 @@ export function FireAlertModal({ open, onClose }) {
             type="button"
             variant="outline"
             onClick={onClose}
-            disabled={ackLoading || silenceLoading}
+            disabled={ackLoading}
           >
             Close
           </Button>
@@ -218,7 +217,7 @@ export function FireAlertModal({ open, onClose }) {
             type="button"
             variant="outline"
             onClick={handleViewOnMap}
-            disabled={ackLoading || silenceLoading}
+            disabled={ackLoading}
           >
             <MapPin className="mr-1.5 h-4 w-4" />
             View on Map
@@ -227,20 +226,16 @@ export function FireAlertModal({ open, onClose }) {
             type="button"
             variant="outline"
             onClick={() => void handleSilenceAlarm()}
-            disabled={!connected || ackLoading || silenceLoading}
+            disabled={!connected || ackLoading}
           >
-            {silenceLoading ? (
-              <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
-            ) : (
-              <VolumeX className="mr-1.5 h-4 w-4" />
-            )}
+            <VolumeX className="mr-1.5 h-4 w-4" />
             Silence Alarm
           </Button>
           <Button
             type="button"
             variant="destructive"
             onClick={() => void handleAcknowledge()}
-            disabled={!connected || ackLoading || silenceLoading}
+            disabled={!connected || ackLoading}
           >
             {ackLoading ? (
               <>

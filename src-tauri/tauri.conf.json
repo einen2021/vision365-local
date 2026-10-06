@@ -22,6 +22,7 @@
         "fullscreen": false,
         "center": true,
         "visible": false,
+        "closable": true,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required"
       }
     ],

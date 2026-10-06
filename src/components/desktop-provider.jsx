@@ -12,6 +12,7 @@ import {
   primeAssetUrlResolver,
 } from "@/lib/apiClient";
 import { useStartupProgressStore } from "@/stores/startupProgressStore";
+import { CloseWindowDialog } from "@/components/app-control-modals";
 
 /** Consecutive telnet connect attempts before giving up and alerting the user. */
 const MAX_PANEL_CONNECT_ATTEMPTS = 3;
@@ -30,15 +31,39 @@ const MAX_PANEL_CONNECT_ATTEMPTS = 3;
  */
 async function runPanelStartupSync(onConnectFailed) {
   const setProgress = useStartupProgressStore.getState().setProgress;
-  setProgress({
-    step: 6,
-    total: 12,
-    percent: 50,
-    message: "Connecting to fire panel...",
-  });
 
   try {
+    const { isDebugMode } = await import("@/lib/debugMode");
     const { useFirePanelStore } = await import("@/stores/firePanelStore");
+
+    if (isDebugMode()) {
+      useFirePanelStore.setState({
+        connected: true,
+        connectedHost: "Debug Mode",
+        connectedPort: 23,
+        connectedAt: new Date().toISOString(),
+        loading: false,
+        lastError: "",
+      });
+
+      setProgress({
+        step: 6,
+        total: 12,
+        percent: 55,
+        message: "Debug Mode Active: Synchronizing demo panel data...",
+      });
+
+      const { runStartupListSync } = await import("@/lib/startupListSync");
+      await runStartupListSync();
+      return;
+    }
+
+    setProgress({
+      step: 6,
+      total: 12,
+      percent: 50,
+      message: "Connecting to fire panel...",
+    });
 
     let connected = false;
     for (let attempt = 1; attempt <= MAX_PANEL_CONNECT_ATTEMPTS; attempt++) {
@@ -104,10 +129,29 @@ export function DesktopProvider({ children }) {
   const [errorMsg, setErrorMsg] = useState("");
   const [logHint, setLogHint] = useState("");
   const [panelConnectFailed, setPanelConnectFailed] = useState(false);
+  const [showCloseConfirmDialog, setShowCloseConfirmDialog] = useState(false);
   const { step, total, percent, message, isSplashOpen } = useStartupProgressStore();
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+
+    // Prevent default right-click context menu (blocks right-click reload, exit, and inspect)
+    const handleContextMenu = (e) => {
+      e.preventDefault();
+    };
+
+    // Prevent refresh keyboard shortcuts (F5, Ctrl+R, Ctrl+Shift+R, Cmd+R)
+    const handleKeyDown = (e) => {
+      if (
+        e.key === "F5" ||
+        ((e.ctrlKey || e.metaKey) && (e.key === "r" || e.key === "R"))
+      ) {
+        e.preventDefault();
+      }
+    };
+
+    window.addEventListener("contextmenu", handleContextMenu, { capture: true });
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
 
     const isTauri =
       "__TAURI_INTERNALS__" in window || "__TAURI__" in window;
@@ -115,7 +159,10 @@ export function DesktopProvider({ children }) {
       primeAssetUrlResolver();
       // On web, run background auto-connect & list sync then close splash
       runPanelStartupSync(() => setPanelConnectFailed(true));
-      return;
+      return () => {
+        window.removeEventListener("contextmenu", handleContextMenu, { capture: true });
+        window.removeEventListener("keydown", handleKeyDown, { capture: true });
+      };
     }
 
     let apiErrorReceived = false;
@@ -127,6 +174,10 @@ export function DesktopProvider({ children }) {
 
         setDesktopApiPort(DESKTOP_API_PORT);
         resetApiBaseUrl();
+
+        await listen("vision365-window-close-requested", () => {
+          setShowCloseConfirmDialog(true);
+        });
 
         await listen("vision365-startup-progress", (event) => {
           const payload = event.payload;
@@ -204,6 +255,11 @@ export function DesktopProvider({ children }) {
     }
 
     initDesktop();
+
+    return () => {
+      window.removeEventListener("contextmenu", handleContextMenu, { capture: true });
+      window.removeEventListener("keydown", handleKeyDown, { capture: true });
+    };
   }, []);
 
   return (
@@ -271,6 +327,12 @@ export function DesktopProvider({ children }) {
           </button>
         </div>
       ) : null}
+
+      {/* Window close confirmation dialog */}
+      <CloseWindowDialog
+        open={showCloseConfirmDialog}
+        onOpenChange={setShowCloseConfirmDialog}
+      />
     </>
   );
 }

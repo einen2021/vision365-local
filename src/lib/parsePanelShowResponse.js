@@ -26,11 +26,64 @@ function matchShowField(raw, label) {
   return match ? match[1].trim() : "";
 }
 
+export const PRIMARY_STATUS_TYPES = [
+  "NORMAL",
+  "FIRE ALARM",
+  "DIRTY",
+  "DISABLE TROUBLE",
+  "DISABLE ALARM",
+  "ABNORMAL",
+  "NO ANSWER",
+  "SUPERVISORY",
+  "OPEN",
+  "SHORT",
+  "TEST",
+  "UNVERIFIED",
+  "ACTIVE",
+  "INACTIVE",
+  "OFF",
+  "ON",
+];
+
+export function resolvePrimaryStatusType(rawStatus = "") {
+  const trimmed = String(rawStatus || "").trim().toUpperCase();
+  if (!trimmed) return "";
+
+  // 1. Direct exact match
+  const exact = PRIMARY_STATUS_TYPES.find((t) => t === trimmed);
+  if (exact) return exact;
+
+  // 2. Specific prefix rules
+  if (/^DISA/i.test(trimmed)) {
+    if (/ALARM/i.test(trimmed)) return "DISABLE ALARM";
+    return "DISABLE TROUBLE";
+  }
+  if (/^NORM/i.test(trimmed)) return "NORMAL";
+  if (/^FIRE|^ALARM/i.test(trimmed)) return "FIRE ALARM";
+  if (/^DIRT/i.test(trimmed)) return "DIRTY";
+  if (/^ABNOR/i.test(trimmed)) return "ABNORMAL";
+  if (/^NO\s*ANS/i.test(trimmed)) return "NO ANSWER";
+  if (/^SUP/i.test(trimmed)) return "SUPERVISORY";
+  if (/^UNVER/i.test(trimmed)) return "UNVERIFIED";
+
+  // 3. Prefix matching from candidate list
+  if (trimmed.length >= 2) {
+    const candidate = PRIMARY_STATUS_TYPES.find((t) => t.startsWith(trimmed));
+    if (candidate) return candidate;
+  }
+
+  return trimmed;
+}
+
 export function parsePanelShowResponse(text = "") {
   const raw = normalizeShowText(text);
 
-  const primaryStatus = matchShowField(raw, "PRIMARY STATUS");
-  const enabledState = matchShowField(raw, "ENABLED STATE");
+  const rawPrimaryStatus = matchShowField(raw, "PRIMARY STATUS");
+  const primaryStatus = resolvePrimaryStatusType(rawPrimaryStatus);
+  const rawEnabledState = matchShowField(raw, "ENABLED STATE");
+  const enabledState =
+    rawEnabledState ||
+    (primaryStatus.startsWith("DISABLE") ? "DISABLED" : "");
 
   const primaryUpper = primaryStatus.toUpperCase();
   const enabledUpper = enabledState.toUpperCase();
@@ -61,10 +114,10 @@ export function primaryStatusToSimplex(primaryStatus = "") {
   if (/FIRE\s*ALARM|\bALARM\b/.test(status)) {
     return { F: 1, T: 0, S: 0 };
   }
-  if (/TROUBLE/.test(status)) {
+  if (/TROUBLE|DIRTY|DISABLE\s+TROUBLE|ABNORMAL|NO\s+ANSWER|OPEN|SHORT/.test(status)) {
     return { F: 0, T: 1, S: 0 };
   }
-  if (/SUPERVISORY/.test(status)) {
+  if (/SUPERVISORY|SUPV|SUPR/.test(status)) {
     return { F: 0, T: 0, S: 1 };
   }
 
@@ -76,8 +129,8 @@ export function getPrimaryStatusTone(primaryStatus = "") {
   const status = String(primaryStatus || "").toUpperCase();
 
   if (/FIRE\s*ALARM|\bALARM\b/.test(status)) return "fire";
-  if (/TROUBLE/.test(status)) return "trouble";
-  if (/SUPERVISORY/.test(status)) return "supervisory";
+  if (/TROUBLE|DIRTY|DISABLE\s+TROUBLE|ABNORMAL|NO\s+ANSWER|OPEN|SHORT/.test(status)) return "trouble";
+  if (/SUPERVISORY|SUPV|SUPR/.test(status)) return "supervisory";
   if (/NORMAL|OFF|INACTIVE/.test(status)) return "normal";
   return "unknown";
 }

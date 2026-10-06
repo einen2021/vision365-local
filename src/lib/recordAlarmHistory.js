@@ -1,7 +1,7 @@
 import { collection, doc, getDoc, getDocs, setDoc } from "firebase/firestore";
 import { db } from "@/config/firebase";
-import { normalizeBuildingName } from "@/lib/buildingNames";
-import { syncPanelListWithTempArray, getTempPanelList } from "@/lib/firePanelListHistory";
+import { normalizeBuildingName } from "./buildingNames";
+import { syncPanelListWithTempArray, getTempPanelList } from "./firePanelListHistory";
 
 /**
  * Normalizes building name into {BuildingName}BuildingDB collection name.
@@ -51,23 +51,31 @@ async function appendRowsToDoc(dbCol, docId, fieldKey, newRows) {
     existing = Array.isArray(data[fieldKey]) ? data[fieldKey] : [];
   }
 
-  const existingKeys = new Set(
-    existing.map((r) => `${String(r?.message || r?.rawMessage || "").trim()}|${r?.time}`).filter(Boolean),
-  );
-
   const rowsToAppend = [];
   for (const row of newRows) {
-    const key = `${String(row?.message || row?.rawMessage || "").trim()}|${row?.time}`;
-    if (!existingKeys.has(key)) {
+    const rowMsg = String(row?.message || row?.rawMessage || "").trim();
+    const rowTime = Number(row?.time) || 0;
+
+    const isDuplicate = existing.some((ex) => {
+      const exMsg = String(ex?.message || ex?.rawMessage || "").trim();
+      const exTime = Number(ex?.time) || 0;
+      if (exMsg === rowMsg) {
+        if (Math.abs(rowTime - exTime) < 30000 || exTime === rowTime) {
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (!isDuplicate) {
       rowsToAppend.push(row);
-      existingKeys.add(key);
+      existing.push(row);
     }
   }
 
   if (rowsToAppend.length === 0) return;
 
-  const combined = [...existing, ...rowsToAppend];
-  await setDoc(ref, { [fieldKey]: combined }, { merge: true });
+  await setDoc(ref, { [fieldKey]: existing }, { merge: true });
 }
 
 /**
@@ -83,47 +91,37 @@ function formatHistoryMessage(element, label) {
   return `${label}${loc}${devType} (${addr})`.trim();
 }
 
+import { extractPanelEventTime } from "./firePanelMonitor";
+
 /**
- * Records newly detected panel list elements to the History documents:
+ * Records a single live alarm message (converted to list item format) to the History documents:
  * - Fire: writes to liveFire ("Fire History") AND alarmMessages ("Alarm messages" tab)
  * - Trouble: writes to liveTrouble ("Trouble History" tab) ONLY (not alarmMessages)
  * - Supervisory: writes to liveSupervisory ("Supervisory History" tab) ONLY (not alarmMessages)
- * Also appends to fire-list / trouble-list / supervisory-list based on category.
  *
- * @param {string} label - "Fire", "Trouble", or "Supervisory"
- * @param {Array<Object>} newElements - List of newly appeared elements
+ * @param {"Fire"|"Trouble"|"Supervisory"|string} label
+ * @param {Object} item - { listItem, raw, deviceAddress, time, timestamp }
  */
-export async function recordNewElementsToHistory(label, newElements) {
-  if (!newElements || !newElements.length) return;
+export async function recordLiveAlarmToHistory(label, item = {}) {
+  if (!item || !label) return;
 
   const normLabel =
     /^trouble$/i.test(label) ? "Trouble" : /^supervisory$/i.test(label) ? "Supervisory" : "Fire";
 
-  const nowMs = Date.now();
-  const historyRows = newElements.map((elem) => {
-    const timeMs =
-      typeof elem.timestamp === "number"
-        ? elem.timestamp
-        : typeof elem.time === "string"
-          ? Date.parse(elem.time) || nowMs
-          : nowMs;
-    const message = formatHistoryMessage(elem, normLabel);
+  const rawMessage = String(item.raw || item.rawMessage || item.message || item.listItem || "").trim();
+  if (!rawMessage) return;
 
-    return {
-      message,
-      time: timeMs,
-      timestamp: new Date(timeMs).toISOString(),
-      rawMessage: elem.raw || elem.rawMessage || message,
-      deviceAddress: elem.fullAddress || elem.deviceAddress || "",
-    };
-  });
+  const { timeMs, timestampIso } = extractPanelEventTime(item);
 
-  // Also add each new element to fire-list / trouble-list / supervisory-list
-  for (const elem of newElements) {
-    void appendLiveLogToCategoryList(normLabel, elem);
-  }
+  const historyRow = {
+    message: rawMessage,
+    rawMessage: rawMessage,
+    raw: rawMessage,
+    time: timeMs,
+    timestamp: timestampIso,
+    deviceAddress: item.deviceAddress || "NA",
+  };
 
-  // Resolve target buildings and execute writes concurrently
   const targetBuildings = await getAllBuildingNames();
   if (targetBuildings.length === 0) return;
 
@@ -133,18 +131,25 @@ export async function recordNewElementsToHistory(label, newElements) {
     if (!dbCol) continue;
 
     if (normLabel === "Fire") {
-      writePromises.push(appendRowsToDoc(dbCol, "liveFire", "liveFire", historyRows));
-      writePromises.push(appendRowsToDoc(dbCol, "alarmMessages", "alarmMessages", historyRows));
+      writePromises.push(appendRowsToDoc(dbCol, "liveFire", "liveFire", [historyRow]));
+      writePromises.push(appendRowsToDoc(dbCol, "alarmMessages", "alarmMessages", [historyRow]));
     } else if (normLabel === "Trouble") {
-      writePromises.push(appendRowsToDoc(dbCol, "liveTrouble", "liveTrouble", historyRows));
+      writePromises.push(appendRowsToDoc(dbCol, "liveTrouble", "liveTrouble", [historyRow]));
     } else if (normLabel === "Supervisory") {
-      writePromises.push(appendRowsToDoc(dbCol, "liveSupervisory", "liveSupervisory", historyRows));
+      writePromises.push(appendRowsToDoc(dbCol, "liveSupervisory", "liveSupervisory", [historyRow]));
     }
   }
 
   if (writePromises.length > 0) {
     await Promise.all(writePromises);
   }
+}
+
+/**
+ * Deprecated / No-op for list responses. List responses are no longer recorded to history.
+ */
+export async function recordNewElementsToHistory(label, newElements) {
+  // Intentionally no-op: list responses are not added to history.
 }
 
 /**
@@ -179,7 +184,7 @@ export async function saveListToCategoryDb(label, parsedRows = []) {
 /**
  * When a new fire, trouble, or supervisory event is added (not a list command response),
  * adds it directly to fire-list, trouble-list, or supervisory-list based on category.
- * Does not alter or add anything extra to the entry.
+ * Extracts time accurately from the message and preserves it.
  *
  * @param {"Fire"|"Trouble"|"Supervisory"|string} label
  * @param {Object|string} entry
@@ -205,34 +210,25 @@ export async function appendLiveLogToCategoryList(label, entry) {
         ""
       : rawText.match(/\b(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)\b/i)?.[0] || "";
 
-  const timeVal =
-    typeof entry === "object" && entry
-      ? typeof entry.time === "number"
-        ? entry.time
-        : typeof entry.at === "string"
-          ? Date.parse(entry.at) || Date.now()
-          : typeof entry.timestamp === "number"
-            ? entry.timestamp
-            : Date.now()
-      : Date.now();
+  const { timeMs, timestampIso, panelTimeText } = extractPanelEventTime(entry);
+
+  const rowAddr = (typeof entry === "object" && (entry?.fullAddress || entry?.deviceAddress)) || addr || "NA";
+  const rowLoc = (typeof entry === "object" && entry?.location) || "—";
+
+  const listStatus =
+    normLabel === "Fire" ? "FIRE*" : normLabel === "Trouble" ? "TRBL*" : "SUPV*";
 
   const row = {
-    fullAddress: (typeof entry === "object" && entry?.fullAddress) || addr,
-    deviceAddress: (typeof entry === "object" && entry?.deviceAddress) || addr,
-    location: (typeof entry === "object" && entry?.location) || "—",
+    fullAddress: rowAddr,
+    deviceAddress: rowAddr,
+    location: rowLoc,
     deviceType:
       (typeof entry === "object" && (entry?.deviceType || entry?.device || entry?.description)) || "—",
-    status:
-      (typeof entry === "object" && entry?.status) ||
-      (normLabel === "Fire" ? "FIRE" : normLabel === "Trouble" ? "TRBL" : "SUPV"),
-    label: (typeof entry === "object" && (entry?.label || entry?.status)) || normLabel.toUpperCase(),
-    panelTimeText:
-      (typeof entry === "object" && entry?.panelTimeText) ||
-      (typeof entry === "object" && entry?.time ? `${entry.time}` : ""),
-    time: timeVal,
-    timestamp:
-      (typeof entry === "object" && entry?.timestamp && typeof entry.timestamp === "string") ||
-      new Date(timeVal).toISOString(),
+    status: listStatus,
+    label: listStatus.replace(/\*$/, ""),
+    panelTimeText: panelTimeText || (typeof entry === "object" && entry?.panelTimeText) || "",
+    time: timeMs,
+    timestamp: timestampIso,
     raw: rawText,
     rawMessage: rawText,
   };
@@ -241,7 +237,8 @@ export async function appendLiveLogToCategoryList(label, entry) {
   // (altering) any other row already cached for this category.
   const existingTempRows = getTempPanelList(normLabel);
   const filteredTempRows = existingTempRows.filter((r) => {
-    if (addr && (r.fullAddress === addr || r.deviceAddress === addr)) return false;
+    if (rowAddr && rowAddr !== "NA" && (r.fullAddress === rowAddr || r.deviceAddress === rowAddr)) return false;
+    if (rowLoc && rowLoc !== "—" && r.location === rowLoc) return false;
     if (rawText && (r.raw === rawText || r.rawMessage === rawText)) return false;
     return true;
   });
@@ -257,7 +254,8 @@ export async function appendLiveLogToCategoryList(label, entry) {
     }
 
     const filtered = existingRows.filter((r) => {
-      if (addr && (r.fullAddress === addr || r.deviceAddress === addr)) return false;
+      if (rowAddr && rowAddr !== "NA" && (r.fullAddress === rowAddr || r.deviceAddress === rowAddr)) return false;
+      if (rowLoc && rowLoc !== "—" && r.location === rowLoc) return false;
       if (rawText && (r.raw === rawText || r.rawMessage === rawText)) return false;
       return true;
     });
@@ -272,3 +270,4 @@ export async function appendLiveLogToCategoryList(label, entry) {
 
 /** Alias for appendLiveLogToCategoryList */
 export const appendLiveAlarmToCategoryList = appendLiveLogToCategoryList;
+

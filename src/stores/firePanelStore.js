@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { apiFetch, parseApiJsonResponse } from "@/lib/apiClient";
 import { LIST_COMMAND_TIMEOUT_MS } from "@/lib/firePanelMonitor";
+import { isDebugMode } from "@/lib/debugMode";
 
 /** Parse API JSON safely — avoids cryptic errors when HTML error pages are returned */
 async function parseJsonResponse(res) {
@@ -35,6 +36,18 @@ export const useFirePanelStore = create((set, get) => ({
 
   /** Sync status, then connect once if still offline and auto-reconnect is enabled. */
   ensureConnected: async () => {
+    if (isDebugMode()) {
+      set({
+        connected: true,
+        connectedHost: "Debug Mode",
+        connectedPort: 23,
+        connectedAt: get().connectedAt || new Date().toISOString(),
+        loading: false,
+        lastError: "",
+      });
+      return true;
+    }
+
     // Don't block reconnect forever if a previous command left loading stuck.
     if (get().loading) {
       const started = Date.now();
@@ -55,6 +68,18 @@ export const useFirePanelStore = create((set, get) => ({
   },
 
   syncStatus: async () => {
+    if (isDebugMode()) {
+      set({
+        connected: true,
+        connectedHost: "Debug Mode",
+        connectedPort: 23,
+        connectedAt: get().connectedAt || new Date().toISOString(),
+        loading: false,
+        lastError: "",
+        disconnectStreak: 0,
+      });
+      return;
+    }
     try {
       const res = await apiFetch("/api/telnet/fire-panel/status");
       if (!res.ok) {
@@ -100,6 +125,18 @@ export const useFirePanelStore = create((set, get) => ({
   },
 
   connect: async () => {
+    if (isDebugMode()) {
+      set({
+        connected: true,
+        connectedHost: "Debug Mode",
+        connectedPort: 23,
+        connectedAt: get().connectedAt || new Date().toISOString(),
+        loading: false,
+        lastError: "",
+      });
+      return { ok: true };
+    }
+
     const { host, port } = get();
     if (!host.trim()) return { ok: false };
     if (get().loading) return { ok: false, reason: "in_progress" };

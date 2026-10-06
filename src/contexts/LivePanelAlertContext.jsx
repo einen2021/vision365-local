@@ -237,19 +237,19 @@ export function LivePanelAlertProvider({ children }) {
   // "Show popup when new alarms occur" toggle — it must not gate the sound.
   const showTroubleAlert = useCallback(() => {
     if (isAlarmActive) return;
+    setIsMuted(false);
     resetTroubleAlertSilence();
     startTroubleAlertBeep();
     if (!usePanelAlertSettingsStore.getState().isTroubleModalEnabled()) return;
-    setIsMuted(false);
     setOpenLabel("Trouble");
   }, [isAlarmActive]);
 
   const showSupervisoryAlert = useCallback(() => {
     if (isAlarmActive) return;
+    setIsMuted(false);
     resetSupervisoryAlertSilence();
     startSupervisoryAlertBeep();
     if (!usePanelAlertSettingsStore.getState().isSupervisoryModalEnabled()) return;
-    setIsMuted(false);
     setOpenLabel("Supervisory");
   }, [isAlarmActive]);
 

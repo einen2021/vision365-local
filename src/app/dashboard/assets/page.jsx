@@ -552,6 +552,11 @@ const normalizeFieldName = (columnName) => {
   if (normalized.includes("part") && normalized.includes("model")) {
     return "partNumber"
   }
+
+  // Handle special case: device type -> deviceType
+  if (normalized === "devicetype" || normalized === "device type" || normalized === "device_type") {
+    return "deviceType"
+  }
   
   // Convert to camelCase
   return columnName
@@ -577,6 +582,21 @@ function generateAssetId(brand, system, itemType, index) {
   const itemTypePart = itemType ? itemType.trim().toUpperCase().replace(/\s+/g, "-") : "NOTYPE"
   const indexPart = String(index).padStart(4, "0")
   return `${brandPart}_${systemPart}_${itemTypePart}_${indexPart}`
+}
+
+export function resolveAssetDeviceType(asset) {
+  if (!asset) return ""
+  return String(
+    asset.deviceType ||
+      asset.DeviceType ||
+      asset.devicetype ||
+      asset.device_type ||
+      asset.pointType ||
+      asset.technicalProperties?.values?.["Device Type"] ||
+      asset.technicalProperties?.values?.["Detector Type"] ||
+      asset.itemType ||
+      "",
+  ).trim()
 }
 
 function simplexDeviceToAsset(device, assetId) {
@@ -1416,6 +1436,7 @@ export default function AssetsPage() {
           (asset.brand || "").toLowerCase().includes(searchLower) ||
           (asset.system || "").toLowerCase().includes(searchLower) ||
           (asset.category || "").toLowerCase().includes(searchLower) ||
+          (resolveAssetDeviceType(asset) || "").toLowerCase().includes(searchLower) ||
           (asset.description || "").toLowerCase().includes(searchLower) ||
           (resolveAssetDeviceAddress(asset) || "").toLowerCase().includes(searchLower) ||
           (asset.deviceAddress || "").toLowerCase().includes(searchLower) ||
@@ -1979,6 +2000,7 @@ export default function AssetsPage() {
       "brand",
       "system",
       "category",
+      "deviceType",
       "itemType",
       "description",
       "model",
@@ -3491,7 +3513,7 @@ export default function AssetsPage() {
                             <>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Building Asset ID</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Asset Name</TableHead>
-                              <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Asset Category</TableHead>
+                              <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Device Type</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Device Location</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Device Address</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Model</TableHead>
@@ -3505,7 +3527,7 @@ export default function AssetsPage() {
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Image</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Brand</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">System</TableHead>
-                              <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Category</TableHead>
+                              <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Device Type</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Device Address</TableHead>
                               <TableHead className="px-2 py-1.5 text-[10px] font-medium whitespace-nowrap">Description</TableHead>
                               <TableHead className="px-2 py-1.5 text-right w-10">
@@ -3548,8 +3570,8 @@ export default function AssetsPage() {
                                   <TableCell className="px-2 py-1.5 max-w-[160px] truncate" title={asset.assetName || ""}>
                                     {asset.assetName || "-"}
                                   </TableCell>
-                                  <TableCell className="px-2 py-1.5 max-w-[120px] truncate" title={asset.assetCategory || asset.category || ""}>
-                                    {asset.assetCategory || asset.category || "-"}
+                                  <TableCell className="px-2 py-1.5 max-w-[120px] truncate" title={resolveAssetDeviceType(asset)}>
+                                    {resolveAssetDeviceType(asset) || "-"}
                                   </TableCell>
                                   <TableCell className="px-2 py-1.5 max-w-[160px] truncate" title={asset.deviceLocation || ""}>
                                     {asset.deviceLocation || "-"}
@@ -3700,8 +3722,8 @@ export default function AssetsPage() {
                                   <TableCell className="px-2 py-1.5 max-w-[120px] truncate" title={asset.system || ""}>
                                     {asset.system || "-"}
                                   </TableCell>
-                                  <TableCell className="px-2 py-1.5 max-w-[120px] truncate" title={asset.category || ""}>
-                                    {asset.category || "-"}
+                                  <TableCell className="px-2 py-1.5 max-w-[120px] truncate" title={resolveAssetDeviceType(asset)}>
+                                    {resolveAssetDeviceType(asset) || "-"}
                                   </TableCell>
                                   <TableCell
                                     className="px-2 py-1.5 max-w-[140px] truncate font-mono"

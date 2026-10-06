@@ -1,5 +1,5 @@
-import { parsePanelListResponse } from "@/lib/firePanelMonitor";
-import { recordNewElementsToHistory } from "@/lib/recordAlarmHistory";
+import { parsePanelListResponse } from "./firePanelMonitor";
+import { recordNewElementsToHistory } from "./recordAlarmHistory";
 
 /**
  * In-memory temporary array cache for live panel list command responses.
@@ -86,16 +86,18 @@ export function syncPanelListWithTempArray(
       // Element exists in temp array: keep previous time
       mergedRows[i] = {
         ...row,
-        time: existing.time || existing.panelTimeText || currentTime,
-        timestamp: existing.timestamp || Date.now(),
+        time: existing.time || row.time || existing.panelTimeText || row.panelTimeText || currentTime,
+        timestamp: existing.timestamp || row.timestamp || Date.now(),
+        panelTimeText: existing.panelTimeText || row.panelTimeText || "",
         isNew: false,
       };
     } else {
-      // New element: update its time to current time
+      // New element: keep row's own extracted time or fallback to currentTime
       mergedRows[i] = {
         ...row,
-        time: currentTime,
-        timestamp: Date.now(),
+        time: row.time || row.panelTimeText || currentTime,
+        timestamp: row.timestamp || Date.now(),
+        panelTimeText: row.panelTimeText || "",
         isNew: true,
       };
     }
@@ -103,13 +105,6 @@ export function syncPanelListWithTempArray(
 
   // Save the complete response data to temp array for the next run
   tempPanelListCache[label] = mergedRows;
-
-  const newElements = mergedRows.filter((r) => r.isNew);
-  if (newElements.length > 0) {
-    void recordNewElementsToHistory(label, newElements).catch((err) => {
-      console.error("[history] Failed to record new elements to history:", err);
-    });
-  }
 
   return mergedRows;
 }

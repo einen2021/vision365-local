@@ -13,6 +13,7 @@ import {
 } from "@/lib/recordAlarmHistory";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
 import { useStartupProgressStore } from "@/stores/startupProgressStore";
+import { isDebugMode } from "@/lib/debugMode";
 
 let startupSyncCompleted = false;
 let startupSyncInProgress = false;
@@ -122,14 +123,25 @@ export async function runStartupListSync(arg1, arg2) {
     // Step 8: Run `show counts` (with retry attempts)
     reportProgress(8, 12, 68, "Checking fire panel counts...");
     let counts = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      await logStartupSync(`[startupSync] Querying show counts on app startup (attempt ${attempt}/3)...`);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await logStartupSync(`[startupSync] Querying show counts on app startup (attempt ${attempt}/2)...`);
       const countsRaw = await sendCommand("show counts", 6000);
       counts = parseShowCountsResponse(countsRaw);
       if (counts) break;
-      if (attempt < 3) {
+      if (attempt < 2) {
         await new Promise((r) => setTimeout(r, 800));
       }
+    }
+
+    if (!counts && isDebugMode()) {
+      await logStartupSync(
+        "[startupSync] [Debug Mode] Fire panel not connected. Using hardcoded demo counts...",
+      );
+      counts = {
+        totalFire: 0,
+        totalTrouble: 6,
+        totalSupervisory: 4,
+      };
     }
 
     const totalFire = counts ? counts.totalFire : 0;
@@ -196,26 +208,61 @@ export async function runStartupListSync(arg1, arg2) {
 
       let parsedRows = [];
       let rawRes = "";
-      const maxAttempts = 10;
+      const maxAttempts = 2;
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const timeoutMs = Math.max(30000, Math.min(120000, expectedCount * 250 + 15000));
         rawRes = await sendCommand(listCmd, timeoutMs, expectedCount);
         parsedRows = parsePanelListResponse(rawRes);
 
-        // Confirm whether total count number of items were received
-        const isCountConfirmed =
-          parsedRows.length >= expectedCount ||
-          (parsedRows.length >= Math.floor(expectedCount * 0.95) && /_DNE|_END|\n-\s*$/i.test(rawRes));
-
-        if (isCountConfirmed) {
+        // Fallback for debug mode if connection is absent or returned empty
+        if ((!rawRes || parsedRows.length === 0) && isDebugMode()) {
+          if (label === "Fire") {
+            rawRes = "";
+          } else if (label === "Trouble") {
+            rawRes = [
+              "2:M1-10-0   GROUND FL MAIN ENTRANCE           SMOKE DETECTOR       TRBL*",
+              "2:M1-45-0   FIRST FLOOR CORRIDOR 104          PULL STATION         TRBL*",
+              "2:M1-102-0  BASEMENT 1 PUMP ROOM              PHOTO DETECTOR       TRBL*",
+              "2:M1-202-0  SUB BS PMP RM WET RSR VA TUB31    SUPERVISORY MONITOR  TRBL*",
+              "2:M2-15-0   ROOF ELEVATOR MACHINE ROOM        HEAT DETECTOR        TRBL*",
+              "P104        PANEL 2 POWER SUPPLY BATTERY      SYSTEM POWER SUPPLY  TRBL*",
+              "-",
+            ].join("\n");
+          } else if (label === "Supervisory") {
+            rawRes = [
+              "2:M1-202-0  SUB BS PMP RM WET RSR VA TUB31    SUPERVISORY MONITOR  SUPV*",
+              "2:M1-215-0  BASEMENT 2 SPRINKLER VALVE 4      SUPERVISORY MONITOR  SUPV*",
+              "2:M2-30-0   GROUND FLOOR OS&Y VALVE           SUPERVISORY MONITOR  SUPV*",
+              "2:M2-88-0   FLOOR 3 ZONE VALVE TAMPER         SUPERVISORY MONITOR  SUPV*",
+              "-",
+            ].join("\n");
+          }
+          parsedRows = parsePanelListResponse(rawRes);
+          await logStartupSync(
+            `[startupSync] [Debug Mode] Hardcoded demo list loaded for ${label}: ${parsedRows.length} item(s)`,
+          );
           break;
         }
 
-        if (attempt === maxAttempts) {
-          await logStartupSync(
-            `[startupSync] ${listCmd} completed with ${parsedRows.length}/${expectedCount} items after ${attempt} attempts. Proceeding to save...`,
-          );
+        // Confirm whether total count number of items were received
+        const isCountConfirmed =
+          parsedRows.length >= expectedCount ||
+          (parsedRows.length >= Math.floor(expectedCount * 0.95) && /_DNE|_END|\n-\s*$/i.test(rawRes)) ||
+          attempt >= maxAttempts;
+
+        if (isCountConfirmed || attempt >= maxAttempts) {
+          if (attempt >= maxAttempts && parsedRows.length < expectedCount) {
+            await logStartupSync(
+              `[startupSync] ${listCmd} completed after max ${attempt} attempts (${parsedRows.length}/${expectedCount} items received). Moving to saving step...`,
+            );
+            reportProgress(
+              stepNum,
+              12,
+              basePercent + 4,
+              `${label} finished 2 attempts (${parsedRows.length}/${expectedCount} items). Moving to saving step...`,
+            );
+          }
           break;
         }
 
@@ -223,10 +270,10 @@ export async function runStartupListSync(arg1, arg2) {
           stepNum,
           12,
           basePercent + Math.min(4, attempt),
-          `Fetching ${label} alarms: ${parsedRows.length}/${expectedCount} items (attempt ${attempt})...`,
+          `Fetching ${label} alarms: ${parsedRows.length}/${expectedCount} items (attempt ${attempt}/2)...`,
         );
         await logStartupSync(
-          `[startupSync] ${listCmd} attempt ${attempt} received ${parsedRows.length}/${expectedCount} items. Waiting and retrying until full data is received...`,
+          `[startupSync] ${listCmd} attempt ${attempt}/2 received ${parsedRows.length}/${expectedCount} items. Retrying attempt 2/2...`,
         );
         await new Promise((r) => setTimeout(r, 1500));
       }
@@ -240,10 +287,10 @@ export async function runStartupListSync(arg1, arg2) {
       const addresses = extractPanelDeviceAddresses(rawRes);
 
       // 1. Save to temp array cache
-      syncPanelListWithTempArray(label, parsedRows);
+      const mergedRows = syncPanelListWithTempArray(label, parsedRows);
 
       // 2. Save complete list to category DB ({fire/trouble/supervisory}-list)
-      await saveListToCategoryDb(label, parsedRows);
+      await saveListToCategoryDb(label, mergedRows);
 
       // 3. Update matching assets in Firestore AssetsList and live status store
       await syncAssetsListWithPanelList(label, addresses);

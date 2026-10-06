@@ -196,6 +196,8 @@ export function extractFloorDetailsFromAsset(asset = {}, docId = "") {
 function normalizeLocationText(value) {
   return String(value || "")
     .toUpperCase()
+    .replace(/\bCRDR\b/g, "CORRIDOR")
+    .replace(/\bCORR\b/g, "CORRIDOR")
     .replace(/[^A-Z0-9]+/g, " ")
     .trim()
     .replace(/\s+/g, " ");
@@ -217,11 +219,25 @@ export async function findAllAssetsListDocsByLocationText(locationText) {
   const matches = [];
   for (const docSnap of snapshot.docs) {
     const data = docSnap.data();
-    const candidates = [data.deviceLocation, data.deviceDescription, data.description];
+    const candidates = [data.deviceLocation, data.deviceDescription, data.description, data.location];
     const matched = candidates.some(
-      (candidate) => normalizeLocationText(candidate) === target,
+      (candidate) => candidate && normalizeLocationText(candidate) === target,
     );
     if (matched) matches.push({ id: docSnap.id, data });
+  }
+
+  // If no direct exact match, try substring match if target is specific
+  if (matches.length === 0 && target.length > 6) {
+    for (const docSnap of snapshot.docs) {
+      const data = docSnap.data();
+      const candidates = [data.deviceLocation, data.deviceDescription, data.description, data.location];
+      const matched = candidates.some((candidate) => {
+        if (!candidate) return false;
+        const normCand = normalizeLocationText(candidate);
+        return normCand && (normCand.includes(target) || target.includes(normCand));
+      });
+      if (matched) matches.push({ id: docSnap.id, data });
+    }
   }
 
   return matches;

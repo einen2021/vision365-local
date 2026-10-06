@@ -4,6 +4,8 @@ import { useEffect } from "react";
 import { usePathname } from "next/navigation";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 
+import { isDebugMode } from "@/lib/debugMode";
+
 const STATUS_SYNC_INTERVAL_MS = 8000;
 const RECONNECT_INTERVAL_MS = 5000;
 const RECONNECT_RETRY_MS = 3000;
@@ -23,6 +25,7 @@ export function FirePanelProvider({ children }) {
 
   // Poll server socket state while connected.
   useEffect(() => {
+    if (isDebugMode()) return;
     const timer = setInterval(() => {
       void syncStatus();
     }, STATUS_SYNC_INTERVAL_MS);
@@ -33,6 +36,7 @@ export function FirePanelProvider({ children }) {
   // IMPORTANT: never exit this loop permanently — autoReconnect can turn
   // back on after a manual Connect, and drops must recover without a refresh.
   useEffect(() => {
+    if (isDebugMode()) return;
     let cancelled = false;
 
     const reconnectLoop = async () => {

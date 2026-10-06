@@ -482,7 +482,7 @@ export const AppProvider = ({ children }) => {
     }, "systemReset")
 
     // Turn floor markers green immediately while Firestore catches up.
-    useAssetFireStatusStore.getState().clearAllSimplexStatusInStore();
+    // useAssetFireStatusStore.getState().clearAllSimplexStatusInStore();
 
     const runBackgroundReset = async () => {
       try {
@@ -536,12 +536,12 @@ export const AppProvider = ({ children }) => {
 
   const enableDevice = useCallback(async (deviceAddress) => {
     return withMonitorPaused(async () => {
-      const loginResponse = await sendFirePanelCommand("login 333");
-      const enableResponse = await sendFirePanelCommand(`disable ${deviceAddress} off`);
+      const loginResponse = await sendPriorityPanelCommand("login 333");
+      const enableResponse = await sendPriorityPanelCommand(`disable ${deviceAddress} off`);
       useDeviceEnabledStore.getState().setEnabled(deviceAddress, true);
       return enableResponse;
     });
-  }, [sendFirePanelCommand]);
+  }, []);
 
   const fetchFirePanelState = useCallback(async () => {
     try {

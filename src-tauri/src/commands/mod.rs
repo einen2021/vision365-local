@@ -163,3 +163,10 @@ pub async fn load_window_state(app: AppHandle) -> Result<Option<WindowState>, St
     let state: WindowState = serde_json::from_str(&json).map_err(|e| e.to_string())?;
     Ok(Some(state))
 }
+
+#[tauri::command]
+pub fn emergency_exit(app: AppHandle) {
+    crate::log_message(&app, "Emergency exit requested by user");
+    std::process::exit(0);
+}
+

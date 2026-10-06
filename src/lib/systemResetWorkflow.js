@@ -137,8 +137,8 @@ export async function handleSystemResetCompleteWorkflow() {
         const resF = await sendCommand("list f", 15000);
         const parsedRows = parsePanelListResponse(resF);
         const fireAddresses = extractPanelDeviceAddresses(resF);
-        syncPanelListWithTempArray("Fire", parsedRows);
-        await saveListToCategoryDb("Fire", parsedRows);
+        const mergedRows = syncPanelListWithTempArray("Fire", parsedRows);
+        await saveListToCategoryDb("Fire", mergedRows);
         await syncAssetsListWithPanelList("Fire", fireAddresses);
       } catch (err) {
         console.error("[systemResetWorkflow] list f failed:", err);
@@ -152,8 +152,8 @@ export async function handleSystemResetCompleteWorkflow() {
         const resT = await sendCommand("list t", 20000);
         const parsedRows = parsePanelListResponse(resT);
         const troubleAddresses = extractPanelDeviceAddresses(resT);
-        syncPanelListWithTempArray("Trouble", parsedRows);
-        await saveListToCategoryDb("Trouble", parsedRows);
+        const mergedRows = syncPanelListWithTempArray("Trouble", parsedRows);
+        await saveListToCategoryDb("Trouble", mergedRows);
         await syncAssetsListWithPanelList("Trouble", troubleAddresses);
       } catch (err) {
         console.error("[systemResetWorkflow] list t failed:", err);
@@ -167,8 +167,8 @@ export async function handleSystemResetCompleteWorkflow() {
         const resS = await sendCommand("list s", 15000);
         const parsedRows = parsePanelListResponse(resS);
         const supAddresses = extractPanelDeviceAddresses(resS);
-        syncPanelListWithTempArray("Supervisory", parsedRows);
-        await saveListToCategoryDb("Supervisory", parsedRows);
+        const mergedRows = syncPanelListWithTempArray("Supervisory", parsedRows);
+        await saveListToCategoryDb("Supervisory", mergedRows);
         await syncAssetsListWithPanelList("Supervisory", supAddresses);
       } catch (err) {
         console.error("[systemResetWorkflow] list s failed:", err);
@@ -276,9 +276,9 @@ export async function syncFireListAssets() {
     const fireAddresses = extractPanelDeviceAddresses(rawText);
 
     // Save complete list to DB history & in-memory cache
-    syncPanelListWithTempArray("Fire", parsedRows);
+    const mergedRows = syncPanelListWithTempArray("Fire", parsedRows);
     // Persist to fire-list DB — clears the category when the panel reports no active fire items.
-    await saveListToCategoryDb("Fire", parsedRows);
+    await saveListToCategoryDb("Fire", mergedRows);
 
     if (fireAddresses.length > 0) {
       console.log(`[syncFireListAssets] Found ${fireAddresses.length} fire device address(es):`, fireAddresses);
@@ -339,9 +339,9 @@ export async function syncTroubleListAssets() {
     const troubleAddresses = extractPanelDeviceAddresses(rawText);
 
     // Save complete list to DB history & in-memory cache
-    syncPanelListWithTempArray("Trouble", parsedRows);
+    const mergedRows = syncPanelListWithTempArray("Trouble", parsedRows);
     // Persist to trouble-list DB — clears the category when the panel reports no active trouble items.
-    await saveListToCategoryDb("Trouble", parsedRows);
+    await saveListToCategoryDb("Trouble", mergedRows);
 
     if (troubleAddresses.length > 0) {
       console.log(`[syncTroubleListAssets] Found ${troubleAddresses.length} trouble device address(es):`, troubleAddresses);
@@ -402,9 +402,9 @@ export async function syncSupervisoryListAssets() {
     const supAddresses = extractPanelDeviceAddresses(rawText);
 
     // Save complete list to DB history & in-memory cache
-    syncPanelListWithTempArray("Supervisory", parsedRows);
+    const mergedRows = syncPanelListWithTempArray("Supervisory", parsedRows);
     // Persist to supervisory-list DB — clears the category when the panel reports no active supervisory items.
-    await saveListToCategoryDb("Supervisory", parsedRows);
+    await saveListToCategoryDb("Supervisory", mergedRows);
 
     if (supAddresses.length > 0) {
       console.log(`[syncSupervisoryListAssets] Found ${supAddresses.length} supervisory device address(es):`, supAddresses);

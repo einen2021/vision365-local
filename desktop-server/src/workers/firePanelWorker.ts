@@ -180,8 +180,9 @@ class PanelDataParser {
     if (this._pendingHeader && this._trySystemResetDetail(line)) return;
     if (this._pendingHeader && this._tryEventDetail(line)) return;
     if (this._tryStandaloneSystemReset(line, rawLine)) return;
-    if (this._tryListEntry(line)) return;
     if (this._trySystemLine(line, rawLine)) return;
+    if (this._tryStandaloneAlarmEvent(line, rawLine)) return;
+    if (this._tryListEntry(line)) return;
     if (this._trySplitGluedLine(line)) return;
 
     this._flushPendingHeader();
@@ -206,6 +207,13 @@ class PanelDataParser {
   }
 
   private _tryEventHeader(line: string): boolean {
+    if (
+      /\bshow\b|PRIMARY\s+STATUS|ENABLED\s+STATE|CUSTOM\s+LABEL|DEVICE\s+TYPE|POINT\s+TYPE|RAW\s+ANALOG|ALARM\s+THRESHOLD|CARD\s+TYPE/i.test(
+        line,
+      )
+    ) {
+      return false;
+    }
     const m = RE_EVENT_HEADER.exec(line);
     if (!m) return false;
     if (RE_GLUE_BOUNDARY.test(line)) return false;
@@ -300,18 +308,68 @@ class PanelDataParser {
     return true;
   }
 
+  private _tryStandaloneAlarmEvent(line: string, rawLine: string): boolean {
+    const trimmed = line.trim();
+    // Do NOT treat show command outputs, status queries, or device property dumps as standalone alarms
+    if (
+      /\bshow\b|PRIMARY\s+STATUS|ENABLED\s+STATE|CUSTOM\s+LABEL|DEVICE\s+TYPE|POINT\s+TYPE|RAW\s+ANALOG|ALARM\s+THRESHOLD|CARD\s+TYPE/i.test(
+        trimmed,
+      )
+    ) {
+      return false;
+    }
+    if (/FIRE\s+ALARM\b/i.test(trimmed)) {
+      this._flushPendingHeader();
+      const { location, device } = splitLocationAndDevice(trimmed);
+      const isAcked = /ACKED/i.test(trimmed);
+      this._routeEvent({
+        kind: isAcked ? "fire-acknowledged" : "fire",
+        location,
+        device: device || "FIRE DEVICE",
+        status: isAcked ? "FIRE ALARM ACKED" : "FIRE ALARM",
+        raw: rawLine,
+        at: new Date().toISOString(),
+      });
+      return true;
+    }
+    return false;
+  }
+
   private _tryEventDetail(line: string): boolean {
+    const trimmed = line.trim();
+    if (
+      /\bshow\b|PRIMARY\s+STATUS|ENABLED\s+STATE|CUSTOM\s+LABEL|DEVICE\s+TYPE|POINT\s+TYPE|RAW\s+ANALOG|ALARM\s+THRESHOLD|CARD\s+TYPE/i.test(
+        trimmed,
+      )
+    ) {
+      this._pendingHeader = null;
+      return false;
+    }
+    let device = "";
+    let status = "";
+
     const m = RE_EVENT_DETAIL.exec(line);
-    if (!m) return false;
-    const device = m[1].trim();
-    const status = m[2].trim();
+    if (m) {
+      device = m[1].trim();
+      status = m[2].trim();
+    } else {
+      const matchStatus = trimmed.match(
+        /(FIRE\s+ALARM(?:\s+ACKED)?|FIRE(?:\s+ACKED)?|NORMAL\s+ACKED|TROUBLE(?:\s+ACKED)?|TRBL(?:\s+ACKED)?|SUPERVISORY(?:\s+ACKED)?|SUPV(?:\s+ACKED)?|ACKED)$/i,
+      );
+      if (matchStatus) {
+        status = matchStatus[1].trim();
+        device = trimmed.slice(0, matchStatus.index).trim();
+      } else {
+        return false;
+      }
+    }
 
     const record: Omit<PanelLogEntry, "kind"> = {
       time: this._pendingHeader!.time,
       weekday: this._pendingHeader!.weekday,
       date: this._pendingHeader!.date,
       location: this._pendingHeader!.location,
-      device,
+      device: device || "FIRE DEVICE",
       status,
       raw: `${this._pendingHeader!.raw} | ${line}`,
       at: new Date().toISOString(),
@@ -421,8 +479,14 @@ class PanelDataParser {
       return true;
     }
 
-    // Show counts lines: show counts, FIRE = N, TROUBLE = N, SUPERVISORY = N, PRIORITY2 = N
-    if (/show\s+counts|FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+/i.test(line)) {
+    // Show command outputs: show <address>, show counts, PRIMARY STATUS, ENABLED STATE, DEVICE TYPE, POINT TYPE, CUSTOM LABEL, RAW ANALOG, etc.
+    if (
+      /\bshow\b|PRIMARY\s+STATUS|ENABLED\s+STATE|CUSTOM\s+LABEL|DEVICE\s+TYPE|POINT\s+TYPE|RAW\s+ANALOG|ALARM\s+THRESHOLD|CARD\s+TYPE/i.test(
+        line,
+      ) ||
+      /show\s+counts|FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+/i.test(line)
+    ) {
+      this._pendingHeader = null;
       this._onEntry({ kind: "system", systemType: "banner", raw: rawLine, at: new Date().toISOString() });
       return true;
     }
@@ -784,8 +848,20 @@ function attachSocketHandlers(sock: net.Socket) {
 
   // Feed all incoming panel data into the parser & collect command responses
   sock.on("data", (chunk: Buffer) => {
-    // 1. Feed parser for real-time live log persistence & SSE
-    parser?.feed(chunk);
+    // 1. If an interactive query command is active (show <address>, cshow, login, disable, enable),
+    // do not feed its response chunks to the spontaneous alarm parser.
+    const isInteractiveQuery =
+      activeCommand &&
+      (activeCommand.command.toLowerCase().startsWith("show") ||
+        activeCommand.command.toLowerCase().startsWith("cshow") ||
+        activeCommand.command.toLowerCase().startsWith("login") ||
+        activeCommand.command.toLowerCase().startsWith("disable") ||
+        activeCommand.command.toLowerCase().startsWith("enable") ||
+        activeCommand.command.toLowerCase().startsWith("set"));
+
+    if (!isInteractiveQuery) {
+      parser?.feed(chunk);
+    }
 
     // 2. If an active command is waiting for response, collect the chunk
     if (activeCommand) {
@@ -813,12 +889,12 @@ function attachSocketHandlers(sock: net.Socket) {
           isComplete = true;
         }
       } else if (lowerCmd.startsWith("show")) {
-        // Complete when show output contains PRIMARY STATUS / POINT ADDRESS / ENABLED STATE and ends with prompt "-" or _DNE
-        if (
-          (/PRIMARY STATUS|POINT ADDRESS|ENABLED STATE|UNVERIFIED/i.test(trimmed) &&
-            (trimmed.endsWith("-") || /-\s*$/.test(trimmed) || /_DNE|_END/i.test(trimmed) || trimmed.includes("\n-"))) ||
-          /%ERROR|INVALID|NOT FOUND|ACCESS DENIED/i.test(trimmed)
-        ) {
+        const hasError = /%ERROR|INVALID|NOT FOUND|ACCESS DENIED/i.test(trimmed);
+        const hasPrimaryStatus = /PRIMARY STATUS\s*(?::|\s)\s*(NORM|FIRE|DIRT|DISA|DISABLE|ABNOR|NO\s*ANS|SUP|OPEN|SHORT|TEST|OFF|ON|ACTIVE|INACT|UNVER)/i.test(trimmed);
+        const hasPromptAtEnd = trimmed.endsWith("-") || /-\s*$/.test(trimmed) || /_DNE|_END/i.test(trimmed);
+        const hasEnabledState = /ENABLED STATE\s*(?::|\s)\s*(ENABLED|DISABLED)/i.test(trimmed);
+
+        if (hasError || (hasPrimaryStatus && (hasPromptAtEnd || hasEnabledState))) {
           isComplete = true;
         }
       } else if (lowerCmd.startsWith("disable") || lowerCmd.startsWith("enable")) {
@@ -905,13 +981,17 @@ function attachSocketHandlers(sock: net.Socket) {
           return;
         }
 
-        // Special check for show <device>: do not complete on silence if status/details have not arrived yet
+        // Special check for show <device>: do not complete on silence if PRIMARY STATUS has not arrived
         if (
           lowerCmd.startsWith("show") &&
-          !lowerCmd.startsWith("show counts") &&
-          !/PRIMARY STATUS|POINT ADDRESS|ENABLED STATE|%ERROR|NOT FOUND|ACCESS DENIED/i.test(bufTrimmed)
+          !lowerCmd.startsWith("show counts")
         ) {
-          return;
+          const hasError = /%ERROR|INVALID|NOT FOUND|ACCESS DENIED/i.test(bufTrimmed);
+          const hasPrimaryStatus = /PRIMARY STATUS\s*(?::|\s)\s*(NORM|FIRE|DIRT|DISA|DISABLE|ABNOR|NO\s*ANS|SUP|OPEN|SHORT|TEST|OFF|ON|ACTIVE|INACT|UNVER)/i.test(bufTrimmed);
+
+          if (!hasError && !hasPrimaryStatus) {
+            return;
+          }
         }
 
         // Special check for list: if expectedCount is specified, keep collecting unless silence has elapsed with sufficient data
@@ -987,17 +1067,10 @@ parentPort?.on("message", (msg: IncomingMessage) => {
   }
 
   if (msg.type === "command") {
-    if (msg.priority) {
-      // Priority commands (ack/silence) must run now — stop whatever else is
-      // in flight instead of waiting behind it.
-      cancelActiveCommandForPriority();
+    if (!activeCommand) {
       executeCommand(msg);
     } else {
-      if (!activeCommand) {
-        executeCommand(msg);
-      } else {
-        commandQueue.push({ msg });
-      }
+      commandQueue.push({ msg });
     }
     return;
   }

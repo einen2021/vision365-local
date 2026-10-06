@@ -13,6 +13,16 @@ import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Loader2,
   Network,
   Plug,
@@ -149,14 +159,26 @@ function formatTime(iso) {
 // ---------------------------------------------------------------------------
 // PanelLogConsole
 // ---------------------------------------------------------------------------
-function PanelLogConsole({ connected }) {
+function PanelLogConsole({ connected, isAdmin: propIsAdmin }) {
   const [logs, setLogs] = useState([]);
   const [paused, setPaused] = useState(false);
   const [filter, setFilter] = useState("all");
   const [counts, setCounts] = useState({});
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
   const bottomRef = useRef(null);
   const pausedRef = useRef(false);
   pausedRef.current = paused;
+  const { toast } = useToast();
+
+  const { role, userRole, user } = usePageAuth();
+  const isAdmin = useMemo(() => {
+    if (typeof propIsAdmin === "boolean") return propIsAdmin;
+    const session = getStoredSessionUser();
+    const r = String(role || userRole || user?.role || session?.role || "").toLowerCase();
+    const d = String(user?.designation || session?.designation || "").toLowerCase();
+    return r === "admin" || d === "admin" || d === "administrator";
+  }, [propIsAdmin, role, userRole, user]);
 
   // ── Initial log fetch & continuous real-time SSE stream ───────────────────
   useEffect(() => {
@@ -202,7 +224,16 @@ function PanelLogConsole({ connected }) {
           if (!active) return;
           try {
             const entry = JSON.parse(e.data);
-            if (!entry || !entry.kind) return;
+            if (!entry) return;
+
+            // Real-time remote clear notification
+            if (entry.cleared) {
+              setLogs([]);
+              setCounts({});
+              return;
+            }
+
+            if (!entry.kind) return;
 
             setLogs((prev) => {
               // Deduplicate by id if present, or by raw+at
@@ -250,10 +281,48 @@ function PanelLogConsole({ connected }) {
     }
   }, [logs]);
 
-  const clearLogs = useCallback(() => {
+  const clearDisplayOnly = useCallback(() => {
     setLogs([]);
     setCounts({});
   }, []);
+
+  const handleClearSavedLogs = async () => {
+    if (!isAdmin || isClearing) return;
+    setIsClearing(true);
+    try {
+      const res = await fetch(apiUrl("/api/telnet/fire-panel/logs"), {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          "x-user-role": "admin",
+        },
+        body: JSON.stringify({ role: "admin" }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.error || "Failed to clear saved logs from server");
+      }
+      setLogs([]);
+      setCounts({});
+      setIsConfirmOpen(false);
+      toast({
+        title: "Saved logs cleared",
+        description:
+          data?.deleted != null
+            ? `Successfully cleared ${data.deleted} previous saved log entries.`
+            : "All previous saved logs have been cleared from database.",
+      });
+    } catch (error) {
+      console.error("Error clearing saved logs:", error);
+      toast({
+        title: "Clear logs failed",
+        description: error?.message || "Could not clear saved logs.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsClearing(false);
+    }
+  };
 
   // ── Filtering ─────────────────────────────────────────────────────────────
   const filters = [
@@ -278,80 +347,146 @@ function PanelLogConsole({ connected }) {
   const troubleCount = counts.trouble ?? 0;
 
   return (
-    <Card>
-      <CardHeader className="pb-2">
-        <div className="flex items-center justify-between flex-wrap gap-2">
-          <div className="flex items-center gap-2">
-            <Terminal className="h-4 w-4 text-muted-foreground" />
-            <CardTitle className="text-base">Panel live log</CardTitle>
-            {fireCount > 0 && (
-              <Badge variant="destructive" className="text-xs">{fireCount} fire</Badge>
-            )}
-            {troubleCount > 0 && (
-              <Badge className="text-xs bg-yellow-600 hover:bg-yellow-600">{troubleCount} trouble</Badge>
-            )}
-          </div>
-          <div className="flex items-center gap-1">
-            <Button size="sm" variant="ghost" onClick={() => setPaused((p) => !p)} className="h-7 px-2 text-xs">
-              {paused ? <PlayCircle className="h-3.5 w-3.5 mr-1" /> : <PauseCircle className="h-3.5 w-3.5 mr-1" />}
-              {paused ? "Resume" : "Pause"}
-            </Button>
-            <Button size="sm" variant="ghost" onClick={clearLogs} className="h-7 px-2 text-xs text-muted-foreground">
-              <Trash2 className="h-3.5 w-3.5" />
-            </Button>
-          </div>
-        </div>
-        <CardDescription>
-          Live TCP stream from fire panel — parsed and categorised in real-time
-        </CardDescription>
-        {/* Filter tabs */}
-        <div className="flex flex-wrap gap-1 pt-1">
-          {filters.map((f) => (
-            <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors ${
-                filter === f
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-muted text-muted-foreground hover:bg-muted/80"
-              }`}
-            >
-              {f === "all" ? `All (${logs.length})` : `${KIND_META[f]?.label ?? f} (${counts[f] ?? 0})`}
-            </button>
-          ))}
-        </div>
-      </CardHeader>
-      <CardContent className="p-0">
-        {displayed.length === 0 ? (
-          <p className="p-4 text-xs text-muted-foreground">
-            {!connected ? "Connect to the panel to stream live logs." : "Waiting for panel data…"}
-          </p>
-        ) : (
-          <div className="max-h-72 overflow-auto font-mono text-[11px]">
-            {displayed.map((entry, i) => {
-              const meta = KIND_META[entry.kind] ?? KIND_META.other;
-              return (
-                <div
-                  key={entry.id ?? i}
-                  className={`flex items-start gap-2 border-b border-border/30 px-3 py-1 leading-snug last:border-0 ${meta.bg}`}
+    <>
+      <Card>
+        <CardHeader className="pb-2">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2">
+              <Terminal className="h-4 w-4 text-muted-foreground" />
+              <CardTitle className="text-base">Panel live log</CardTitle>
+              {fireCount > 0 && (
+                <Badge variant="destructive" className="text-xs">{fireCount} fire</Badge>
+              )}
+              {troubleCount > 0 && (
+                <Badge className="text-xs bg-yellow-600 hover:bg-yellow-600">{troubleCount} trouble</Badge>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Button size="sm" variant="ghost" onClick={() => setPaused((p) => !p)} className="h-7 px-2 text-xs">
+                {paused ? <PlayCircle className="h-3.5 w-3.5 mr-1" /> : <PauseCircle className="h-3.5 w-3.5 mr-1" />}
+                {paused ? "Resume" : "Pause"}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={clearDisplayOnly}
+                className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+                title="Clear current console screen without deleting stored database logs"
+              >
+                Clear screen
+              </Button>
+              {isAdmin ? (
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => setIsConfirmOpen(true)}
+                  disabled={isClearing}
+                  className="h-7 px-2.5 text-xs font-medium"
+                  title="Permanently clear saved logs from database (Admin role only)"
                 >
-                  <span className="shrink-0 text-muted-foreground/60 tabular-nums">
-                    {formatTime(entry.at)}
-                  </span>
-                  <span className={`shrink-0 w-11 text-right font-bold ${meta.color}`}>
-                    {meta.label}
-                  </span>
-                  <span className="break-all text-foreground/90">
-                    {formatLogRow(entry)}
-                  </span>
-                </div>
-              );
-            })}
-            <div ref={bottomRef} />
+                  {isClearing ? (
+                    <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5 mr-1" />
+                  )}
+                  Clear saved logs
+                </Button>
+              ) : null}
+            </div>
           </div>
-        )}
-      </CardContent>
-    </Card>
+          <CardDescription>
+            Live TCP stream from fire panel — parsed and categorised in real-time
+          </CardDescription>
+          {/* Filter tabs */}
+          <div className="flex flex-wrap gap-1 pt-1">
+            {filters.map((f) => (
+              <button
+                key={f}
+                onClick={() => setFilter(f)}
+                className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                  filter === f
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted text-muted-foreground hover:bg-muted/80"
+                }`}
+              >
+                {f === "all" ? `All (${logs.length})` : `${KIND_META[f]?.label ?? f} (${counts[f] ?? 0})`}
+              </button>
+            ))}
+          </div>
+        </CardHeader>
+        <CardContent className="p-0">
+          {displayed.length === 0 ? (
+            <p className="p-4 text-xs text-muted-foreground">
+              {!connected ? "Connect to the panel to stream live logs." : "Waiting for panel data…"}
+            </p>
+          ) : (
+            <div className="max-h-72 overflow-auto font-mono text-[11px]">
+              {displayed.map((entry, i) => {
+                const meta = KIND_META[entry.kind] ?? KIND_META.other;
+                return (
+                  <div
+                    key={entry.id ?? i}
+                    className={`flex items-start gap-2 border-b border-border/30 px-3 py-1 leading-snug last:border-0 ${meta.bg}`}
+                  >
+                    <span className="shrink-0 text-muted-foreground/60 tabular-nums">
+                      {formatTime(entry.at)}
+                    </span>
+                    <span className={`shrink-0 w-11 text-right font-bold ${meta.color}`}>
+                      {meta.label}
+                    </span>
+                    <span className="break-all text-foreground/90">
+                      {formatLogRow(entry)}
+                    </span>
+                  </div>
+                );
+              })}
+              <div ref={bottomRef} />
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {isAdmin ? (
+        <AlertDialog open={isConfirmOpen} onOpenChange={setIsConfirmOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle className="flex items-center gap-2 text-destructive">
+                <Trash2 className="h-5 w-5" />
+                Clear previous saved logs?
+              </AlertDialogTitle>
+              <AlertDialogDescription className="space-y-2 text-sm text-muted-foreground">
+                <span className="block">
+                  This will permanently delete all previously saved fire panel logs from the local database.
+                </span>
+                <span className="block font-medium text-foreground">
+                  This action cannot be undone. Live monitoring will remain active and continue capturing new incoming events.
+                </span>
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={isClearing}>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={(e) => {
+                  e.preventDefault();
+                  handleClearSavedLogs();
+                }}
+                disabled={isClearing}
+                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              >
+                {isClearing ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Clearing...
+                  </>
+                ) : (
+                  "Yes, clear saved logs"
+                )}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      ) : null}
+    </>
   );
 }
 
@@ -568,7 +703,7 @@ export default function NetworkTelnetPage() {
               ) : null}
 
               {/* Live log console — replaces the old CVAL-only pre block */}
-              <PanelLogConsole connected={isConnected} />
+              <PanelLogConsole connected={isConnected} isAdmin={isAdmin} />
 
               <div className="space-y-2">
                 <p className="text-xs text-muted-foreground">

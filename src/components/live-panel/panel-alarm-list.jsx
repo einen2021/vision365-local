@@ -22,8 +22,12 @@ const ROW_HIGHLIGHT_CLASSES = {
 };
 
 function statusBadgeClass(status) {
-  const key = String(status || "").replace(/\*$/, "").toUpperCase();
-  return STATUS_BADGE_CLASSES[key] || "border-muted bg-muted/40 text-muted-foreground";
+  const text = String(status || "").replace(/\*$/, "").toUpperCase();
+  if (STATUS_BADGE_CLASSES[text]) return STATUS_BADGE_CLASSES[text];
+  if (/FIRE|ALRM/i.test(text)) return STATUS_BADGE_CLASSES.FIRE;
+  if (/TRBL|TROUBLE|DIRTY|DISABLE/i.test(text)) return STATUS_BADGE_CLASSES.TRBL;
+  if (/SUPV|SUPR|SUPERVISORY/i.test(text)) return STATUS_BADGE_CLASSES.SUPV;
+  return "border-muted bg-muted/40 text-muted-foreground";
 }
 
 // Time | Address | Location | Device type | Status

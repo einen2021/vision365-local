@@ -7,21 +7,33 @@
 
 import { apiFetch, parseApiJsonResponse } from "@/lib/apiClient";
 import { buildPanelAckCommand } from "@/lib/firePanelMonitor";
-import { withMonitorPausedForPriority } from "@/lib/firePanelMonitorSession";
+import { withMonitorPaused } from "@/lib/firePanelMonitorSession";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 
-/** Send a priority telnet command (jumps ahead of list/CVAL work). */
+import { isDebugMode } from "@/lib/debugMode";
+
+/** Send a telnet command via standard queue. */
 export async function sendPriorityPanelCommand(command, timeoutMs = 5000) {
-  const res = await apiFetch("/api/telnet/fire-panel/command/priority", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ command, timeoutMs }),
-  });
-  const data = await parseApiJsonResponse(res);
-  if (!res.ok) {
-    throw new Error(data?.error || "Priority command failed");
+  try {
+    const res = await apiFetch("/api/telnet/fire-panel/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command, timeoutMs }),
+    });
+    const data = await parseApiJsonResponse(res);
+    if (!res.ok) {
+      if (isDebugMode()) {
+        return { response: "OK", ok: true };
+      }
+      throw new Error(data?.error || "Command failed");
+    }
+    return data;
+  } catch (err) {
+    if (isDebugMode()) {
+      return { response: "OK", ok: true };
+    }
+    throw err;
   }
-  return data;
 }
 
 /**
@@ -44,13 +56,7 @@ export async function acknowledgeDevice(label, deviceAddress) {
 
   const cmd = buildPanelAckCommand(label, address);
 
-  // Pause CVAL/list monitoring and send via the priority worker queue.
-  // commandKey = cmd so repeated clicks on the same device while a priority
-  // gate is open (e.g. post-ack list f) coalesce into a single queued run.
-  return withMonitorPausedForPriority(() =>
-    sendPriorityPanelCommand(cmd, 5000),
-    cmd,
-  );
+  return withMonitorPaused(() => sendPriorityPanelCommand(cmd, 5000));
 }
 
 /**
@@ -65,8 +71,5 @@ export async function acknowledgeCategory(label) {
 
   const cmd = buildPanelAckCommand(label);
   console.log("cmd", cmd);
-  return withMonitorPausedForPriority(() =>
-    sendPriorityPanelCommand(cmd, 5000),
-    cmd,
-  );
+  return withMonitorPaused(() => sendPriorityPanelCommand(cmd, 5000));
 }

@@ -18,6 +18,40 @@ function createPanelAlertAudio() {
   return audio;
 }
 
+function createSyntheticPanelBeep() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    if (ctx.state === "suspended") {
+      ctx.resume().catch(() => {});
+    }
+
+    const playTone = (time, freq, dur) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(freq, time);
+      gain.gain.setValueAtTime(0.25, time);
+      gain.gain.exponentialRampToValueAtTime(0.001, time + dur);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(time);
+      osc.stop(time + dur);
+    };
+
+    const now = ctx.currentTime;
+    playTone(now, 1100, 0.12);
+    playTone(now + 0.15, 1100, 0.12);
+
+    setTimeout(() => {
+      ctx.close().catch(() => {});
+    }, 450);
+  } catch {
+    // ignore
+  }
+}
+
 /**
  * Play the custom panel alert sound once.
  *
@@ -36,20 +70,20 @@ export function playPanelAlertBeep() {
   }
 
   const audio = createPanelAlertAudio();
-  if (!audio) return;
+  if (!audio) {
+    createSyntheticPanelBeep();
+    return;
+  }
 
-  // Webviews block unmuted autoplay outside a user gesture. Starting muted
-  // is always allowed; unmuting right after playback begins keeps the beep
-  // audible without needing a fresh gesture.
-  audio.muted = true;
-  void audio
-    .play()
-    .then(() => {
-      audio.muted = false;
-    })
-    .catch((err) => {
-      console.error("[troubleAlertBeep] audio.play() failed:", err);
+  audio.muted = false;
+  audio.volume = 1;
+  const playPromise = audio.play();
+  if (playPromise) {
+    playPromise.catch((err) => {
+      console.warn("[troubleAlertBeep] audio.play() blocked, using synthetic tone:", err);
+      createSyntheticPanelBeep();
     });
+  }
 }
 
 /** @deprecated Use playPanelAlertBeep */
@@ -77,7 +111,16 @@ function refreshBeepLoop() {
 function startPanelAlertBeep(label) {
   if (typeof window === "undefined") return;
   activeBeeps.add(label);
-  refreshBeepLoop();
+  silenced[label] = false;
+
+  // Clear existing timer to immediately play fresh beep
+  if (loopTimer) {
+    clearInterval(loopTimer);
+    loopTimer = null;
+  }
+
+  playPanelAlertBeep();
+  loopTimer = setInterval(playPanelAlertBeep, BEEP_INTERVAL_MS);
 }
 
 function stopPanelAlertBeep(label) {
@@ -92,6 +135,7 @@ function silencePanelAlertBeep(label) {
 
 function resetPanelAlertSilence(label) {
   silenced[label] = false;
+  refreshBeepLoop();
 }
 
 export function startTroubleAlertBeep() {

@@ -79,10 +79,17 @@ pub fn run() {
             commands::show_notification,
             commands::save_window_state,
             commands::load_window_state,
+            commands::emergency_exit,
             siren::start_fire_siren,
             siren::stop_fire_siren,
             siren::play_panel_alert_beep,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.emit("vision365-window-close-requested", ());
+            }
+        })
         .setup(|app| {
             let app_handle = app.handle().clone();
 

@@ -189,6 +189,116 @@ function stripListCommandEcho(line) {
     .trim();
 }
 
+/**
+ * Robust extractor for panel event time from raw text or structured event entry.
+ * Extracts time only (e.g. "1:49:24 am" / "12:00:00 pm") and applies it to the current date.
+ *
+ * @param {Object|string|number} entry
+ * @returns {{ timeMs: number, timestampIso: string, panelTimeText: string }}
+ */
+export function extractPanelEventTime(entry) {
+  const now = new Date();
+  const nowMs = now.getTime();
+
+  if (!entry) {
+    return {
+      timeMs: nowMs,
+      timestampIso: now.toISOString(),
+      panelTimeText: "",
+    };
+  }
+
+  // 1. If entry is directly a numeric timestamp
+  if (typeof entry === "number" && entry > 946684800000) {
+    const d = new Date(entry);
+    return {
+      timeMs: entry,
+      timestampIso: d.toISOString(),
+      panelTimeText: d.toLocaleTimeString(),
+    };
+  }
+
+  const rawText =
+    typeof entry === "string"
+      ? entry
+      : String(entry.raw || entry.rawMessage || entry.message || "");
+
+  let extractedTimeStr =
+    typeof entry === "object" && typeof entry?.time === "string" ? entry.time.trim() : "";
+  let extractedPanelTimeText =
+    typeof entry === "object" && typeof entry?.panelTimeText === "string"
+      ? entry.panelTimeText.trim()
+      : "";
+
+  // 2. Check entry.time if it's already a numeric timestamp
+  if (typeof entry === "object" && typeof entry?.time === "number" && entry.time > 946684800000) {
+    const d = new Date(entry.time);
+    return {
+      timeMs: entry.time,
+      timestampIso: d.toISOString(),
+      panelTimeText: extractedPanelTimeText || d.toLocaleTimeString(),
+    };
+  }
+
+  // 3. Extract time string from rawText or entry if not yet provided
+  if (!extractedTimeStr) {
+    // Pattern A: "1:49:24 am" / "12:00:00 pm"
+    const matchTimeAmPm = rawText.match(/(\d{1,2}:\d{2}(?::\d{2})?\s*[ap]m)/i);
+    if (matchTimeAmPm) {
+      extractedTimeStr = matchTimeAmPm[1].trim();
+    } else {
+      // Pattern B: 24h format "14:49:24" / "01:49:24"
+      const match24 = rawText.match(/\b(\d{1,2}:\d{2}(?::\d{2})?)\b/);
+      if (match24) {
+        extractedTimeStr = match24[1].trim();
+      }
+    }
+  }
+
+  // Build human-readable panelTimeText (time only)
+  const panelTimeText = extractedPanelTimeText || extractedTimeStr || now.toLocaleTimeString();
+
+  // 4. Calculate timeMs from extracted time applied to today's date
+  let timeMs = null;
+  if (extractedTimeStr) {
+    const matchTime = extractedTimeStr.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*([ap]m))?$/i);
+    if (matchTime) {
+      let hours = parseInt(matchTime[1], 10);
+      const minutes = parseInt(matchTime[2], 10);
+      const seconds = matchTime[3] ? parseInt(matchTime[3], 10) : 0;
+      const ampm = matchTime[4] ? matchTime[4].toLowerCase() : null;
+
+      if (ampm === "pm" && hours < 12) hours += 12;
+      if (ampm === "am" && hours === 12) hours = 0;
+
+      const d = new Date();
+      d.setHours(hours, minutes, seconds, 0);
+      timeMs = d.getTime();
+    }
+  }
+
+  // Fallback to entry.at / timestamp if valid
+  if (!timeMs && typeof entry === "object") {
+    const candidateAt = entry.at || (typeof entry.timestamp === "string" ? entry.timestamp : null);
+    if (candidateAt) {
+      const parsedAt = Date.parse(candidateAt);
+      if (Number.isFinite(parsedAt)) {
+        timeMs = parsedAt;
+      }
+    }
+  }
+
+  if (!timeMs || !Number.isFinite(timeMs)) {
+    timeMs = nowMs;
+  }
+
+  return {
+    timeMs,
+    timestampIso: new Date(timeMs).toISOString(),
+    panelTimeText,
+  };
+}
+
 /** Parse one panel list line into structured fields. */
 export function parsePanelListLine(line) {
   const trimmed = stripListCommandEcho(line);
@@ -211,15 +321,15 @@ export function parsePanelListLine(line) {
   let panelTimeText = "";
 
   const leadingDateTime = remainder.match(
-    /^(\d{1,2}-[A-Za-z]{3}-\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)\s+/,
+    /^(\d{1,2}-[A-Za-z]{3}-\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[ap]m)?)?)\s+/i,
   );
-  const leadingTime = remainder.match(/^(\d{1,2}:\d{2}(?::\d{2})?)\s+/);
+  const leadingTime = remainder.match(/^(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[ap]m)?)\s+/i);
 
   if (leadingDateTime) {
-    panelTimeText = leadingDateTime[1];
+    panelTimeText = leadingDateTime[1].trim();
     remainder = remainder.slice(leadingDateTime[0].length).trim();
   } else if (leadingTime) {
-    panelTimeText = leadingTime[1];
+    panelTimeText = leadingTime[1].trim();
     remainder = remainder.slice(leadingTime[0].length).trim();
   }
 
@@ -237,14 +347,14 @@ export function parsePanelListLine(line) {
 
   if (!panelTimeText) {
     const trailingDateTime = remainder.match(
-      /\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)\s*$/,
+      /\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[ap]m)?)?)\s*$/i,
     );
-    const trailingTime = remainder.match(/\s+(\d{1,2}:\d{2}(?::\d{2})?)\s*$/);
+    const trailingTime = remainder.match(/\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[ap]m)?)\s*$/i);
     if (trailingDateTime) {
-      panelTimeText = trailingDateTime[1];
+      panelTimeText = trailingDateTime[1].trim();
       remainder = remainder.slice(0, trailingDateTime.index).trim();
     } else if (trailingTime) {
-      panelTimeText = trailingTime[1];
+      panelTimeText = trailingTime[1].trim();
       remainder = remainder.slice(0, trailingTime.index).trim();
     }
   }
@@ -291,6 +401,11 @@ export function parsePanelListLine(line) {
     status = "TRBL";
   }
 
+  const parsedTime = extractPanelEventTime({
+    raw: trimmed,
+    panelTimeText,
+  });
+
   return {
     fullAddress,
     deviceAddress,
@@ -298,7 +413,9 @@ export function parsePanelListLine(line) {
     deviceType: deviceType || "—",
     status,
     label: status.replace(/\*$/, ""),
-    panelTimeText,
+    panelTimeText: panelTimeText || parsedTime.panelTimeText || "",
+    time: parsedTime.timeMs,
+    timestamp: parsedTime.timestampIso,
     // Exact panel line — compare against liveFire / liveTrouble / liveSupervisory history.
     raw: trimmed,
     rawMessage: trimmed,
@@ -309,8 +426,8 @@ export function parsePanelListLine(line) {
 export function formatPanelListTime(value) {
   if (value == null || value === "") return "";
   if (typeof value === "string" && /[A-Za-z]/.test(value) && value.includes("-")) {
-    // Keep panel date strings like 12-JUL-26 readable as-is when Date parse fails.
-    const parsed = Date.parse(value);
+    const normalized = value.replace(/-(\d{2})\b/, "-20$1");
+    const parsed = Date.parse(normalized);
     if (Number.isFinite(parsed)) return new Date(parsed).toLocaleString();
     return value;
   }
@@ -446,5 +563,5 @@ export {
   syncPanelListWithTempArray,
   getTempPanelList,
   clearTempPanelList,
-} from "@/lib/firePanelListHistory";
+} from "./firePanelListHistory";
 

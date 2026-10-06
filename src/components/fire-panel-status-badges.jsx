@@ -83,66 +83,63 @@ export function FirePanelStatusBadges() {
     <>
       <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
         <div className="flex flex-wrap items-center gap-2">
-        <div className="flex flex-col gap-0.5">
-          {connected ? (
-            <Badge
-              variant="outline"
-              className={`${STATUS_BADGE_CLASS} border-green-600/40 text-green-600`}
-              title={
-                connectedHost
-                  ? `Connected to ${connectedHost}:${connectedPort}`
-                  : "Fire panel connected"
-              }
-            >
-              <Wifi />
-              Connected
-            </Badge>
-          ) : loading ? (
-            <Badge
-              variant="outline"
-              className={`${STATUS_BADGE_CLASS} text-amber-600 border-amber-600/40`}
-            >
-              <Loader2 className="animate-spin" />
-              Connecting
-            </Badge>
-          ) : (
-            <Badge
-              variant="outline"
-              className={`${STATUS_BADGE_CLASS} text-muted-foreground`}
-            >
-              <Unplug />
-              Disconnected
-            </Badge>
-          )}
-        </div>
+          <div className="flex flex-col gap-0.5">
+            {connected ? (
+              <Badge
+                variant="outline"
+                className={`${STATUS_BADGE_CLASS} border-green-600/40 text-green-600`}
+                title={
+                  connectedHost
+                    ? `Connected to ${connectedHost}:${connectedPort}`
+                    : "Fire panel connected"
+                }
+              >
+                <Wifi />
+                Connected
+              </Badge>
+            ) : loading ? (
+              <Badge
+                variant="outline"
+                className={`${STATUS_BADGE_CLASS} text-amber-600 border-amber-600/40`}
+              >
+                <Loader2 className="animate-spin" />
+                Connecting
+              </Badge>
+            ) : (
+              <Badge
+                variant="outline"
+                className={`${STATUS_BADGE_CLASS} text-muted-foreground`}
+              >
+                <Unplug />
+                Disconnected
+              </Badge>
+            )}
+          </div>
 
-        <FirePanelAckButtons />
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className={HEADER_ACTION_BUTTON_CLASS}
-          disabled={!connected || silencing}
-          onClick={() => void handleSilenceAlarm()}
-        >
-          {silencing ? (
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          ) : (
+          <FirePanelAckButtons />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={HEADER_ACTION_BUTTON_CLASS}
+            disabled={!connected || silencing}
+            onClick={() => void handleSilenceAlarm()}
+          >
+
             <VolumeX className="mr-2 h-4 w-4" />
-          )}
-          Silence Alarm
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className={HEADER_ACTION_BUTTON_CLASS}
-          onClick={() => void handleSystemReset()}
-          disabled={!connected || silencing}
-        >
-          <RefreshCcw className="mr-2 h-4 w-4" />
-          System Reset
-        </Button>
+            Silence Alarm
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={HEADER_ACTION_BUTTON_CLASS}
+            onClick={() => void handleSystemReset()}
+            disabled={!connected || silencing}
+          >
+            <RefreshCcw className="mr-2 h-4 w-4" />
+            System Reset
+          </Button>
         </div>
         <GraphicsViewNavButton />
       </div>

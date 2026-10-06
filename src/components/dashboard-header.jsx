@@ -6,6 +6,7 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { AssetDeviceSearchBar } from "@/components/asset-device-search-bar";
 import { FirePanelStatusBadges } from "@/components/fire-panel-status-badges";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { RestartButton } from "@/components/app-control-modals";
 
 const ClientModeToggle = dynamic(
   () => import("@/components/theme-toggle").then((mod) => ({ default: mod.ModeToggle })),
@@ -24,6 +25,7 @@ export function DashboardTopBar({ headerClassName }) {
       >
         <SidebarTrigger className="-ml-1" />
         <ClientModeToggle />
+        <RestartButton />
         <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
           <FirePanelStatusBadges />
         </div>

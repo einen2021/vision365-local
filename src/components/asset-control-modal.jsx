@@ -39,58 +39,18 @@ import { cn } from "@/lib/utils"
 /** Small delay between show retries when the panel returns a partial chunk. */
 const SHOW_RETRY_DELAY_MS = 400
 
-/**
- * Backup device status from monitoring F/T when `show` PRIMARY STATUS is missing.
- * F=1 → FIRE ALARM; T=1 → DISABLE TROUBLE; otherwise NORMAL.
- */
-function statusLabelFromFT(F = 0, T = 0) {
-  if (Number(F) === 1) return "FIRE ALARM"
-  if (Number(T) === 1) return "DISABLE TROUBLE"
-  return "NORMAL"
-}
-
 /** Push parsed PRIMARY STATUS into the marker store (lowest priority tier). */
-function syncShowStatusToMarkers(address, primaryStatus, assetRef) {
+function syncShowStatusToMarkers(address, primaryStatus) {
   const trimmed = String(address || "").trim()
   if (!trimmed) return
 
-  let status = primaryStatus
+  const status = primaryStatus
     ? primaryStatusToSimplex(primaryStatus)
     : null
-
-  if (!status) {
-    const assetId =
-      assetRef?.buildingAssetId ||
-      assetRef?.assetsListId ||
-      assetRef?.id ||
-      ""
-    const cached = useAssetFireStatusStore
-      .getState()
-      .getSimplexStatus(assetId, trimmed)
-    if (cached) {
-      status = cached
-    }
-  }
 
   if (status) {
     useAssetFireStatusStore.getState().patchShowStatusForAddress(trimmed, status)
   }
-}
-
-/** Read cached F/T for this asset address and return a display label. */
-function backupStatusFromFT(address, assetRef) {
-  const assetId =
-    assetRef?.buildingAssetId ||
-    assetRef?.assetsListId ||
-    assetRef?.id ||
-    ""
-  const status = useAssetFireStatusStore
-    .getState()
-    .getSimplexStatus(assetId, address)
-
-  if (!status) return statusLabelFromFT(0, 0)
-
-  return statusLabelFromFT(status.F, status.T)
 }
 
 const getCategoryKey = (categoryName) => {
@@ -172,17 +132,12 @@ export function AssetControlModal({
 
       // Read live connection state (avoid a stale closed-over value).
       if (!useFirePanelStore.getState().connected) {
-        // Panel offline — still show F/T backup so status is not stuck empty.
-        const backupLabel = backupStatusFromFT(trimmed, assetRef)
-        setPrimaryStatus(backupLabel)
-        syncShowStatusToMarkers(trimmed, backupLabel, assetRef)
         return
       }
 
       const requestId = ++statusRequestIdRef.current
       setIsLoadingPanelStatus(true)
 
-      /** One show attempt — incomplete PRIMARY/ENABLED counts as failure so we can retry. */
       const attemptShow = async () => {
         const parsed = await runPanelShow(trimmed)
         if (!parsed.primaryStatus && !parsed.enabledState) {
@@ -192,32 +147,32 @@ export function AssetControlModal({
       }
 
       try {
-        let parsed
-        try {
-          parsed = await attemptShow()
-        } catch (firstError) {
-          // Common when CVAL monitoring and Asset Control race on the telnet socket.
-          console.warn("[show] first attempt failed, retrying once", {
-            address: trimmed,
-            error: firstError?.message,
-          })
-          await new Promise((resolve) => setTimeout(resolve, SHOW_RETRY_DELAY_MS))
-          if (requestId !== statusRequestIdRef.current) return
-          parsed = await attemptShow()
+        let parsed = null
+        const retryDelayMs = 600
+
+        // Retry in a loop until a valid, correct-format response is received from the panel
+        while (
+          requestId === statusRequestIdRef.current &&
+          useFirePanelStore.getState().connected
+        ) {
+          try {
+            parsed = await attemptShow()
+            if (parsed && (parsed.primaryStatus || parsed.enabledState)) {
+              break
+            }
+          } catch (err) {
+            console.warn(`[show ${trimmed}] attempt failed, retrying...`, err?.message)
+          }
+
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
         }
 
         // Modal closed or a newer request started — drop this result.
-        if (requestId !== statusRequestIdRef.current) return
+        if (requestId !== statusRequestIdRef.current || !parsed) return
 
         if (parsed.primaryStatus) {
           setPrimaryStatus(parsed.primaryStatus)
-          syncShowStatusToMarkers(trimmed, parsed.primaryStatus, assetRef)
-        } else {
-          // Show worked for ENABLED STATE but missed PRIMARY STATUS — use F/T.
-          const backupLabel = backupStatusFromFT(trimmed, assetRef)
-          setPrimaryStatus(backupLabel)
-          syncShowStatusToMarkers(trimmed, backupLabel, assetRef)
-          console.warn("[show] missing PRIMARY STATUS, using F/T backup:", backupLabel)
+          syncShowStatusToMarkers(trimmed, parsed.primaryStatus)
         }
         if (parsed.enabledState) {
           setEnabledState(parsed.enabledState)
@@ -228,28 +183,13 @@ export function AssetControlModal({
       } catch (error) {
         if (requestId !== statusRequestIdRef.current) return
         console.error("Panel show command failed:", error)
-
-        // Backup: monitoring F/T values when show response is not usable.
-        const backupLabel = backupStatusFromFT(trimmed, assetRef)
-        setPrimaryStatus(backupLabel)
-        syncShowStatusToMarkers(trimmed, backupLabel, assetRef)
-        console.warn("[show] failed, using F/T backup status:", backupLabel)
-
-        const incomplete = /incomplete show response/i.test(error?.message || "")
-        toast({
-          title: incomplete ? "Panel status incomplete" : "Could not read panel status",
-          description: incomplete
-            ? `Show returned without PRIMARY STATUS / ENABLED STATE. Showing F/T backup: ${backupLabel}.`
-            : `${error.message || "show command failed"}. Showing F/T backup: ${backupLabel}.`,
-          variant: "destructive",
-        })
       } finally {
         if (requestId === statusRequestIdRef.current) {
           setIsLoadingPanelStatus(false)
         }
       }
     },
-    [asset, runPanelShow, toast],
+    [runPanelShow],
   )
 
   fetchPanelShowStatusRef.current = fetchPanelShowStatus
@@ -513,6 +453,7 @@ export function AssetControlModal({
       return
     }
 
+    statusRequestIdRef.current += 1
     setIsUpdatingAsset(true)
     try {
       await enableDevice(address)
@@ -527,7 +468,7 @@ export function AssetControlModal({
         title: "Success",
         description: "Device enabled successfully",
       })
-      void fetchPanelShowStatus(address, selectedAsset)
+      onClose?.()
     } catch (error) {
       console.error("Error enabling device:", error)
       toast({
@@ -560,6 +501,7 @@ export function AssetControlModal({
       return
     }
 
+    statusRequestIdRef.current += 1
     setIsUpdatingAsset(true)
     try {
       await disableDevice(address)
@@ -574,7 +516,7 @@ export function AssetControlModal({
         title: "Success",
         description: "Device disabled successfully",
       })
-      void fetchPanelShowStatus(address, selectedAsset)
+      onClose?.()
     } catch (error) {
       console.error("Error disabling device:", error)
       toast({

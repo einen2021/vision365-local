@@ -2,26 +2,32 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Flame } from "lucide-react";
+import { Flame, Loader2, RefreshCw } from "lucide-react";
 import { doc, onSnapshot } from "firebase/firestore";
 import { db } from "@/config/firebase";
 import { AppSidebar } from "@/components/app-sidebar";
 import { DashboardTopBar } from "@/components/dashboard-header";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
+import { Button } from "@/components/ui/button";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFireAlert } from "@/contexts/FireModalContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
+import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
 import { usePageAuth } from "@/hooks/usePageAuth";
 import { useToast } from "@/hooks/use-toast";
 import {
   countListMessages,
+  extractPanelDeviceAddresses,
   formatPanelListTime,
   getExpectedListCountForLabel,
   isListResponseReady,
+  parsePanelListResponse,
   syncPanelListWithTempArray,
   getTempPanelList,
 } from "@/lib/firePanelMonitor";
-import { acknowledgeDevice } from "@/lib/acknowledgePanelDevice";
+import { acknowledgeDevice, sendPriorityPanelCommand } from "@/lib/acknowledgePanelDevice";
+import { withMonitorPaused } from "@/lib/firePanelMonitorSession";
+import { refreshCategoryPanelList } from "@/lib/refreshCategoryList";
 import { findAssetsListEntryByPanelAddress } from "@/lib/assetsListSimplexStatus";
 import { resolveAssetNavigationUrl } from "@/lib/assetPlacementNavigation";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -37,7 +43,9 @@ function isShowCountsOrSystem(entry) {
 
   if (/FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+|PRIORITY2\s*=\s*\d+/i.test(raw)) return true;
   if (/FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+|PRIORITY2\s*=\s*\d+/i.test(loc)) return true;
-  if (/^show\s+counts/i.test(raw) || /^show\s+counts/i.test(loc) || /^show\s+counts/i.test(desc)) return true;
+  if (/^show\s+counts|^show\b|PRIMARY\s+STATUS|ENABLED\s+STATE/i.test(raw)) return true;
+  if (/^show\s+counts|^show\b|PRIMARY\s+STATUS|ENABLED\s+STATE/i.test(loc)) return true;
+  if (/^show\s+counts|^show\b|PRIMARY\s+STATUS|ENABLED\s+STATE/i.test(desc)) return true;
   if (/SYSTEM\s+RESET|SYSTEM\s+IS\s+NORMAL/i.test(raw) && !entry.pointId && !entry.deviceAddress) return true;
   return false;
 }
@@ -69,9 +77,40 @@ export default function LiveFirePage() {
 
   const [acknowledgingAddress, setAcknowledgingAddress] = useState(null);
   const [ackedAddresses, setAckedAddresses] = useState(() => new Set());
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [, setTick] = useState(0);
   const [dbListRows, setDbListRows] = useState([]);
   const [dbFetchedAt, setDbFetchedAt] = useState("");
+
+  const handleRefresh = useCallback(async () => {
+    if (!connected) {
+      toast({
+        title: "Not connected",
+        description: "Connect to the fire panel before refreshing the list.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setIsRefreshing(true);
+    try {
+      const { rows, expectedCount } = await refreshCategoryPanelList("Fire");
+
+      toast({
+        title: "List Refreshed",
+        description: `${rows.length}${expectedCount > 0 ? `/${expectedCount}` : ""} fire ${rows.length === 1 ? "entry" : "entries"} updated.`,
+      });
+    } catch (error) {
+      console.error("[LiveFirePage] refresh list failed:", error);
+      toast({
+        title: "Refresh failed",
+        description: error?.message || "Could not refresh fire list from panel.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [connected, toast]);
 
   const cached = firePanelListResponses?.Fire ?? null;
   const rawResponse = typeof cached === "string" ? cached : (cached?.response || "");
@@ -171,21 +210,21 @@ export default function LiveFirePage() {
       setAcknowledgingAddress(targetKey);
       try {
         muteSiren?.();
-        await acknowledgeDevice("Fire", address);
+        // await acknowledgeDevice("Fire", address);
 
-        setAckedAddresses((prev) => {
-          const next = new Set(prev);
-          next.add(row.fullAddress);
-          next.add(row.deviceAddress);
-          next.add(row.key);
-          next.add(row.id);
-          return next;
-        });
+        // setAckedAddresses((prev) => {
+        //   const next = new Set(prev);
+        //   next.add(row.fullAddress);
+        //   next.add(row.deviceAddress);
+        //   next.add(row.key);
+        //   next.add(row.id);
+        //   return next;
+        // });
 
-        toast({
-          title: "Acknowledged",
-          description: `ack f ${address !== "—" ? address : ""}`,
-        });
+        // toast({
+        //   title: "Acknowledged",
+        //   description: `ack f ${address !== "—" ? address : ""}`,
+        // });
 
         if (address && address !== "—") {
           const entry = await findAssetsListEntryByPanelAddress(address);
@@ -199,16 +238,16 @@ export default function LiveFirePage() {
           }
         }
       } catch (error) {
-        toast({
-          title: "Acknowledge failed",
-          description: error?.message || "Could not acknowledge this entry.",
-          variant: "destructive",
-        });
+        // toast({
+        //   title: "Acknowledge failed",
+        //   description: error?.message || "Could not acknowledge this entry.",
+        //   variant: "destructive",
+        // });
       } finally {
         setAcknowledgingAddress(null);
       }
     },
-    [acknowledgingAddress, connected, muteSiren, router, toast],
+    [acknowledgingAddress, connected, muteSiren, router],
   );
 
   if (!isReady) {
@@ -251,6 +290,20 @@ export default function LiveFirePage() {
                 </p>
               </div>
             </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void handleRefresh()}
+              disabled={!connected || isRefreshing}
+              className="gap-1.5"
+            >
+              {isRefreshing ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <RefreshCw className="h-4 w-4" />
+              )}
+              Refresh
+            </Button>
           </div>
 
           {!connected ? (

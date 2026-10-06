@@ -10,6 +10,7 @@ import { FirePanelProvider } from "@/components/fire-panel-provider";
 import { AssetFireStatusProvider } from "@/components/asset-fire-status-provider";
 import { FireAlertProvider } from "@/contexts/FireModalContext";
 import { LivePanelAlertProvider } from "@/contexts/LivePanelAlertContext";
+import { DebugSimulatorToolbar } from "@/components/debug-simulator-toolbar";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -45,6 +46,7 @@ export default function RootLayout({ children }) {
                         <RoleGuard>{children}</RoleGuard>
                       </AssetTypeIconsProvider>
                       <Toaster />
+                      <DebugSimulatorToolbar />
                     </AppProvider>
                   </LivePanelAlertProvider>
                 </FireAlertProvider>

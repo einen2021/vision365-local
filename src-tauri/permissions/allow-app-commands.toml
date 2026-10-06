@@ -10,7 +10,9 @@ commands.allow = [
   "show_notification",
   "save_window_state",
   "load_window_state",
+  "emergency_exit",
   "start_fire_siren",
   "stop_fire_siren",
   "play_panel_alert_beep",
 ]
+

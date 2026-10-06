@@ -656,15 +656,69 @@ function setSimplexFlags(
   asset.simplexStatus = status;
 }
 
+function collectAddressMatchKeys(rawAddress?: string | null): Set<string> {
+  const keys = new Set<string>();
+  if (!rawAddress) return keys;
+  const clean = String(rawAddress).trim().toUpperCase();
+  if (!clean) return keys;
+  keys.add(clean);
+
+  const match = clean.match(
+    /^(?:(\d+):)?(M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+|\d+-\d+(?:-\d+)?)$/i,
+  );
+  if (match) {
+    const node = match[1] || "";
+    const dev = match[2].toUpperCase();
+    keys.add(dev);
+
+    if (dev.endsWith("-0")) {
+      keys.add(dev.slice(0, -2));
+      if (node) {
+        keys.add(`${node}:${dev.slice(0, -2)}`);
+      }
+    } else if (/^M\d+-\d+$/i.test(dev)) {
+      keys.add(`${dev}-0`);
+      if (node) {
+        keys.add(`${node}:${dev}-0`);
+      }
+    }
+    if (node) {
+      keys.add(`${node}:${dev}`);
+    }
+  }
+
+  return keys;
+}
+
+function collectAssetMatchKeys(asset: DbAsset, id: string): Set<string> {
+  const keys = new Set<string>();
+  for (const candidate of [
+    id,
+    asset.deviceAddress,
+    asset.partNumber,
+    asset.address,
+    asset.simplexAddress,
+    buildMAddress(asset.loopNumber, asset.deviceNumber, asset.subAdd),
+  ]) {
+    for (const key of collectAddressMatchKeys(candidate as any)) {
+      keys.add(key);
+    }
+  }
+  return keys;
+}
+
 function buildAddressIndex(assetsList: AssetsListMap) {
   const index = new Map<string, Array<{ id: string; asset: DbAsset }>>();
 
   for (const [id, asset] of Object.entries(assetsList)) {
-    const addr = getAssetDeviceAddress(asset);
-    if (!addr) continue;
-    const bucket = index.get(addr) || [];
-    bucket.push({ id, asset });
-    index.set(addr, bucket);
+    const entryItem = { id, asset };
+    for (const key of collectAssetMatchKeys(asset, id)) {
+      const bucket = index.get(key) || [];
+      if (!bucket.some((b) => b.id === id)) {
+        bucket.push(entryItem);
+      }
+      index.set(key, bucket);
+    }
   }
 
   return index;
@@ -941,7 +995,15 @@ function applyCategoryListToAssets(
 
   for (const entry of entries) {
     const flags = flagsFromLabel(entry.label, category);
-    const bucket = index.get(entry.deviceAddress);
+    const candidateKeys = [
+      ...collectAddressMatchKeys(entry.deviceAddress),
+      ...collectAddressMatchKeys(entry.fullAddress),
+    ];
+    let bucket: Array<{ id: string; asset: DbAsset }> | undefined;
+    for (const k of candidateKeys) {
+      bucket = index.get(k);
+      if (bucket?.length) break;
+    }
 
     if (!bucket?.length) {
       serverLog(

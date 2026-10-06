@@ -69,8 +69,8 @@ function MessageTable({ rows, messageClass, emptyLabel }) {
                 ? row.formattedTime
                 : "—"}
             </TableCell>
-            <TableCell className={`break-words ${messageClass}`}>
-              {row.message || "—"}
+            <TableCell className={`break-words whitespace-pre-wrap font-mono text-xs ${messageClass}`}>
+              {row.raw || row.rawMessage || row.message || "—"}
             </TableCell>
           </TableRow>
         ))}

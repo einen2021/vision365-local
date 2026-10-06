@@ -54,38 +54,10 @@ export async function withMonitorPaused(fn) {
 }
 
 /**
- * Pause background work and run immediately — do NOT wait on the command chain.
- * Used for ack/silence/show where waiting behind a 200-row list dump is unacceptable.
- * The worker-side priority queue ensures the command jumps ahead of any in-flight list.
- *
- * Exception: while a priority gate is open (see openPriorityGate), the command is
- * held instead of running immediately. Repeated calls with the same commandKey
- * while the gate is open coalesce into a single queued run.
+ * Run with monitor paused in standard serialized order.
  */
-export async function withMonitorPausedForPriority(fn, commandKey = null) {
-  const state = getSessionState();
-  const gate = state.priorityGate;
-
-  if (gate) {
-    const key = commandKey ?? fn;
-    const existing = gate.queue.get(key);
-    if (existing) return existing.promise;
-
-    const entry = { fn };
-    entry.promise = new Promise((resolve, reject) => {
-      entry.resolve = resolve;
-      entry.reject = reject;
-    });
-    gate.queue.set(key, entry);
-    return entry.promise;
-  }
-
-  pauseMonitorLoop();
-  try {
-    return await fn();
-  } finally {
-    resumeMonitorLoop();
-  }
+export async function withMonitorPausedForPriority(fn) {
+  return withMonitorPaused(fn);
 }
 
 /**

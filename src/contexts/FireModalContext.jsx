@@ -35,7 +35,11 @@ import {
   resetCategorySimplexStatus,
 } from "@/lib/systemResetWorkflow";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
-import { appendLiveLogToCategoryList, saveListToCategoryDb } from "@/lib/recordAlarmHistory";
+import {
+  appendLiveLogToCategoryList,
+  saveListToCategoryDb,
+  recordLiveAlarmToHistory,
+} from "@/lib/recordAlarmHistory";
 import { findAllDeviceAddressesByLocationText } from "@/lib/assetAddressFloorIndex";
 import {
   LIST_COMMAND_TIMEOUT_MS,
@@ -43,6 +47,7 @@ import {
   parsePanelListResponse,
   extractPanelDeviceAddresses,
   simplexKeyForCategoryLabel,
+  extractPanelEventTime,
 } from "@/lib/firePanelMonitor";
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
 import {
@@ -225,6 +230,7 @@ export function FireAlertProvider({ children }) {
   // Last known counts from any "show counts" call — used by the "NORMAL ACKED"
   // handler to detect a per-category decrease (see fetchAndSyncCounts).
   const previousCountsRef = useRef({ totalFire: 0, totalTrouble: 0, totalSupervisory: 0 });
+  const recentLiveAlarmHistoryRef = useRef(new Map());
 
   const showFireAlert = useCallback((alarmInfo = null) => {
     if (alarmInfo) {
@@ -232,6 +238,7 @@ export function FireAlertProvider({ children }) {
     }
     setAckLoading(false);
     setIsAlarmActive(true);
+    setIsSirenMuted(false);
     setIsFireAlertOpen(true);
   }, []);
 
@@ -292,24 +299,23 @@ export function FireAlertProvider({ children }) {
         );
       }
 
-      // 3. Only when explicitly asked (the "NORMAL ACKED" handler): if a
-      // category's total decreased since the last known counts, something
-      // cleared off-panel — hard-reset that category's F/T/S flags and list,
-      // then re-list from the panel. No list command otherwise.
-      if (checkDecrease) {
-        const previous = previousCountsRef.current;
-        if (counts.totalFire < previous.totalFire) {
-          await resetCategorySimplexStatus("Fire");
-          await syncFireListAssets();
-        }
+      // 3. Reconcile categories when counts change from previous value:
+      const previous = previousCountsRef.current;
+      if (counts.totalTrouble !== previous.totalTrouble) {
         if (counts.totalTrouble < previous.totalTrouble) {
           await resetCategorySimplexStatus("Trouble");
-          await syncTroubleListAssets();
         }
+        await syncTroubleListAssets();
+      }
+      if (counts.totalSupervisory !== previous.totalSupervisory) {
         if (counts.totalSupervisory < previous.totalSupervisory) {
           await resetCategorySimplexStatus("Supervisory");
-          await syncSupervisoryListAssets();
         }
+        await syncSupervisoryListAssets();
+      }
+      if (checkDecrease && counts.totalFire < previous.totalFire) {
+        await resetCategorySimplexStatus("Fire");
+        await syncFireListAssets();
       }
 
       previousCountsRef.current = {
@@ -412,7 +418,7 @@ export function FireAlertProvider({ children }) {
     })();
   }, [closeFireAlertModal, fetchAndSyncCounts, muteSiren, router, runPostAckListSync, toast]);
 
-  // Siren runs while alarm is active (even after modal is closed)
+  // Siren runs while alarm is active or modal is open (and not muted)
   useEffect(() => {
     if (!isAlarmActive || isSirenMuted) {
       stopSirenRef.current?.();
@@ -420,13 +426,15 @@ export function FireAlertProvider({ children }) {
       return;
     }
 
+    // Stop any stale siren handle and start fresh sound
+    stopSirenRef.current?.();
     stopSirenRef.current = startFireAlertSiren();
 
     return () => {
       stopSirenRef.current?.();
       stopSirenRef.current = null;
     };
-  }, [isAlarmActive, isSirenMuted]);
+  }, [isAlarmActive, isSirenMuted, isFireAlertOpen]);
 
   // ── Realtime SSE listener: trigger modal whenever a new fire alarm arrives ──
   useEffect(() => {
@@ -437,37 +445,34 @@ export function FireAlertProvider({ children }) {
     const processEntry = (entry) => {
       if (!entry) return;
 
-      // Ignore list query responses, non-alarm system/diagnostic/noise/unparsed lines
+      const rawText = String(entry.raw || "");
+      const locText = String(entry.location || "");
+      const descText = String(entry.description || "");
+      const devText = String(entry.device || "");
+
+      // Ignore show counts, show <address>, PRIMARY STATUS, and device property queries
+      const allText = `${rawText} ${locText} ${descText} ${devText} ${String(entry.status || "")} ${String(entry.category || "")}`;
       if (
-        entry.isListEntry ||
-        Boolean(entry.pointId) ||
-        entry.kind === "system" ||
-        entry.kind === "cval" ||
-        entry.kind === "noise" ||
-        entry.kind === "unparsed"
+        /show\s+counts|FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+/i.test(allText) ||
+        /\bshow\b|PRIMARY\s+STATUS|ENABLED\s+STATE|CUSTOM\s+LABEL|DEVICE\s+TYPE|POINT\s+TYPE|RAW\s+ANALOG|ALARM\s+THRESHOLD|CARD\s+TYPE/i.test(allText)
       ) {
         return;
       }
 
-      const rawText = String(entry.raw || "");
-      if (
-        /show\s+counts|FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+/i.test(
-          rawText,
-        )
-      ) {
+      if (entry.kind === "cval" || entry.kind === "noise" || entry.kind === "system") {
         return;
       }
 
       const statusText = String(entry.status || "");
       const catText = String(entry.category || "");
 
-      // Check if this is an explicit fire alarm event (live event, not a list item)
+      // Check if this is an explicit fire alarm event (highest priority — live event, not passive list dump)
       const isFire =
         (entry.kind === "fire" ||
           catText === "fire" ||
-          /^FIRE\s+ALARM$|^FIRE$/i.test(statusText)) &&
-        !entry.isListEntry &&
-        !entry.pointId;
+          /^FIRE\s+ALARM$|^FIRE$/i.test(statusText) ||
+          /FIRE\s+ALARM/i.test(rawText)) &&
+        !entry.isListEntry;
 
       // Check if this is an ACK event
       const isAck =
@@ -478,22 +483,20 @@ export function FireAlertProvider({ children }) {
         statusText === "NORMAL ACKED" ||
         /NORMAL\s+ACKED|FIRE\s+ALARM\s+ACKED/i.test(rawText);
 
-      // Check if event is trouble (live event, not a list item)
+      // Check if event is trouble (live event, not passive list dump)
       const isTrouble =
         (entry.kind === "trouble" ||
           catText === "trouble" ||
           /TROUBLE|TRBL|DIRTY/i.test(statusText)) &&
-        !entry.isListEntry &&
-        !entry.pointId;
+        !entry.isListEntry;
 
-      // Check if event is supervisory (live event, not a list item)
+      // Check if event is supervisory (live event, not passive list dump)
       const isSupervisory =
         (entry.kind === "supervisory" ||
           catText === "supervisory" ||
           /SUPERVISORY|SUPV|SUPR/i.test(statusText) ||
           /SUPERVISORY/i.test(String(entry.device || ""))) &&
-        !entry.isListEntry &&
-        !entry.pointId;
+        !entry.isListEntry;
 
       // Check if event is system reset
       const isReset =
@@ -504,8 +507,6 @@ export function FireAlertProvider({ children }) {
         entry.kind === "reset";
 
       // If new unacknowledged fire alarm detected -> popup fire modal & update device F value to 1!
-      // No fire-list DB write here — the fire-list DB is only ever updated
-      // from handleSystemResetCompleteWorkflow's reset-complete path now.
       if (isFire && !isAck) {
         const fireAddr =
           entry.pointId ||
@@ -513,11 +514,14 @@ export function FireAlertProvider({ children }) {
           rawText.match(/\b(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)\b/i)?.[0] ||
           "";
 
+        const { timeMs: fireTimeMs, timestampIso: fireTimestampIso, panelTimeText: firePanelTimeText } =
+          extractPanelEventTime(entry);
+
         showFireAlert({
           location: entry.location || "Fire Alarm Detected",
           deviceType: entry.device || entry.deviceType || entry.description || "Fire Device",
           deviceAddress: fireAddr,
-          panelTime: entry.time ? `${entry.time} ${entry.date || ""}`.trim() : entry.panelTime || "",
+          panelTime: firePanelTimeText || (entry.at ? new Date(entry.at).toLocaleString() : new Date().toLocaleString()),
           raw: entry.raw,
         });
 
@@ -532,12 +536,16 @@ export function FireAlertProvider({ children }) {
         // (via AssetsList) and log it as a `list f` dump row would read.
         const fireLocation = entry.location || "";
         const fireDeviceType =
-          entry.device || entry.deviceType || entry.description || "";
+          entry.device || entry.deviceType || entry.description || "FIRE DEVICE";
+
         void (async () => {
           try {
             const resolvedAddresses = await findAllDeviceAddressesByLocationText(fireLocation);
+            let fireAddrToUse = "NA";
+
             if (resolvedAddresses.length > 1) {
               ambiguousLocationRef.current.Fire = true;
+              fireAddrToUse = "NA";
               console.log(
                 "[FireModalContext] fire location matches multiple devices — fetching list f now:",
                 fireLocation,
@@ -559,20 +567,44 @@ export function FireAlertProvider({ children }) {
               } catch (err) {
                 console.error("[FireModalContext] list f failed:", err);
               }
-            } else {
-              const resolvedAddress = resolvedAddresses[0] || "";
-              if (!resolvedAddress) return;
-              console.log(fireLocation, fireDeviceType);
-              const listFItem = [resolvedAddress, fireLocation, fireDeviceType, "FIRE*"]
+            } else if (resolvedAddresses.length === 1) {
+              fireAddrToUse = resolvedAddresses[0];
+              const listFItem = [fireAddrToUse, fireLocation, fireDeviceType, "FIRE*"]
                 .filter(Boolean)
                 .join("   ");
               console.log("[FireModalContext] new fire as list f item:", listFItem);
               const parsedRows = parsePanelListResponse(listFItem);
               await saveListToCategoryDb("Fire", parsedRows);
-              useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([resolvedAddress], "F", 1);
+              useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([fireAddrToUse], "F", 1);
+            } else {
+              fireAddrToUse = fireAddr || "NA";
+              if (fireAddr) {
+                const listFItem = [fireAddr, fireLocation, fireDeviceType, "FIRE*"]
+                  .filter(Boolean)
+                  .join("   ");
+                console.log("[FireModalContext] new fire as list f item:", listFItem);
+                const parsedRows = parsePanelListResponse(listFItem);
+                await saveListToCategoryDb("Fire", parsedRows);
+                useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([fireAddr], "F", 1);
+              }
             }
 
+            const listFHistoryItem = [fireAddrToUse, fireLocation, fireDeviceType, "FIRE*"]
+              .filter(Boolean)
+              .join("   ");
 
+            const dedupKey = `Fire:${listFHistoryItem}`;
+            const lastRecorded = recentLiveAlarmHistoryRef.current.get(dedupKey) || 0;
+            if (Date.now() - lastRecorded >= 30000) {
+              recentLiveAlarmHistoryRef.current.set(dedupKey, Date.now());
+              void recordLiveAlarmToHistory("Fire", {
+                listItem: listFHistoryItem,
+                raw: entry.raw,
+                deviceAddress: fireAddrToUse,
+                time: fireTimeMs,
+                timestamp: fireTimestampIso,
+              });
+            }
           } catch (error) {
             console.error("[FireModalContext] findAllDeviceAddressesByLocationText failed:", error);
           }
@@ -587,6 +619,9 @@ export function FireAlertProvider({ children }) {
           rawText.match(/\b(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)\b/i)?.[0] ||
           "";
 
+        const { timeMs: trblTimeMs, timestampIso: trblTimestampIso, panelTimeText: trblPanelTimeText } =
+          extractPanelEventTime(entry);
+
         // LivePanelAlertProvider owns the trouble beep/modal but sits below this
         // provider in the tree, so signal it via a window event (same pattern as
         // vision365:firePanelStateUpdated) instead of calling its hook directly.
@@ -594,32 +629,64 @@ export function FireAlertProvider({ children }) {
           window.dispatchEvent(new CustomEvent("vision365:newTroubleEvent"));
         }
 
-        void (async () => {
-          if (trblAddr) {
-            await appendLiveLogToCategoryList("Trouble", entry);
-            // Optimistic single-device patch only — see Fire branch above for why
-            // syncAssetsListWithPanelList cannot be called with just this one address.
-            useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([trblAddr], "T", 1);
-          }
-          await syncTroubleListAssets();
-        })();
-
-        // Same ambiguous-location detection as Fire — resolved with a real
-        // `list t` once this trouble alert is acknowledged.
         const troubleLocation = entry.location || "";
+        const troubleDeviceType =
+          entry.device || entry.deviceType || entry.description || "TROUBLE POINT";
+
         void (async () => {
           try {
-            const resolvedAddresses = await findAllDeviceAddressesByLocationText(troubleLocation);
-            if (resolvedAddresses.length > 1) {
-              ambiguousLocationRef.current.Trouble = true;
-              console.log(
-                "[FireModalContext] trouble location matches multiple devices — will re-list after ack:",
-                troubleLocation,
-                resolvedAddresses,
-              );
+            let trblAddrToUse = trblAddr || "NA";
+            if (!trblAddr && troubleLocation) {
+              const resolvedAddresses = await findAllDeviceAddressesByLocationText(troubleLocation);
+              if (resolvedAddresses.length === 1) {
+                trblAddrToUse = resolvedAddresses[0];
+              } else if (resolvedAddresses.length > 1) {
+                ambiguousLocationRef.current.Trouble = true;
+                trblAddrToUse = "NA";
+                console.log(
+                  "[FireModalContext] trouble location matches multiple devices — will re-list after ack:",
+                  troubleLocation,
+                  resolvedAddresses,
+                );
+              }
+            }
+
+            // Always append live trouble log to trouble-list
+            await appendLiveLogToCategoryList("Trouble", {
+              ...entry,
+              deviceAddress: trblAddrToUse,
+              fullAddress: trblAddrToUse,
+              location: troubleLocation || entry.location || "—",
+              deviceType: troubleDeviceType,
+              time: trblTimeMs,
+              timestamp: trblTimestampIso,
+              panelTimeText: trblPanelTimeText,
+            });
+            console.log("[Trouble]: New Trouble added to categoryList:", entry, trblAddrToUse);
+
+            if (trblAddrToUse && trblAddrToUse !== "NA") {
+              useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([trblAddrToUse], "T", 1);
+            }
+
+            const listTItem = [trblAddrToUse, troubleLocation, troubleDeviceType, "TRBL*"]
+              .filter(Boolean)
+              .join("   ");
+            console.log("[Trouble]: new trouble as list t item:", listTItem);
+
+            const dedupKey = `Trouble:${listTItem}`;
+            const lastRecorded = recentLiveAlarmHistoryRef.current.get(dedupKey) || 0;
+            if (Date.now() - lastRecorded >= 30000) {
+              recentLiveAlarmHistoryRef.current.set(dedupKey, Date.now());
+              void recordLiveAlarmToHistory("Trouble", {
+                listItem: listTItem,
+                raw: entry.raw,
+                deviceAddress: trblAddrToUse,
+                time: trblTimeMs,
+                timestamp: trblTimestampIso,
+              });
             }
           } catch (error) {
-            console.error("[FireModalContext] findAllDeviceAddressesByLocationText failed:", error);
+            console.error("[FireModalContext] trouble event processing failed:", error);
           }
         })();
       }
@@ -632,36 +699,71 @@ export function FireAlertProvider({ children }) {
           rawText.match(/\b(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)\b/i)?.[0] ||
           "";
 
+        const { timeMs: supTimeMs, timestampIso: supTimestampIso, panelTimeText: supPanelTimeText } =
+          extractPanelEventTime(entry);
+
         if (typeof window !== "undefined") {
           window.dispatchEvent(new CustomEvent("vision365:newSupervisoryEvent"));
         }
 
-        void (async () => {
-          if (supAddr) {
-            await appendLiveLogToCategoryList("Supervisory", entry);
-            // Optimistic single-device patch only — see Fire branch above for why
-            // syncAssetsListWithPanelList cannot be called with just this one address.
-            useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([supAddr], "S", 1);
-          }
-          await syncSupervisoryListAssets();
-        })();
-
-        // Same ambiguous-location detection as Fire — resolved with a real
-        // `list s` once this supervisory alert is acknowledged.
         const supervisoryLocation = entry.location || "";
+        const supervisoryDeviceType =
+          entry.device || entry.deviceType || entry.description || "SUPERVISORY";
+
         void (async () => {
           try {
-            const resolvedAddresses = await findAllDeviceAddressesByLocationText(supervisoryLocation);
-            if (resolvedAddresses.length > 1) {
-              ambiguousLocationRef.current.Supervisory = true;
-              console.log(
-                "[FireModalContext] supervisory location matches multiple devices — will re-list after ack:",
-                supervisoryLocation,
-                resolvedAddresses,
-              );
+            let supAddrToUse = supAddr || "NA";
+            if (!supAddr && supervisoryLocation) {
+              const resolvedAddresses = await findAllDeviceAddressesByLocationText(supervisoryLocation);
+              if (resolvedAddresses.length === 1) {
+                supAddrToUse = resolvedAddresses[0];
+              } else if (resolvedAddresses.length > 1) {
+                ambiguousLocationRef.current.Supervisory = true;
+                supAddrToUse = "NA";
+                console.log(
+                  "[FireModalContext] supervisory location matches multiple devices — will re-list after ack:",
+                  supervisoryLocation,
+                  resolvedAddresses,
+                );
+              }
+            }
+
+            // Always append live supervisory log to supervisory-list
+            await appendLiveLogToCategoryList("Supervisory", {
+              ...entry,
+              deviceAddress: supAddrToUse,
+              fullAddress: supAddrToUse,
+              location: supervisoryLocation || entry.location || "—",
+              deviceType: supervisoryDeviceType,
+              time: supTimeMs,
+              timestamp: supTimestampIso,
+              panelTimeText: supPanelTimeText,
+            });
+            console.log("[Supervisory]: New Supervisory added to categoryList:", entry, supAddrToUse);
+
+            if (supAddrToUse && supAddrToUse !== "NA") {
+              useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([supAddrToUse], "S", 1);
+            }
+
+            const listSItem = [supAddrToUse, supervisoryLocation, supervisoryDeviceType, "SUPV*"]
+              .filter(Boolean)
+              .join("   ");
+            console.log("[Supervisory]: new supervisory as list s item:", listSItem);
+
+            const dedupKey = `Supervisory:${listSItem}`;
+            const lastRecorded = recentLiveAlarmHistoryRef.current.get(dedupKey) || 0;
+            if (Date.now() - lastRecorded >= 30000) {
+              recentLiveAlarmHistoryRef.current.set(dedupKey, Date.now());
+              void recordLiveAlarmToHistory("Supervisory", {
+                listItem: listSItem,
+                raw: entry.raw,
+                deviceAddress: supAddrToUse,
+                time: supTimeMs,
+                timestamp: supTimestampIso,
+              });
             }
           } catch (error) {
-            console.error("[FireModalContext] findAllDeviceAddressesByLocationText failed:", error);
+            console.error("[FireModalContext] supervisory event processing failed:", error);
           }
         })();
       }
@@ -744,12 +846,24 @@ export function FireAlertProvider({ children }) {
 
     connectLiveAlarms();
 
+    const handleFireEvent = (e) => {
+      if (e?.detail) {
+        processEntry(e.detail);
+      }
+    };
+    if (typeof window !== "undefined") {
+      window.addEventListener("vision365:newFireEvent", handleFireEvent);
+    }
+
     return () => {
       active = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (eventSource) eventSource.close();
+      if (typeof window !== "undefined") {
+        window.removeEventListener("vision365:newFireEvent", handleFireEvent);
+      }
     };
-  }, [showFireAlert]);
+  }, [fetchAndSyncCounts, hideFireAlert, showFireAlert]);
 
   const value = useMemo(
     () => ({

@@ -39,8 +39,18 @@ try {
 
   const result = spawnSync(
     "npx",
-    ["cross-env", "DESKTOP_BUILD=1", "next", "build", "--webpack"],
-    { cwd: root, stdio: "inherit", shell: true, env: { ...process.env, DESKTOP_BUILD: "1" } }
+    ["cross-env", "DESKTOP_BUILD=1", "NEXT_PUBLIC_DEBUG_MODE=false", "DEBUG_MODE=false", "next", "build", "--webpack"],
+    {
+      cwd: root,
+      stdio: "inherit",
+      shell: true,
+      env: {
+        ...process.env,
+        DESKTOP_BUILD: "1",
+        NEXT_PUBLIC_DEBUG_MODE: "false",
+        DEBUG_MODE: "false",
+      },
+    }
   );
 
   restoreApi();

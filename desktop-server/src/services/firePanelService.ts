@@ -1,7 +1,7 @@
 import { createRequire } from "module";
 import path from "path";
 import { Worker } from "worker_threads";
-import { serverLog } from "../log";
+import { serverLog, clearServerLogFile } from "../log";
 import { getSqlite } from "../db/client";
 
 /** Local require — works under tsx and packaged CJS. */
@@ -138,6 +138,13 @@ export function logSystemMessage(raw: string): StoredPanelLog | null {
   return stored;
 }
 
+/** Broadcast and persist a simulated panel log entry (for debug/demo mode). */
+export function simulatePanelLogEntry(entry: PanelLogEntry): StoredPanelLog | null {
+  const stored = insertPanelLog(entry);
+  if (stored) broadcastPanelLog(stored);
+  return stored;
+}
+
 /**
  * Subscribe to live panel log entries (SSE clients).
  * Returns an unsubscribe function.
@@ -178,6 +185,42 @@ export function getRecentPanelLogs(limit = 200): StoredPanelLog[] {
       .reverse(); // oldest first for display
   } catch {
     return [];
+  }
+}
+
+/**
+ * Clear all saved panel logs from SQLite and broadcast a clear event to live subscribers.
+ * Optionally also resets the server.log file.
+ */
+export function clearPanelLogs(clearFileLog = true): { deleted: number } {
+  try {
+    const db = getSqlite();
+    const result = db.prepare("DELETE FROM panel_logs").run();
+    const deleted = Number(result.changes);
+
+    if (clearFileLog) {
+      clearServerLogFile();
+    }
+
+    serverLog(`Panel logs cleared by administrator (${deleted} entries deleted)`);
+
+    // Notify connected SSE clients that saved logs have been cleared
+    const clearNotice: StoredPanelLog = {
+      id: 0,
+      kind: "system",
+      systemType: "banner",
+      raw: "[SYSTEM] Previous saved logs were cleared by administrator.",
+      description: "Previous saved logs were cleared by administrator.",
+      at: new Date().toISOString(),
+      // @ts-expect-error extra property for live UI sync
+      cleared: true,
+    };
+    broadcastPanelLog(clearNotice);
+
+    return { deleted };
+  } catch (err) {
+    serverLog(`Failed to clear panel logs: ${(err as Error).message}`);
+    return { deleted: 0 };
   }
 }
 
@@ -482,7 +525,24 @@ function ensureConnected() {
   if (!connected) throw new Error("Not connected");
 }
 
+function isDebugModeServer(): boolean {
+  return (
+    process.env.DEBUG_MODE === "true" ||
+    process.env.NEXT_PUBLIC_DEBUG_MODE === "true" ||
+    process.env.DEBUG_MODE === "1" ||
+    process.env.NEXT_PUBLIC_DEBUG_MODE === "1"
+  );
+}
+
 export async function connectFirePanel(host: string, port: number) {
+  if (isDebugModeServer()) {
+    connected = true;
+    currentHost = "Debug Mode";
+    currentPort = port || 23;
+    addLog(`[Debug Mode] Skipping telnet TCP connection to ${host}:${port}`);
+    return;
+  }
+
   ensureWorkers();
 
   const existing = await readWorkerStatus();
@@ -592,12 +652,11 @@ async function sendCommandViaWorker(
   timeoutMs?: number,
   onChunk?: (response: string, done: boolean) => void,
   expectedCount?: number,
-  priority?: boolean,
 ) {
   ensureWorkers();
 
   const trimmed = cleanCommandText(command);
-  addLog(`Command${priority ? " [priority]" : ""}: ${trimmed}`);
+  addLog(`Command: ${trimmed}`);
 
   const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const msg: IncomingMessage = {
@@ -606,7 +665,6 @@ async function sendCommandViaWorker(
     command,
     timeoutMs,
     expectedCount,
-    priority,
   };
 
   if (onChunk) {
@@ -656,16 +714,13 @@ export async function sendFirePanelCommand(
 }
 
 /**
- * Send a priority command — jumps ahead of any queued list/CVAL work in the worker.
- * Used for ack/silence where waiting behind a 200-row list dump is unacceptable.
+ * Send command without priority preemption.
  */
 export async function sendFirePanelCommandPriority(
   command: string,
   timeoutMs?: number,
 ) {
-  ensureConnected();
-  const response = await sendCommandViaWorker(command, timeoutMs, undefined, undefined, true);
-  return { response };
+  return sendFirePanelCommand(command, timeoutMs);
 }
 
 export async function shutdownFirePanelWorkers() {
