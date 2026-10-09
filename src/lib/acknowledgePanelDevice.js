@@ -7,18 +7,32 @@
 
 import { apiFetch, parseApiJsonResponse } from "@/lib/apiClient";
 import { buildPanelAckCommand } from "@/lib/firePanelMonitor";
-import { withMonitorPaused } from "@/lib/firePanelMonitorSession";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 
 import { isDebugMode } from "@/lib/debugMode";
 
-/** Send a telnet command via standard queue. */
+/**
+ * Send a telnet command through the priority endpoint. The panel worker ranks it
+ * (ack / login / set first) and cancels + restarts any lower-rank list dump.
+ */
 export async function sendPriorityPanelCommand(command, timeoutMs = 5000) {
+  return postPriority({ command, timeoutMs });
+}
+
+/**
+ * Send several commands queued back-to-back on the panel (e.g. login + set
+ * 2/3/4:p217 on) — one HTTP round trip, nothing interleaved between them.
+ */
+export async function sendPriorityPanelCommands(commands, timeoutMs = 5000) {
+  return postPriority({ commands, timeoutMs });
+}
+
+async function postPriority(body) {
   try {
-    const res = await apiFetch("/api/telnet/fire-panel/command", {
+    const res = await apiFetch("/api/telnet/fire-panel/command/priority", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command, timeoutMs }),
+      body: JSON.stringify(body),
     });
     const data = await parseApiJsonResponse(res);
     if (!res.ok) {
@@ -56,7 +70,7 @@ export async function acknowledgeDevice(label, deviceAddress) {
 
   const cmd = buildPanelAckCommand(label, address);
 
-  return withMonitorPaused(() => sendPriorityPanelCommand(cmd, 5000));
+  return sendPriorityPanelCommand(cmd, 5000);
 }
 
 /**
@@ -70,6 +84,5 @@ export async function acknowledgeCategory(label) {
   }
 
   const cmd = buildPanelAckCommand(label);
-  console.log("cmd", cmd);
-  return withMonitorPaused(() => sendPriorityPanelCommand(cmd, 5000));
+  return sendPriorityPanelCommand(cmd, 5000);
 }

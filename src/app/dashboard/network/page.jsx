@@ -185,6 +185,39 @@ function PanelLogConsole({ connected, isAdmin: propIsAdmin }) {
     let active = true;
     let es = null;
     let reconnectTimer = null;
+    // SSE entries are buffered and applied together — a list dump streams
+    // hundreds of lines and one state update (re-render) per line froze the page.
+    let pendingEntries = [];
+    let flushTimer = null;
+
+    const logKey = (l) => (l.id != null ? `id:${l.id}` : `${l.raw}-${l.at}`);
+
+    const flushPending = () => {
+      flushTimer = null;
+      if (!active || pendingEntries.length === 0) return;
+      const batch = pendingEntries;
+      pendingEntries = [];
+
+      setLogs((prev) => {
+        const seen = new Set(prev.map(logKey));
+        const fresh = [];
+        for (const entry of batch) {
+          const key = logKey(entry);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          fresh.push(entry);
+        }
+        if (fresh.length === 0) return prev;
+        const next = [...prev, ...fresh];
+        return next.length > MAX_DISPLAY_LOGS ? next.slice(-MAX_DISPLAY_LOGS) : next;
+      });
+
+      setCounts((prev) => {
+        const next = { ...prev };
+        for (const entry of batch) next[entry.kind] = (next[entry.kind] ?? 0) + 1;
+        return next;
+      });
+    };
 
     // 1. Fetch latest logs immediately on mount/re-render so console is never blank
     const fetchInitialLogs = async () => {
@@ -228,6 +261,7 @@ function PanelLogConsole({ connected, isAdmin: propIsAdmin }) {
 
             // Real-time remote clear notification
             if (entry.cleared) {
+              pendingEntries = [];
               setLogs([]);
               setCounts({});
               return;
@@ -235,17 +269,8 @@ function PanelLogConsole({ connected, isAdmin: propIsAdmin }) {
 
             if (!entry.kind) return;
 
-            setLogs((prev) => {
-              // Deduplicate by id if present, or by raw+at
-              const entryKey = entry.id != null ? entry.id : `${entry.raw}-${entry.at}`;
-              const exists = prev.some((l) => (l.id != null ? l.id === entry.id : `${l.raw}-${l.at}` === entryKey));
-              if (exists) return prev;
-
-              const next = [...prev, entry];
-              return next.length > MAX_DISPLAY_LOGS ? next.slice(-MAX_DISPLAY_LOGS) : next;
-            });
-
-            setCounts((prev) => ({ ...prev, [entry.kind]: (prev[entry.kind] ?? 0) + 1 }));
+            pendingEntries.push(entry);
+            if (!flushTimer) flushTimer = setTimeout(flushPending, 150);
           } catch {
             // ignore heartbeat or comments
           }
@@ -270,6 +295,7 @@ function PanelLogConsole({ connected, isAdmin: propIsAdmin }) {
     return () => {
       active = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (flushTimer) clearTimeout(flushTimer);
       if (es) es.close();
     };
   }, []);
@@ -395,7 +421,7 @@ function PanelLogConsole({ connected, isAdmin: propIsAdmin }) {
             </div>
           </div>
           <CardDescription>
-            Live TCP stream from fire panel — parsed and categorised in real-time
+            Live messages from the fire panel
           </CardDescription>
           {/* Filter tabs */}
           <div className="flex flex-wrap gap-1 pt-1">

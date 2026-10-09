@@ -538,13 +538,8 @@ export function buildPanelAckCommand(label, deviceAddress = null) {
   if (address) {
     return `ack ${type} ${address}`;
   }
-  if(label === "Supervisory"){
-    return   `ack ${type}`;
-  }
-  else {
-    return `ack`;
-  }
-  
+  // Category-wide acknowledge is a bare `ack` for Fire, Trouble and Supervisory.
+  return `ack`;
 }
 
 export function readSimplexStatus(asset) {

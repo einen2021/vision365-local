@@ -101,7 +101,7 @@ export async function savePanelCategoryCount(
       },
       true,
     );
-    markDirty();
+    markDirty([PANEL_STATE_DOC]);
 
     serverLog(
       `[fire-panel] firePanelState → ${totalField}=${count} (previous panel count: ${prevCount})`,
@@ -162,7 +162,7 @@ export async function savePanelStateCounts(counts: {
       },
       true,
     );
-    markDirty();
+    markDirty([PANEL_STATE_DOC]);
 
     const changes: string[] = [];
     if (existing.totalFire !== next.totalFire) {
@@ -523,6 +523,8 @@ export async function syncCategoryOnCountDecrease(
 
 export interface PanelListEntry {
   deviceAddress: string;
+  /** Address with panel prefix when the panel printed one (e.g. "2:M1-2-0"). */
+  fullAddress: string;
   label: string;
   raw: string;
 }
@@ -595,14 +597,21 @@ export function parsePanelListResponse(text: string): PanelListEntry[] {
     if (/_DNE/i.test(trimmed)) continue;
     if (/^list\s/i.test(trimmed)) continue;
 
-    const addressMatch = trimmed.match(/^(M\d+-\d+(?:-\d+)?)(?:\s+|$)/i);
+    // Panel rows carry a node prefix ("2:M1-2-0 ..."); P-points and card
+    // addresses ("P209", "1-0-0") are list rows too. Matching only a bare
+    // "M1-..." start parsed 0 rows, so every device's flag was cleared and
+    // none re-set.
+    const addressMatch = trimmed.match(
+      /^(?:(\d+):)?(M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)(?:\s+|$)/i,
+    );
     if (!addressMatch) continue;
 
-    const deviceAddress = addressMatch[1].toUpperCase();
+    const deviceAddress = addressMatch[2].toUpperCase();
+    const fullAddress = addressMatch[1] ? `${addressMatch[1]}:${deviceAddress}` : deviceAddress;
     const labelMatch = trimmed.match(/\s([A-Z]{2,6})\*?\s*$/i);
     const label = (labelMatch?.[1] || "").toUpperCase();
 
-    entries.push({ deviceAddress, label, raw: trimmed });
+    entries.push({ deviceAddress, fullAddress, label, raw: trimmed });
   }
 
   return entries;

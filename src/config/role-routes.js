@@ -24,6 +24,7 @@ export const commonRoutes = [
   "/dashboard/live-fire",
   "/dashboard/live-trouble",
   "/dashboard/live-supervisory",
+  "/dashboard/autopilot",
 ];
 
 export const faqRoute = "/dashboard/faq";

@@ -94,6 +94,8 @@ export function AssetControlModal({
   const [deviceDescription, setDeviceDescription] = useState("")
   const [primaryStatus, setPrimaryStatus] = useState("")
   const [enabledState, setEnabledState] = useState("")
+  // When "Check status" last read the panel (null = not checked in this session).
+  const [statusCheckedAt, setStatusCheckedAt] = useState(null)
   const [enabled, setEnabled] = useState(true)
   const [selectedAsset, setSelectedAsset] = useState(null)
   // Live AssetsList simplexStatus (F/T/S) — read directly via onSnapshot, never from the in-memory cache.
@@ -101,8 +103,6 @@ export function AssetControlModal({
 
   // Bump this to ignore late responses from a previous open / asset / refresh.
   const statusRequestIdRef = useRef(0)
-  const prevConnectedRef = useRef(panelConnected)
-  const fetchPanelShowStatusRef = useRef(null)
   // Keep admin edits while the modal stays open (load can otherwise overwrite with stale mapping props).
   const savedFieldsRef = useRef({ address: null, description: null, location: null })
 
@@ -149,11 +149,15 @@ export function AssetControlModal({
       try {
         let parsed = null
         const retryDelayMs = 600
+        const maxAttempts = 3
 
-        // Retry in a loop until a valid, correct-format response is received from the panel
-        while (
+        // A few tries for a complete, correctly formatted response from the panel.
+        for (
+          let attempt = 1;
+          attempt <= maxAttempts &&
           requestId === statusRequestIdRef.current &&
-          useFirePanelStore.getState().connected
+          useFirePanelStore.getState().connected;
+          attempt += 1
         ) {
           try {
             parsed = await attemptShow()
@@ -161,14 +165,25 @@ export function AssetControlModal({
               break
             }
           } catch (err) {
-            console.warn(`[show ${trimmed}] attempt failed, retrying...`, err?.message)
+            console.warn(`[show ${trimmed}] attempt ${attempt} failed`, err?.message)
           }
 
-          await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
+          if (attempt < maxAttempts) {
+            await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
+          }
         }
 
         // Modal closed or a newer request started — drop this result.
-        if (requestId !== statusRequestIdRef.current || !parsed) return
+        if (requestId !== statusRequestIdRef.current) return
+        if (!parsed) {
+          toast({
+            title: "Could not read device status",
+            description: "The panel did not answer. Try again in a moment.",
+            variant: "destructive",
+          })
+          return
+        }
+        setStatusCheckedAt(new Date())
 
         if (parsed.primaryStatus) {
           setPrimaryStatus(parsed.primaryStatus)
@@ -189,10 +204,8 @@ export function AssetControlModal({
         }
       }
     },
-    [runPanelShow],
+    [runPanelShow, toast],
   )
-
-  fetchPanelShowStatusRef.current = fetchPanelShowStatus
 
   // Stable key so parent re-renders with a new asset object do not re-trigger load.
   const assetKey = asset?.buildingAssetId || asset?.id || ""
@@ -222,7 +235,7 @@ export function AssetControlModal({
     }
   }, [isOpen])
 
-  // Load Firestore asset fields, then auto-fetch live panel status.
+  // Load Firestore asset fields. Panel status is read only via "Check status".
   useEffect(() => {
     if (!isOpen || !asset || !selectedBuilding) return
 
@@ -232,6 +245,7 @@ export function AssetControlModal({
     // Clear previous status immediately so we never flash the last asset's values.
     setPrimaryStatus("")
     setEnabledState("")
+    setStatusCheckedAt(null)
     setIsLoadingPanelStatus(false)
 
     const loadAssetData = async () => {
@@ -344,10 +358,6 @@ export function AssetControlModal({
         setEnabled(enabledStatus)
         setDeviceLocation(location)
         setSelectedAsset(nextSelectedAsset)
-
-        if (address) {
-          void fetchPanelShowStatusRef.current?.(address, nextSelectedAsset)
-        }
       } catch (error) {
         if (cancelled || loadId !== statusRequestIdRef.current) return
         console.error("Error loading asset data:", error)
@@ -389,18 +399,6 @@ export function AssetControlModal({
     return () => unsubscribe()
   }, [isOpen, selectedAsset?.assetsListId])
 
-  // If the panel connects while this modal is already open, fetch status then.
-  useEffect(() => {
-    const wasConnected = prevConnectedRef.current
-    prevConnectedRef.current = panelConnected
-
-    if (!isOpen || !panelConnected || wasConnected) return
-    const address = String(deviceAddress || "").trim()
-    if (!address) return
-
-    void fetchPanelShowStatus(address, selectedAsset)
-  }, [isOpen, panelConnected, deviceAddress, selectedAsset, fetchPanelShowStatus])
-
   useEffect(() => {
     if (!isOpen) {
       // Invalidate any in-flight show / Firestore load.
@@ -411,6 +409,7 @@ export function AssetControlModal({
       setDeviceDescription("")
       setPrimaryStatus("")
       setEnabledState("")
+      setStatusCheckedAt(null)
       setEnabled(true)
       setSelectedAsset(null)
       setIsLoadingPanelStatus(false)
@@ -684,9 +683,11 @@ export function AssetControlModal({
         description: "Device details saved successfully",
       })
 
-      // Only re-run panel show when the address actually changed.
+      // A new address invalidates the last status read — check it again on demand.
       if (nextAddress !== previousAddress) {
-        void fetchPanelShowStatus(nextAddress, nextSelectedAsset)
+        setPrimaryStatus("")
+        setEnabledState("")
+        setStatusCheckedAt(null)
       }
     } catch (error) {
       console.error("Error saving device details:", error)
@@ -705,9 +706,8 @@ export function AssetControlModal({
 
   if (!asset) return null
 
-  // Default to NORMAL when show has not returned a status yet.
-  const displayPrimaryStatus = primaryStatus || "NORMAL"
-  const statusTone = getPrimaryStatusTone(displayPrimaryStatus)
+  const displayPrimaryStatus = primaryStatus || ""
+  const statusTone = displayPrimaryStatus ? getPrimaryStatusTone(displayPrimaryStatus) : "unknown"
   const statusToneClass =
     statusTone === "fire"
       ? "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300"
@@ -779,10 +779,11 @@ export function AssetControlModal({
                   <Label className="text-sm font-semibold">Current Device Status</Label>
                   <Button
                     type="button"
-                    variant="ghost"
+                    variant="outline"
                     size="sm"
-                    className="h-8 px-2"
+                    className="h-8 gap-1.5"
                     disabled={isLoadingPanelStatus || !deviceAddress.trim() || !panelConnected}
+                    title={!panelConnected ? "Connect to the fire panel first" : undefined}
                     onClick={() => fetchPanelShowStatus(deviceAddress, selectedAsset)}
                   >
                     {isLoadingPanelStatus ? (
@@ -790,6 +791,7 @@ export function AssetControlModal({
                     ) : (
                       <RefreshCcw className="h-4 w-4" />
                     )}
+                    {displayPrimaryStatus ? "Check again" : "Check status"}
                   </Button>
                 </div>
                 <div className={cn("rounded-lg border px-3 py-2.5 text-sm font-medium", statusToneClass)}>
@@ -798,10 +800,21 @@ export function AssetControlModal({
                       <Loader2 className="h-4 w-4 animate-spin" />
                       Reading panel status...
                     </span>
-                  ) : (
+                  ) : displayPrimaryStatus ? (
                     displayPrimaryStatus
+                  ) : (
+                    <span className="font-normal text-muted-foreground">
+                      {panelConnected
+                        ? "Not checked — click Check status to read it from the panel"
+                        : "Connect to the fire panel to check the status"}
+                    </span>
                   )}
                 </div>
+                {statusCheckedAt && !isLoadingPanelStatus ? (
+                  <p className="text-xs text-muted-foreground">
+                    Checked at {statusCheckedAt.toLocaleTimeString()}
+                  </p>
+                ) : null}
                 {enabledState ? (
                   <p className="text-xs text-muted-foreground">
                     Panel ENABLED STATE: {enabledState}

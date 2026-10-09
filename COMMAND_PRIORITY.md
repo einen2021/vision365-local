@@ -9,7 +9,7 @@ This document defines the **domain-driven operational priority hierarchy and rea
 In fire alarm management systems:
 1. **Active Monitoring & Fire Emergencies take absolute precedence**.
 2. **Only `list f` (Live Fire List) waits for full response completion**.
-3. **`list t` (Trouble) and `list s` (Supervisory) DO NOT wait for completion**. Chunks are listened to, filtered in real-time, and emitted to UI/logs without holding up the telnet worker.
+3. **`list t` (Trouble) and `list s` (Supervisory) stream partial chunks** (throttled to ~10/s) so the UI fills as rows arrive; any higher-rank command preempts them.
 4. If any lower-priority command is running and a higher-priority command arrives, the system **preempts (blocks/finishes early) the lower-priority command** instantly.
 
 ```
@@ -68,20 +68,38 @@ In fire alarm management systems:
 
 ---
 
-## 3. Dynamic Preemption Engine (`Block Low Priority & Focus on High Priority`)
+## 3. Dynamic Preemption Engine (as implemented in `firePanelWorker.ts`)
 
-When a high-priority command arrives while a lower-priority command is currently executing on the panel socket:
+1. **Ranked queue** — `rankFor(command)` assigns the rank from the command text
+   (ack/silence/login/set → 2, `list f` → 3, `list t/s` + `show counts` → 4,
+   `show`/`disable`/`enable` → 5, other → 6, `cshow *` → 7). The next command is
+   the lowest rank in the queue, FIFO within a rank.
 
-1. **Immediate Socket Preemption (`preemptActiveCommand`)**:
-   - Compares `activeCommandPriority > incomingPriority`.
-   - `preemptActiveCommand()` triggers immediately on the active low-priority command.
-   - The lower-priority command yields the socket early without blocking.
+2. **Dump preemption (`preemptActiveDump`)** — when a command arrives with a lower
+   rank number than an active `list`/`cshow` dump, the dump stops collecting and
+   the new command is written immediately. The dump is then settled by whichever
+   shows up first in the telnet stream:
+   - the urgent command's **echo** → the panel aborted the dump → the dump is
+     re-queued at the front of its rank and restarts after the urgent commands;
+   - the dump's **end** (`-` prompt / `_DNE` with the expected row count) → the
+     panel queued the urgent command behind the dump → the original dump is
+     completed from the rows that kept arriving (no second dump).
+   Either way the caller gets one complete response for its request id.
 
-2. **Lower-Priority Queue Purge (`deferPendingLowerPriorityCommands`)**:
-   - Queued commands of lower priority than the incoming command are deferred.
+3. **Fire-and-forget writes** — `ack …` and `set …` are written to the socket and
+   resolved at once (the panel processes input in order), so silence/reset
+   (`login` + 3× `set`) cost about one login round trip. Callers send these as one
+   batch: `POST /api/telnet/fire-panel/command/priority` with `commands: [...]`.
 
-3. **Instant High-Priority Execution**:
-   - The high-priority command takes over the socket immediately.
+4. **Echo gate** — the first collecting command after a preemption ignores panel
+   text until its own echo arrives (or the line is quiet for 300 ms), so a
+   cancelled dump's tail does not leak into its response.
+
+The browser does not serialize panel commands (`withMonitorPaused` only tracks a
+pause counter); ordering is owned by the worker.
+
+Local check: `node scripts/fake-panel.mjs 2323 200 30 [abort|queue]` and
+`node scripts/fake-panel-bench.mjs 2323 200` (after `npm run desktop:worker:build`).
 
 ---
 

@@ -34,6 +34,17 @@ async function withLock<T>(fn: () => Promise<T> | T): Promise<T> {
   }
 }
 
+/**
+ * Call after rows in `documents` were changed with direct SQL (startup
+ * storage cleanup): drops the in-memory cache and makes every client refetch.
+ */
+export function invalidateDocumentsAfterDirectWrite(): void {
+  const revision = bumpRevision();
+  cache = null;
+  cacheRevision = -1;
+  resetChangeTracking(revision);
+}
+
 /** Current change revision (for realtime polling). */
 export function getDbRevision(): number {
   const row = getSqlite()
@@ -128,6 +139,7 @@ export function writeDb(data: DbRecord): void {
 
   cache = { ...data };
   cacheRevision = getDbRevision();
+  resetChangeTracking(cacheRevision);
 
   if (nextScore > 0) {
     queueDbSnapshotBackup(data);
@@ -321,6 +333,98 @@ export function generateId(): string {
   return `doc_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Per-path change tracking (in memory). Lets realtime listeners refetch only
+// when their own document / collection changed, and lets collection listeners
+// pull just the changed documents instead of the whole collection (AssetsList
+// is several MB). Reset by any full-database write and on server restart.
+// ---------------------------------------------------------------------------
+
+/** Anything at or below this revision is unknown — listeners must refetch fully. */
+let baselineRevision = -1;
+/** path → last revision of a write at or below it. */
+const subtreeRevision = new Map<string, number>();
+/** path → last revision of a write exactly at it (replaces everything below). */
+const directRevision = new Map<string, number>();
+/** collection path → doc id → last revision that changed that doc. */
+const docRevisions = new Map<string, Map<string, number>>();
+
+function pathKey(segments: string[]): string {
+  return segments.join("/");
+}
+
+function ensureBaseline() {
+  if (baselineRevision < 0) baselineRevision = getDbRevision();
+}
+
+function resetChangeTracking(revision: number) {
+  baselineRevision = revision;
+  subtreeRevision.clear();
+  directRevision.clear();
+  docRevisions.clear();
+}
+
+function recordPathWrites(paths: string[][], revision: number) {
+  ensureBaseline();
+  for (const segments of paths) {
+    if (!Array.isArray(segments) || segments.length === 0) continue;
+    directRevision.set(pathKey(segments), revision);
+    for (let k = 1; k <= segments.length; k++) {
+      subtreeRevision.set(pathKey(segments.slice(0, k)), revision);
+    }
+    // Every document on the way down changed inside its parent collection.
+    for (let k = 2; k <= segments.length; k++) {
+      const collectionKey = pathKey(segments.slice(0, k - 1));
+      let docs = docRevisions.get(collectionKey);
+      if (!docs) {
+        docs = new Map();
+        docRevisions.set(collectionKey, docs);
+      }
+      docs.set(segments[k - 1], revision);
+    }
+  }
+}
+
+/** Revision of the data at `segments`: changes when it, anything below it, or a parent is written. */
+export function getPathRevision(segments: string[]): number {
+  ensureBaseline();
+  let revision = Math.max(baselineRevision, subtreeRevision.get(pathKey(segments)) ?? -1);
+  for (let k = 1; k < segments.length; k++) {
+    revision = Math.max(revision, directRevision.get(pathKey(segments.slice(0, k))) ?? -1);
+  }
+  return revision;
+}
+
+/**
+ * Documents of a collection changed since `since`. Returns null when a full
+ * refetch is required (tracking reset, or the collection itself / a parent was
+ * replaced wholesale).
+ */
+export function getCollectionChanges(
+  db: DbRecord,
+  segments: string[],
+  since: number,
+): { revision: number; docs: { id: string; data: unknown }[]; deleted: string[] } | null {
+  ensureBaseline();
+  if (since < baselineRevision) return null;
+  for (let k = 1; k <= segments.length; k++) {
+    if ((directRevision.get(pathKey(segments.slice(0, k))) ?? -1) > since) return null;
+  }
+
+  const docs: { id: string; data: unknown }[] = [];
+  const deleted: string[] = [];
+  const changed = docRevisions.get(pathKey(segments));
+  if (changed) {
+    for (const [id, revision] of changed) {
+      if (revision <= since) continue;
+      const data = getDocument(db, [...segments, id]);
+      if (data === null || data === undefined) deleted.push(id);
+      else docs.push({ id, data: typeof data === "object" ? data : { value: data } });
+    }
+  }
+  return { revision: getPathRevision(segments), docs, deleted };
+}
+
 /** Transactional read-modify-write */
 export async function withDb<T>(fn: (db: DbRecord) => T | Promise<T>): Promise<T> {
   return withLock(async () => {
@@ -331,19 +435,102 @@ export async function withDb<T>(fn: (db: DbRecord) => T | Promise<T>): Promise<T
   });
 }
 
-/** Read-modify-write that only persists when markDirty() was called */
-export async function withDbMutate<T>(
-  fn: (db: DbRecord, ctx: { markDirty: () => void }) => T | Promise<T>,
+/** Top-level row keys a document path can live under (nested `a` or flat `a/b/...`). */
+function rowKeysForPath(segments: string[]): string[] {
+  const keys: string[] = [];
+  for (let k = 1; k <= segments.length; k++) {
+    keys.push(segments.slice(0, k).join("/"));
+  }
+  return keys;
+}
+
+/**
+ * Persist only the rows touched by `paths` (plus any top-level keys added or
+ * removed). Avoids re-serializing and upserting every collection on each write.
+ */
+function writeDbRows(
+  snapshot: DbRecord,
+  paths: string[][],
+  keysBefore: Set<string>,
+): void {
+  const dirty = new Set<string>();
+  for (const segments of paths) {
+    for (const key of rowKeysForPath(segments)) {
+      if (key in snapshot) dirty.add(key);
+    }
+  }
+  const removed: string[] = [];
+  for (const key of keysBefore) {
+    if (!(key in snapshot)) removed.push(key);
+  }
+  for (const key of Object.keys(snapshot)) {
+    if (!keysBefore.has(key)) dirty.add(key);
+  }
+  if (dirty.size === 0 && removed.length === 0) return;
+
+  const now = new Date().toISOString();
+  withTransaction(() => {
+    const db = getSqlite();
+    const upsert = db.prepare(
+      `INSERT INTO documents (path, data, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(path) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`,
+    );
+    const del = db.prepare("DELETE FROM documents WHERE path = ?");
+    for (const key of dirty) {
+      upsert.run(key, JSON.stringify(snapshot[key] ?? null), now);
+    }
+    for (const key of removed) {
+      del.run(key);
+    }
+    bumpRevision();
+  });
+
+  cache = { ...snapshot };
+  cacheRevision = getDbRevision();
+  recordPathWrites(paths, cacheRevision);
+  queueDbSnapshotBackup(snapshot);
+}
+
+/**
+ * Read-modify-write for document-path operations (/api/db set/update/delete/add/batch).
+ * Only the rows under `paths` are written back.
+ */
+export async function withDbPaths<T>(
+  paths: string[][],
+  fn: (db: DbRecord) => T | Promise<T>,
 ): Promise<T> {
   return withLock(async () => {
     const snapshot = readDb();
+    const keysBefore = new Set(Object.keys(snapshot));
+    const result = await fn(snapshot);
+    writeDbRows(snapshot, paths, keysBefore);
+    return result;
+  });
+}
+
+/**
+ * Read-modify-write that only persists when markDirty() was called.
+ * markDirty(path) writes just that document's rows; markDirty() with no path
+ * (callers that change many collections at once) rewrites the whole database.
+ */
+export async function withDbMutate<T>(
+  fn: (db: DbRecord, ctx: { markDirty: (path?: string[]) => void }) => T | Promise<T>,
+): Promise<T> {
+  return withLock(async () => {
+    const snapshot = readDb();
+    const keysBefore = new Set(Object.keys(snapshot));
     let dirty = false;
+    let fullWrite = false;
+    const paths: string[][] = [];
     const result = await fn(snapshot, {
-      markDirty: () => {
+      markDirty: (path?: string[]) => {
         dirty = true;
+        if (path?.length) paths.push(path);
+        else fullWrite = true;
       },
     });
-    if (dirty) writeDb(snapshot);
+    if (fullWrite) writeDb(snapshot);
+    else if (dirty) writeDbRows(snapshot, paths, keysBefore);
     return result;
   });
 }

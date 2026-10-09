@@ -27,6 +27,7 @@ import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 import { LIVE_FIRE_ROUTE } from "@/config/live-panel-routes";
 import { normalizePathname } from "@/lib/roleAccess";
+import { acknowledgeFireConfirmed } from "@/lib/confirmedFireAck";
 
 /** Placeholder alarm details shown until real data is wired up. */
 const PLACEHOLDER_ALERT = {
@@ -73,7 +74,8 @@ export function FireAlertModal({ open, onClose }) {
     // 2. Priority ACK command (`ack f`) & list sync run in background
     void (async () => {
       try {
-        await acknowledge("Fire");
+        // Re-sends `ack` while `list f` still shows the fire unacknowledged (≤ ~6s).
+        await acknowledgeFireConfirmed();
       } catch (error) {
         console.error("Fire Ack failed:", error);
       }
@@ -234,6 +236,7 @@ export function FireAlertModal({ open, onClose }) {
           <Button
             type="button"
             variant="destructive"
+            className={ackLoading ? undefined : "fire-ack-blink"}
             onClick={() => void handleAcknowledge()}
             disabled={!connected || ackLoading}
           >

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Eye, Loader2, RefreshCw } from "lucide-react";
 import { doc, onSnapshot } from "firebase/firestore";
 import { db } from "@/config/firebase";
@@ -28,6 +29,9 @@ import { useLivePanelAlert } from "@/contexts/LivePanelAlertContext";
 import { acknowledgeDevice, sendPriorityPanelCommand } from "@/lib/acknowledgePanelDevice";
 import { withMonitorPaused } from "@/lib/firePanelMonitorSession";
 import { refreshCategoryPanelList } from "@/lib/refreshCategoryList";
+import { findAssetsListEntryByPanelAddress } from "@/lib/assetsListSimplexStatus";
+import { resolveAssetNavigationUrl } from "@/lib/assetPlacementNavigation";
+import { stampFloorPlanNavigationParams } from "@/lib/fireAlertFloorNavigation";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -65,6 +69,7 @@ function isEntryAcked(entry) {
 }
 
 export default function LiveSupervisoryPage() {
+  const router = useRouter();
   const { isReady } = usePageAuth({ redirectIfLoggedOut: true });
   const { toast } = useToast();
   const connected = useFirePanelStore((s) => s.connected);
@@ -211,11 +216,39 @@ export default function LiveSupervisoryPage() {
     (isListResponseReady(rawResponse, expectedCount) || parsedRows.length > 0);
   const listMessageCount = parsedRows.length || (rawResponse ? countListMessages(rawResponse) : 0);
 
+  /** Resolve the row's asset and navigate to it, highlighted, on its nested floor plan. */
+  const navigateToAssetOnFloorPlan = useCallback(
+    async (address) => {
+      if (!address || address === "—") return;
+      try {
+        const entry = await findAssetsListEntryByPanelAddress(address);
+        if (!entry) return;
+        const asset = { id: entry.id, ...entry.data };
+        const url = await resolveAssetNavigationUrl(asset, entry.id);
+        router.push(
+          stampFloorPlanNavigationParams(url, {
+            assetId: entry.id,
+            address,
+            highlight: true,
+          }),
+        );
+      } catch (error) {
+        console.error("[LiveSupervisoryPage] navigate to floor plan failed:", error);
+      }
+    },
+    [router],
+  );
+
   const handleRowAck = useCallback(
     async (row) => {
+      const address = String(row.fullAddress || row.deviceAddress || "").trim();
+
+      // Navigate + highlight right away — this should work regardless of panel
+      // connection state or whether the acknowledge below succeeds.
+      void navigateToAssetOnFloorPlan(address);
+
       if (!connected || acknowledgingAddress) return;
 
-      const address = String(row.fullAddress || row.deviceAddress || "").trim();
       const targetKey = address !== "—" ? address : (row.key || row.id);
       setAcknowledgingAddress(targetKey);
       try {
@@ -245,7 +278,7 @@ export default function LiveSupervisoryPage() {
         setAcknowledgingAddress(null);
       }
     },
-    [acknowledgingAddress, connected],
+    [acknowledgingAddress, connected, navigateToAssetOnFloorPlan],
   );
 
   if (!isReady) {

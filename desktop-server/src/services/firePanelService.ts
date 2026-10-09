@@ -86,6 +86,8 @@ export interface StoredPanelLog extends PanelLogEntry {
 
 /** Ring-buffer cap for panel_logs table. */
 const PANEL_LOG_MAX_ROWS = 2000;
+const PANEL_LOG_TRIM_EVERY = 100;
+let insertsSinceTrim = 0;
 
 type LogSender = (entry: StoredPanelLog) => void;
 const panelLogSubscribers = new Set<LogSender>();
@@ -104,10 +106,16 @@ function insertPanelLog(entry: PanelLogEntry): StoredPanelLog | null {
         entry.at,
       );
 
-    // Ring buffer: delete anything older than the last PANEL_LOG_MAX_ROWS rows
-    db.prepare(
-      `DELETE FROM panel_logs WHERE id <= (SELECT MAX(id) - ? FROM panel_logs)`,
-    ).run(PANEL_LOG_MAX_ROWS);
+    // Ring buffer: delete anything older than the last PANEL_LOG_MAX_ROWS rows.
+    // Trimmed every PANEL_LOG_TRIM_EVERY inserts — a list dump logs hundreds of
+    // lines and one DELETE per line doubled the write cost.
+    insertsSinceTrim += 1;
+    if (insertsSinceTrim >= PANEL_LOG_TRIM_EVERY) {
+      insertsSinceTrim = 0;
+      db.prepare(
+        `DELETE FROM panel_logs WHERE id <= (SELECT MAX(id) - ? FROM panel_logs)`,
+      ).run(PANEL_LOG_MAX_ROWS);
+    }
 
     return { ...entry, id: Number(lastInsertRowid) };
   } catch {
@@ -652,6 +660,7 @@ async function sendCommandViaWorker(
   timeoutMs?: number,
   onChunk?: (response: string, done: boolean) => void,
   expectedCount?: number,
+  priority?: boolean,
 ) {
   ensureWorkers();
 
@@ -665,6 +674,7 @@ async function sendCommandViaWorker(
     command,
     timeoutMs,
     expectedCount,
+    priority,
   };
 
   if (onChunk) {
@@ -675,6 +685,8 @@ async function sendCommandViaWorker(
     const response = (await request(panelWorker!, msg)) as string;
     if (trimmed.toLowerCase().startsWith("show")) {
       addLog(`show response:\n${response}`);
+    } else if (trimmed.toLowerCase().startsWith("login")) {
+      addLog(`login response: ${JSON.stringify(String(response).slice(0, 200))}`);
     }
     return response;
   } finally {
@@ -714,13 +726,33 @@ export async function sendFirePanelCommand(
 }
 
 /**
- * Send command without priority preemption.
+ * Priority command — the worker ranks it by command type (ack/login/set first)
+ * and cancels + restarts any lower-rank list dump in progress.
  */
 export async function sendFirePanelCommandPriority(
   command: string,
   timeoutMs?: number,
 ) {
-  return sendFirePanelCommand(command, timeoutMs);
+  ensureConnected();
+  const response = await sendCommandViaWorker(command, timeoutMs, undefined, undefined, true);
+  return { response };
+}
+
+/**
+ * Several priority commands posted to the worker in one tick (e.g. login + set
+ * 2/3/4:p217 on) so they queue back-to-back with nothing interleaved.
+ */
+export async function sendFirePanelCommandsPriority(
+  commands: string[],
+  timeoutMs?: number,
+) {
+  ensureConnected();
+  const responses = await Promise.all(
+    commands.map((command) =>
+      sendCommandViaWorker(command, timeoutMs, undefined, undefined, true),
+    ),
+  );
+  return { responses };
 }
 
 export async function shutdownFirePanelWorkers() {

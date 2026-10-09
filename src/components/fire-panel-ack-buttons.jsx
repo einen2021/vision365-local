@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFireAlert } from "@/contexts/FireModalContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
+import { acknowledgeFireConfirmed } from "@/lib/confirmedFireAck";
 import { useToast } from "@/hooks/use-toast";
 import { LIVE_PANEL_ROUTE_BY_LABEL } from "@/config/live-panel-routes";
 import { normalizePathname } from "@/lib/roleAccess";
@@ -24,6 +25,7 @@ const ACK_BUTTONS = [
     variant: "destructive",
     cvalField: "totalFire",
     activeClassName: "border-red-500/40 bg-red-500/5",
+    blinkClassName: "fire-ack-blink",
   },
   {
     label: "Trouble",
@@ -31,6 +33,7 @@ const ACK_BUTTONS = [
     variant: "outline",
     cvalField: "totalTrouble",
     activeClassName: "border-yellow-500/40 bg-yellow-500/5",
+    blinkClassName: "trouble-ack-blink",
   },
   {
     label: "Supervisory",
@@ -38,6 +41,7 @@ const ACK_BUTTONS = [
     variant: "outline",
     cvalField: "totalSupervisory",
     activeClassName: "border-purple-500/40 bg-purple-500/5",
+    blinkClassName: "supervisory-ack-blink",
   },
 ];
 
@@ -46,7 +50,20 @@ export function FirePanelAckButtons() {
   const router = useRouter();
   const pathname = normalizePathname(usePathname());
   const { acknowledge, firePanelState } = useFirePanelMonitor();
-  const { muteSiren } = useFireAlert();
+  const {
+    muteSiren,
+    isFireAckPending,
+    clearFireAckPending,
+    isTroubleAckPending,
+    clearTroubleAckPending,
+    isSupervisoryAckPending,
+    clearSupervisoryAckPending,
+  } = useFireAlert();
+  const ackPendingByLabel = {
+    Fire: isFireAckPending,
+    Trouble: isTroubleAckPending,
+    Supervisory: isSupervisoryAckPending,
+  };
   const connected = useFirePanelStore((s) => s.connected);
   const { toast } = useToast();
 
@@ -62,6 +79,18 @@ export function FirePanelAckButtons() {
     }
 
     try {
+      if (label === "Fire") {
+        // One confirmed ack instead of two blind ones: a second bare `ack` can
+        // acknowledge a trouble once the fire is already acknowledged.
+        const result = await acknowledgeFireConfirmed();
+        toast({
+          title: result.acknowledged ? "Fire acknowledged" : `${title} sent`,
+          description: result.acknowledged
+            ? undefined
+            : "The panel has not confirmed it yet.",
+        });
+        return true;
+      }
       await acknowledge(label);
       await acknowledge(label);
       toast({
@@ -81,18 +110,24 @@ export function FirePanelAckButtons() {
   const handleButtonClick = (label, title) => {
     const route = LIVE_PANEL_ROUTE_BY_LABEL[label];
 
+    // Trouble and supervisory share one beep loop — any Ack click silences
+    // both, so the beep always stops (a new event starts it again).
+    silenceTroubleAlertBeep();
+    silenceSupervisoryAlertBeep();
+
     if (label === "Fire") {
       muteSiren?.();
+      clearFireAckPending?.();
     }
     if (label === "Trouble") {
-      silenceTroubleAlertBeep();
+      clearTroubleAckPending?.();
     }
     if (label === "Supervisory") {
-      silenceSupervisoryAlertBeep();
+      clearSupervisoryAckPending?.();
     }
 
     void (async () => {
-      // Run ACK command (`ack f`, `ack t`, `ack s`) and wait for OK response.
+      // Run the ACK command (bare `ack`) and wait for OK response.
       // No list command is sent here — never run list commands while an ack
       // button is being clicked, to avoid overlapping requests on the panel
       // connection. The live list page refreshes on its own.
@@ -107,7 +142,7 @@ export function FirePanelAckButtons() {
 
   return (
     <>
-      {ACK_BUTTONS.map(({ label, title, variant, cvalField, activeClassName }) => {
+      {ACK_BUTTONS.map(({ label, title, variant, cvalField, activeClassName, blinkClassName }) => {
         // Show live panel CVAL totals (same as the status cards).
         const cval = firePanelState?.[cvalField] ?? 0;
         const active = cval > 0;
@@ -122,6 +157,7 @@ export function FirePanelAckButtons() {
             className={cn(
               HEADER_ACTION_BUTTON_CLASS,
               active && variant === "outline" ? activeClassName : undefined,
+              ackPendingByLabel[label] && blinkClassName,
             )}
             disabled={!connected}
             title={

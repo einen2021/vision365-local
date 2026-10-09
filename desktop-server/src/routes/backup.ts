@@ -8,6 +8,7 @@ import {
   countProductiveData,
   findLatestDbSnapshotBackup,
   findBestDbSnapshotBackup,
+  readSnapshotFile,
   saveDbSnapshotBackup,
 } from "../services/dbSnapshotBackup";
 
@@ -42,7 +43,7 @@ export function createBackupRoutes(paths: AppPaths) {
 
     const snapshots = fs
       .readdirSync(dir)
-      .filter((name) => name.endsWith(".json"))
+      .filter((name) => /\.json(\.gz)?$/i.test(name))
       .map((filename) => {
         const fullPath = path.join(dir, filename);
         const stat = fs.statSync(fullPath);
@@ -100,7 +101,10 @@ export function createBackupRoutes(paths: AppPaths) {
         return c.json({ success: false, message: "Snapshot file not found" }, 404);
       }
 
-      const data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      const data = readSnapshotFile(filePath);
+      if (!data) {
+        return c.json({ success: false, message: "Snapshot file could not be read" }, 400);
+      }
       const stats = countProductiveData(data);
       if (stats.score === 0) {
         return c.json(

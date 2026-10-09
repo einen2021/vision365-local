@@ -280,7 +280,28 @@ export async function findAllDeviceAddressesByLocationText(locationText) {
       addresses.push(address);
     }
   }
-  return addresses;
+  return collapseUnprefixedDuplicates(addresses);
+}
+
+/**
+ * The same device is sometimes stored twice — once with its panel prefix
+ * ("2:M1-2-0") and once without ("M1-2-0"). Drop the unprefixed copy when
+ * exactly one prefixed address has the same device part, so one physical
+ * device is not reported as an ambiguous multi-device location. An unprefixed
+ * address that matches several panels (or none) is kept as is.
+ */
+function collapseUnprefixedDuplicates(addresses) {
+  const prefixedByDevice = new Map();
+  for (const address of addresses) {
+    const m = /^(\d+):(.+)$/.exec(address);
+    if (!m) continue;
+    const device = m[2].toUpperCase();
+    prefixedByDevice.set(device, (prefixedByDevice.get(device) || 0) + 1);
+  }
+  return addresses.filter((address) => {
+    if (/^\d+:/.test(address)) return true;
+    return prefixedByDevice.get(address.toUpperCase()) !== 1;
+  });
 }
 
 /**

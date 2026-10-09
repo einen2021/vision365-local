@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
-import { collection, getDocs, onSnapshot } from "firebase/firestore";
+import { collection, getDocsMirrored, onSnapshot } from "firebase/firestore";
 import { db } from "@/config/firebase";
 import {
   cacheChanged,
@@ -19,7 +19,6 @@ import {
   resolveMarkerStatusFromMapping,
 } from "@/lib/assetFireStatus";
 import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
-import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets";
 
 export const FIRE_STATUS_POLL_MS = 1000;
 
@@ -30,6 +29,16 @@ let syncQueued = false;
 let assetsListUnsubscribe = null;
 
 const SYNC_DEBOUNCE_MS = 400;
+/** Last mirrored AssetsList snapshot applied by syncFromAssetsList (identity check). */
+let lastAppliedSnapshot = null;
+/** F/T/S per address key exactly as the database last reported it (no live/optimistic flags). */
+let lastDbByDeviceAddress = null;
+
+function sameStatus(a, b) {
+  const x = normalizeSimplexStatus(a);
+  const y = normalizeSimplexStatus(b);
+  return x.F === y.F && x.T === y.T && x.S === y.S;
+}
 
 function buildCacheFromSnapshot(snapshot) {
   const byDeviceAddress = {};
@@ -120,14 +129,43 @@ export const useAssetFireStatusStore = create((set, get) => ({
   applyAssetsListSnapshot: (snapshot) => {
     const nextCache = buildCacheFromSnapshot(snapshot);
     const prev = get();
-    // Keep AssetsList maps pure. Panel live flags live in panelLiveByAddress
-    // and are OR'd at resolve time so polls cannot wipe optimistic F/T.
-    if (!cacheChanged(prev, nextCache)) return;
+
+    // Live panel flags (panelLiveByAddress) win over AssetsList when markers
+    // resolve, so a poll cannot undo an instant F/T/S change before its DB
+    // write lands. But once a device's F/T/S changes IN THE DATABASE (list
+    // sync, reset, restore, server-side sync, another PC), the database is the
+    // newer truth: drop that device's live flags so its marker follows the DB.
+    const prevDb = lastDbByDeviceAddress;
+    lastDbByDeviceAddress = nextCache.byDeviceAddress;
+    let panelLiveByAddress = prev.panelLiveByAddress;
+    let showStatusByAddress = prev.showStatusByAddress;
+    let liveChanged = false;
+    if (prevDb) {
+      const live = { ...panelLiveByAddress };
+      const show = { ...showStatusByAddress };
+      for (const [key, status] of Object.entries(nextCache.byDeviceAddress)) {
+        if (sameStatus(prevDb[key], status)) continue;
+        if (key in live) {
+          delete live[key];
+          liveChanged = true;
+        }
+        if (key in show) {
+          delete show[key];
+          liveChanged = true;
+        }
+      }
+      if (liveChanged) {
+        panelLiveByAddress = live;
+        showStatusByAddress = show;
+      }
+    }
+
+    if (!liveChanged && !cacheChanged(prev, nextCache)) return;
 
     set({
       ...nextCache,
-      panelLiveByAddress: prev.panelLiveByAddress,
-      showStatusByAddress: prev.showStatusByAddress,
+      panelLiveByAddress,
+      showStatusByAddress,
       lastSync: Date.now(),
     });
   },
@@ -139,9 +177,11 @@ export const useAssetFireStatusStore = create((set, get) => ({
     }
     syncInFlight = true;
     try {
-      // Never reuse the placement/search snapshot cache for live F/T colors.
-      invalidateAssetsListSnapshotCache();
-      const snapshot = await getDocs(collection(db, "AssetsList"));
+      // Incremental: only AssetsList docs changed since the last sync are
+      // fetched, and an unchanged collection returns the same snapshot object.
+      const snapshot = await getDocsMirrored(collection(db, "AssetsList"));
+      if (snapshot === lastAppliedSnapshot) return;
+      lastAppliedSnapshot = snapshot;
       get().applyAssetsListSnapshot(snapshot);
     } catch (error) {
       console.warn("[assetFireStatus] sync failed:", error);
@@ -524,6 +564,7 @@ export function useAssetFireActive(assetId, deviceAddress, fallback = 0, enabled
       const fb = Number(fallback ?? FIRE_ACTIVE_NORMAL);
       if (fb >= FIRE_ACTIVE_ALARM) return FIRE_ACTIVE_ALARM;
       if (fb >= FIRE_ACTIVE_TROUBLE) return FIRE_ACTIVE_TROUBLE;
+      if (fb >= FIRE_ACTIVE_SUPERVISORY) return FIRE_ACTIVE_SUPERVISORY;
       return FIRE_ACTIVE_NORMAL;
     }
     void s.lastSync;
@@ -546,6 +587,7 @@ export function useAssetFireActiveFromMapping(
       const fb = Number(fallback ?? FIRE_ACTIVE_NORMAL);
       if (fb >= FIRE_ACTIVE_ALARM) return FIRE_ACTIVE_ALARM;
       if (fb >= FIRE_ACTIVE_TROUBLE) return FIRE_ACTIVE_TROUBLE;
+      if (fb >= FIRE_ACTIVE_SUPERVISORY) return FIRE_ACTIVE_SUPERVISORY;
       return FIRE_ACTIVE_NORMAL;
     }
     void s.lastSync;

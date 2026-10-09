@@ -275,6 +275,32 @@ export async function deleteDocsBatch(docRefs) {
   return deleted;
 }
 
+/**
+ * Append rows to array fields on the server (de-duplicated there against recent
+ * entries) without downloading the existing arrays.
+ * @param {{ ref: DocumentReference, field: string }[]} targets
+ * @param {object[]} rows
+ */
+export async function appendRowsToDocs(targets, rows) {
+  if (!targets?.length || !rows?.length) return { appended: 0 };
+  try {
+    return await apiCall({
+      op: "appendRows",
+      targets: targets.map((t) => ({ path: t.ref._path, field: t.field })),
+      rows,
+    });
+  } catch (error) {
+    if (!/unknown operation/i.test(error?.message || "")) throw error;
+    // API server older than this client — append the old way (read + write back).
+    for (const { ref, field } of targets) {
+      const snap = await getDoc(ref);
+      const existing = snap.exists() && Array.isArray(snap.data()?.[field]) ? snap.data()[field] : [];
+      await setDoc(ref, { [field]: [...existing, ...rows] }, { merge: true });
+    }
+    return { appended: rows.length * targets.length };
+  }
+}
+
 export function writeBatch(db) {
   const operations = [];
   return {
@@ -298,18 +324,96 @@ export function writeBatch(db) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Collection mirrors — one in-memory copy per collection path, kept current by
+// asking the server only for documents changed since the last sync. AssetsList
+// is several MB; this turns a full refetch into a few KB per change.
+// Mirror data is shared: treat snapshots from getDocsMirrored() as read-only.
+// ---------------------------------------------------------------------------
+
+const collectionMirrors = new Map();
+/** Set when the API server predates the "changes" op (restart it to re-enable). */
+let changesOpUnsupported = false;
+
+function syncCollectionMirror(path) {
+  const key = JSON.stringify(path);
+  let mirror = collectionMirrors.get(key);
+  if (!mirror) {
+    mirror = { path, docs: null, revision: -1, snapshot: null, inflight: null };
+    collectionMirrors.set(key, mirror);
+  }
+  if (mirror.inflight) return mirror.inflight;
+
+  mirror.inflight = (async () => {
+    try {
+      if (mirror.docs && !changesOpUnsupported) {
+        // An API server older than this client answers "Unknown operation" —
+        // fall back to full refetches (and stop asking) instead of failing.
+        const res = await apiCall({ op: "changes", path, since: mirror.revision }).catch(
+          (error) => {
+            if (/unknown operation/i.test(error?.message || "")) changesOpUnsupported = true;
+            return { full: true };
+          },
+        );
+        if (!res.full) {
+          if (res.docs.length > 0 || res.deleted.length > 0) {
+            for (const d of res.docs) mirror.docs.set(d.id, d.data);
+            for (const id of res.deleted) mirror.docs.delete(id);
+            mirror.snapshot = null;
+          }
+          mirror.revision = res.revision;
+          return mirror;
+        }
+      }
+      const res = await apiCall({ op: "list", path, constraints: [] });
+      mirror.docs = new Map((res.docs || []).map((d) => [d.id, d.data]));
+      mirror.revision = typeof res.pathRevision === "number" ? res.pathRevision : -1;
+      mirror.snapshot = null;
+      return mirror;
+    } finally {
+      mirror.inflight = null;
+    }
+  })();
+  return mirror.inflight;
+}
+
+/** Same QuerySnapshot object until the collection changes — callers can compare by identity. */
+function mirrorSnapshot(mirror) {
+  if (!mirror.snapshot) {
+    const docs = [];
+    for (const [id, data] of mirror.docs) {
+      docs.push(new DocumentSnapshot(id, data, true, [...mirror.path, id]));
+    }
+    mirror.snapshot = new QuerySnapshot(docs);
+  }
+  return mirror.snapshot;
+}
+
 /**
- * Realtime listener: poll cheap /api/db/revision first (SQLite meta counter),
- * then refetch the document only when something changed.
+ * getDocs for a whole collection, synced incrementally. Returns the identical
+ * snapshot object when nothing changed. Data is shared — do not mutate it.
+ */
+export async function getDocsMirrored(collectionRef) {
+  return mirrorSnapshot(await syncCollectionMirror(collectionRef._path));
+}
+
+/**
+ * Realtime listener: poll the cheap path-scoped /api/db/revision (changes only
+ * when this document / collection is written), then refetch. Whole-collection
+ * listeners receive only the changed documents from the server.
  */
 export function onSnapshot(ref, onNext, onError) {
   let active = true;
-  let lastRevision = -1;
+  let lastRevision = null;
   let lastJson = "";
+  let lastSnapshot = null;
+  const path = getPath(ref);
+  const isWholeCollection = ref instanceof CollectionReference;
+  const revisionUrl = `/api/db/revision?path=${encodeURIComponent(JSON.stringify(path))}`;
 
   async function fetchRevision() {
     try {
-      const res = await apiFetch("/api/db/revision");
+      const res = await apiFetch(revisionUrl);
       if (!res.ok) return null;
       const body = await res.json();
       return typeof body.revision === "number" ? body.revision : null;
@@ -328,23 +432,26 @@ export function onSnapshot(ref, onNext, onError) {
         return;
       }
 
-      let snapshot;
-      if (ref instanceof DocumentReference) {
-        snapshot = await getDoc(ref);
-      } else if (ref instanceof Query) {
-        snapshot = await getDocs(ref);
+      if (isWholeCollection) {
+        const snapshot = await getDocsMirrored(ref);
+        if (revision !== null) lastRevision = revision;
+        if (snapshot !== lastSnapshot) {
+          lastSnapshot = snapshot;
+          onNext(snapshot);
+        }
       } else {
-        snapshot = await getDocs(ref);
-      }
-      const json = JSON.stringify(
-        ref instanceof DocumentReference
-          ? snapshot.data()
-          : snapshot.docs.map((d) => ({ id: d.id, ...d.data() })),
-      );
-      if (revision !== null) lastRevision = revision;
-      if (json !== lastJson) {
-        lastJson = json;
-        onNext(snapshot);
+        const snapshot =
+          ref instanceof DocumentReference ? await getDoc(ref) : await getDocs(ref);
+        const json = JSON.stringify(
+          ref instanceof DocumentReference
+            ? snapshot.data()
+            : snapshot.docs.map((d) => ({ id: d.id, ...d.data() })),
+        );
+        if (revision !== null) lastRevision = revision;
+        if (json !== lastJson) {
+          lastJson = json;
+          onNext(snapshot);
+        }
       }
     } catch (err) {
       if (onError) onError(err);

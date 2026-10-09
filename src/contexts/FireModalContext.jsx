@@ -23,6 +23,7 @@ import { cn } from "@/lib/utils";
 import { LIVE_FIRE_ROUTE } from "@/config/live-panel-routes";
 import { startFireAlertSiren } from "@/lib/fireAlertSiren";
 import { acknowledgeCategory, sendPriorityPanelCommand } from "@/lib/acknowledgePanelDevice";
+import { acknowledgeFireConfirmed } from "@/lib/confirmedFireAck";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 import { apiUrl } from "@/lib/apiClient";
@@ -32,15 +33,16 @@ import {
   syncFireListAssets,
   syncTroubleListAssets,
   syncSupervisoryListAssets,
-  resetCategorySimplexStatus,
 } from "@/lib/systemResetWorkflow";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
+import { waitForAutoPilotListHold } from "@/stores/autoPilotStore";
 import {
   appendLiveLogToCategoryList,
   saveListToCategoryDb,
   recordLiveAlarmToHistory,
 } from "@/lib/recordAlarmHistory";
 import { findAllDeviceAddressesByLocationText } from "@/lib/assetAddressFloorIndex";
+import { collectDeviceAddressKeys } from "@/lib/assetFireStatus";
 import {
   LIST_COMMAND_TIMEOUT_MS,
   getListCmdForLabel,
@@ -52,8 +54,6 @@ import {
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
 import {
   withMonitorPaused,
-  openPriorityGate,
-  closePriorityGate,
 } from "@/lib/firePanelMonitorSession";
 
 const FireAlertContext = createContext();
@@ -164,7 +164,10 @@ function FireAlertModalView({
             <Button
               type="button"
               variant="destructive"
-              className="min-w-[140px] h-10 font-semibold shadow-md"
+              className={cn(
+                "min-w-[140px] h-10 font-semibold shadow-md",
+                !ackLoading && "fire-ack-blink",
+              )}
               onClick={onAcknowledge}
               disabled={ackLoading}
             >
@@ -214,6 +217,162 @@ function FireAlertModalView({
   );
 }
 
+const ADDRESS_IN_TEXT_RE = /\b(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)\b/i;
+
+/**
+ * Optimistically clear T and S for the single device a restore message refers
+ * to (by address, or by its location text). Ambiguous locations are left to the
+ * follow-up list sync.
+ */
+async function clearRestoredDeviceFlags(entry, rawText) {
+  try {
+    const direct = entry.pointId || entry.deviceAddress || rawText.match(ADDRESS_IN_TEXT_RE)?.[0];
+    const addresses = direct
+      ? [direct]
+      : entry.location
+        ? await findAllDeviceAddressesByLocationText(entry.location)
+        : [];
+    if (addresses.length !== 1) return;
+    const store = useAssetFireStatusStore.getState();
+    store.optimisticallySetFlagForAddresses(addresses, "T", 0);
+    store.optimisticallySetFlagForAddresses(addresses, "S", 0);
+  } catch (error) {
+    console.error("[FireModalContext] restore flag clear failed:", error);
+  }
+}
+
+/** Max time new panel messages are collected before being handled together. */
+const LIVE_BATCH_WINDOW_MS = 2000;
+/** Most messages looked at together — the batch is handled as soon as it is full. */
+const LIVE_BATCH_MAX = 10;
+/** Once this many are waiting, a short pause in the stream ends the burst. */
+const LIVE_BATCH_MIN_LOOKAHEAD = 5;
+const LIVE_BATCH_QUIET_MS = 300;
+/** A fire waits only this long, so messages from the same burst are sorted with it. */
+const LIVE_FIRE_GRACE_MS = 100;
+
+/** Handling order within a batch (lower first). */
+const LIVE_PRIORITY = { fire: 0, supervisory: 1, trouble: 2, other: 3 };
+
+function liveEntryPriority({ isFire, isSupervisory, isTrouble, isAck }) {
+  if (isAck) return LIVE_PRIORITY.other;
+  if (isFire) return LIVE_PRIORITY.fire;
+  if (isSupervisory) return LIVE_PRIORITY.supervisory;
+  if (isTrouble) return LIVE_PRIORITY.trouble;
+  return LIVE_PRIORITY.other;
+}
+
+/**
+ * Classify one live panel log entry. Returns null for lines that are not live
+ * alarm traffic (command output, CVAL, system banners).
+ */
+function classifyLiveEntry(entry) {
+  if (!entry) return null;
+
+  const rawText = String(entry.raw || "");
+  const locText = String(entry.location || "");
+  const descText = String(entry.description || "");
+  const devText = String(entry.device || "");
+
+  // Ignore show counts, show <address>, PRIMARY STATUS, and device property queries
+  const allText = `${rawText} ${locText} ${descText} ${devText} ${String(entry.status || "")} ${String(entry.category || "")}`;
+  if (
+    /show\s+counts|FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+/i.test(allText) ||
+    /\bshow\b|PRIMARY\s+STATUS|ENABLED\s+STATE|CUSTOM\s+LABEL|DEVICE\s+TYPE|POINT\s+TYPE|RAW\s+ANALOG|ALARM\s+THRESHOLD|CARD\s+TYPE/i.test(allText)
+  ) {
+    return null;
+  }
+
+  if (entry.kind === "cval" || entry.kind === "noise" || entry.kind === "system") {
+    return null;
+  }
+
+  const statusText = String(entry.status || "");
+  const catText = String(entry.category || "");
+
+  // A device returning to normal ("NORMAL", "... CLEARED", "... RESTORED") is
+  // never a new alarm, even when the status mentions TROUBLE or the device is
+  // a SUPERVISORY MONITOR. "NORMAL ACKED" stays an acknowledgement.
+  const isRestore =
+    !entry.isListEntry &&
+    !/ACKED/i.test(statusText) &&
+    /\bNORMAL\b|CLEAR|RESTOR/i.test(statusText);
+
+  // Check if this is an explicit fire alarm event (highest priority — live event, not passive list dump)
+  const isFire =
+    (entry.kind === "fire" ||
+      catText === "fire" ||
+      /^FIRE\s+ALARM$|^FIRE$/i.test(statusText) ||
+      /FIRE\s+ALARM/i.test(rawText)) &&
+    !entry.isListEntry &&
+    !isRestore;
+
+  // Check if this is an ACK event
+  const isAck =
+    entry.kind === "fire-acknowledged" ||
+    entry.kind === "acknowledged" ||
+    entry.acknowledged === true ||
+    /ACKED/i.test(statusText) ||
+    statusText === "NORMAL ACKED" ||
+    /NORMAL\s+ACKED|FIRE\s+ALARM\s+ACKED/i.test(rawText);
+
+  // Check if event is trouble (live event, not passive list dump)
+  const isTrouble =
+    (entry.kind === "trouble" ||
+      catText === "trouble" ||
+      /TROUBLE|TRBL|DIRTY/i.test(statusText)) &&
+    !entry.isListEntry &&
+    !isRestore;
+
+  // Check if event is supervisory (live event, not passive list dump)
+  const isSupervisory =
+    (entry.kind === "supervisory" ||
+      catText === "supervisory" ||
+      /SUPERVISORY|SUPV|SUPR/i.test(statusText) ||
+      /SUPERVISORY/i.test(String(entry.device || ""))) &&
+    !entry.isListEntry &&
+    !isRestore;
+
+  // Check if event is system reset
+  const isReset =
+    entry.kind === "reset-complete" ||
+    entry.kind === "reset-normal" ||
+    entry.kind === "reset-in-progress" ||
+    entry.kind === "reset-aborted" ||
+    entry.kind === "reset";
+
+  return { rawText, statusText, isRestore, isFire, isAck, isTrouble, isSupervisory, isReset };
+}
+
+/**
+ * AutoPilot hook: announce every live panel line the moment it arrives (before
+ * batching) as an alarm or an acknowledgement for one category. Fire > Trouble
+ * > Supervisory when a line matches more than one.
+ */
+function announceLivePanelEntry(entry, classified, receivedAt) {
+  if (typeof window === "undefined") return;
+  const { rawText, statusText, isFire, isAck, isTrouble, isSupervisory } = classified;
+  let type = null;
+  let label = null;
+  if (isAck) {
+    const isFireAck =
+      entry.kind === "fire-acknowledged" ||
+      /FIRE\s+ALARM\s+ACKED/i.test(statusText) ||
+      /FIRE\s+ALARM\s+ACKED/i.test(rawText);
+    type = "ack";
+    label = isFireAck ? "Fire" : isSupervisory && !isTrouble ? "Supervisory" : "Trouble";
+  } else if (isFire || isTrouble || isSupervisory) {
+    type = "alarm";
+    label = isFire ? "Fire" : isTrouble ? "Trouble" : "Supervisory";
+  }
+  if (!type) return;
+  window.dispatchEvent(
+    new CustomEvent("vision365:livePanelEntry", {
+      detail: { type, label, entry, receivedAt },
+    }),
+  );
+}
+
 export function FireAlertProvider({ children }) {
   const router = useRouter();
   const { toast } = useToast();
@@ -222,6 +381,13 @@ export function FireAlertProvider({ children }) {
   const [isSirenMuted, setIsSirenMuted] = useState(false);
   const [ackLoading, setAckLoading] = useState(false);
   const [activeAlarmInfo, setActiveAlarmInfo] = useState(null);
+  // Navbar "Fire Ack" button blinks from a new live fire until it is clicked
+  // or a fire acknowledgement (FIRE ALARM ACKED) arrives in the panel logs.
+  const [isFireAckPending, setIsFireAckPending] = useState(false);
+  // Navbar "Trouble Ack" / "Sup Ack" buttons blink from a new live trouble /
+  // supervisory event until they are clicked or a matching ack is logged.
+  const [isTroubleAckPending, setIsTroubleAckPending] = useState(false);
+  const [isSupervisoryAckPending, setIsSupervisoryAckPending] = useState(false);
   const stopSirenRef = useRef(null);
   // Set per-category when a new message's location text resolves to more
   // than one AssetsList device — resolved with a `list f/t/s` dump once
@@ -229,7 +395,10 @@ export function FireAlertProvider({ children }) {
   const ambiguousLocationRef = useRef({ Fire: false, Trouble: false, Supervisory: false });
   // Last known counts from any "show counts" call — used by the "NORMAL ACKED"
   // handler to detect a per-category decrease (see fetchAndSyncCounts).
-  const previousCountsRef = useRef({ totalFire: 0, totalTrouble: 0, totalSupervisory: 0 });
+  // null until the first check, which starts from the counts saved by the
+  // startup list sync — starting from 0 re-listed every trouble (215 rows,
+  // ~20s of panel time) on the first alarm after each page load.
+  const previousCountsRef = useRef(null);
   const recentLiveAlarmHistoryRef = useRef(new Map());
 
   const showFireAlert = useCallback((alarmInfo = null) => {
@@ -254,6 +423,32 @@ export function FireAlertProvider({ children }) {
     setIsFireAlertOpen(false);
   }, []);
 
+  const clearFireAckPending = useCallback(() => {
+    setIsFireAckPending(false);
+  }, []);
+
+  const clearTroubleAckPending = useCallback(() => {
+    setIsTroubleAckPending(false);
+  }, []);
+
+  const clearSupervisoryAckPending = useCallback(() => {
+    setIsSupervisoryAckPending(false);
+  }, []);
+
+  // Live stream and debug simulator both announce new trouble / supervisory
+  // events through these window events.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleNewTrouble = () => setIsTroubleAckPending(true);
+    const handleNewSupervisory = () => setIsSupervisoryAckPending(true);
+    window.addEventListener("vision365:newTroubleEvent", handleNewTrouble);
+    window.addEventListener("vision365:newSupervisoryEvent", handleNewSupervisory);
+    return () => {
+      window.removeEventListener("vision365:newTroubleEvent", handleNewTrouble);
+      window.removeEventListener("vision365:newSupervisoryEvent", handleNewSupervisory);
+    };
+  }, []);
+
   const toggleSirenMute = useCallback(() => {
     setIsSirenMuted((prev) => !prev);
   }, []);
@@ -266,7 +461,7 @@ export function FireAlertProvider({ children }) {
     setIsSirenMuted(false);
   }, []);
 
-  const fetchAndSyncCounts = useCallback(async ({ checkDecrease = false } = {}) => {
+  const fetchAndSyncCounts = useCallback(async () => {
     try {
       const cmdUrl = apiUrl("/api/telnet/fire-panel/command");
       const res = await fetch(cmdUrl, {
@@ -279,6 +474,25 @@ export function FireAlertProvider({ children }) {
       const rawText = typeof data === "string" ? data : (data?.response || data?.raw || "");
       const counts = parseShowCountsResponse(rawText);
       if (!counts) return;
+
+      // Baseline for the change check below (read before this call saves new counts).
+      let previous = previousCountsRef.current;
+      if (!previous) {
+        previous = { totalFire: 0, totalTrouble: 0, totalSupervisory: 0 };
+        try {
+          const storedRes = await fetch(apiUrl("/api/telnet/fire-panel/panel-state"));
+          if (storedRes.ok) {
+            const stored = await storedRes.json();
+            previous = {
+              totalFire: Number(stored?.totalFire) || 0,
+              totalTrouble: Number(stored?.totalTrouble) || 0,
+              totalSupervisory: Number(stored?.totalSupervisory) || 0,
+            };
+          }
+        } catch {
+          // keep the zero baseline
+        }
+      }
 
       // 1. Save to backend database
       const stateUrl = apiUrl("/api/telnet/fire-panel/panel-state");
@@ -299,30 +513,29 @@ export function FireAlertProvider({ children }) {
         );
       }
 
-      // 3. Reconcile categories when counts change from previous value:
-      const previous = previousCountsRef.current;
-      if (counts.totalTrouble !== previous.totalTrouble) {
-        if (counts.totalTrouble < previous.totalTrouble) {
-          await resetCategorySimplexStatus("Trouble");
-        }
-        await syncTroubleListAssets();
-      }
-      if (counts.totalSupervisory !== previous.totalSupervisory) {
-        if (counts.totalSupervisory < previous.totalSupervisory) {
-          await resetCategorySimplexStatus("Supervisory");
-        }
-        await syncSupervisoryListAssets();
-      }
-      if (checkDecrease && counts.totalFire < previous.totalFire) {
-        await resetCategorySimplexStatus("Fire");
-        await syncFireListAssets();
-      }
-
+      // 3. Reconcile categories whose count changed. The counts we just read are
+      //    passed through so each sync skips its own `show counts`; the diff in
+      //    syncAssetsListWithPanelList clears devices that dropped off the list.
       previousCountsRef.current = {
         totalFire: counts.totalFire,
         totalTrouble: counts.totalTrouble,
         totalSupervisory: counts.totalSupervisory,
       };
+      const syncs = [];
+      if (counts.totalTrouble !== previous.totalTrouble) {
+        syncs.push(syncTroubleListAssets({ expectedCount: counts.totalTrouble }));
+      }
+      if (counts.totalSupervisory !== previous.totalSupervisory) {
+        syncs.push(syncSupervisoryListAssets({ expectedCount: counts.totalSupervisory }));
+      }
+      // Any drop in the fire count re-syncs the fire list. A fire at a single
+      // device only set a live F flag (no DB write), so without this its
+      // marker stayed red after the fire cleared. At 0 fires no command is
+      // sent — every F flag is simply cleared.
+      if (counts.totalFire < previous.totalFire) {
+        syncs.push(syncFireListAssets({ expectedCount: counts.totalFire }));
+      }
+      await Promise.allSettled(syncs);
     } catch (err) {
       console.error("[FireModalContext] fetchAndSyncCounts failed:", err);
     }
@@ -334,8 +547,8 @@ export function FireAlertProvider({ children }) {
    * waits for the full response, saves it to {label}-list so the live page
    * (which reads that doc via onSnapshot) picks it up, and logs the response.
    *
-   * Ack/silence/reset/etc. issued while this runs are held behind it (see
-   * openPriorityGate) instead of preempting it — same-command retries coalesce.
+   * Ack/silence/reset issued while this runs preempt it in the panel worker;
+   * the list dump is restarted afterwards and this call still gets the full list.
    */
   const runPostAckListSync = useCallback(async (label) => {
     if (!ambiguousLocationRef.current[label]) return;
@@ -344,8 +557,9 @@ export function FireAlertProvider({ children }) {
     const listCmd = getListCmdForLabel(label);
     if (!listCmd) return;
 
-    const gate = openPriorityGate();
     try {
+      // Not during an AutoPilot sequence (no-op when AutoPilot is idle).
+      await waitForAutoPilotListHold();
       const result = await withMonitorPaused(() =>
         sendPriorityPanelCommand(listCmd, LIST_COMMAND_TIMEOUT_MS),
       );
@@ -374,8 +588,6 @@ export function FireAlertProvider({ children }) {
       useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
     } catch (error) {
       console.error(`[FireModalContext] post-ack ${listCmd} failed:`, error);
-    } finally {
-      closePriorityGate(gate);
     }
   }, []);
 
@@ -401,8 +613,10 @@ export function FireAlertProvider({ children }) {
     void (async () => {
       let ackSucceeded = false;
       try {
-        await sendPriorityPanelCommand("ack", 2000);
+        // Re-sends `ack` while `list f` still shows the fire unacknowledged (≤ ~6s).
+        const result = await acknowledgeFireConfirmed();
         ackSucceeded = true;
+        console.log("[FireModalContext] fire ack:", result);
       } catch (err) {
         console.error("[FireModalContext] ack f failed:", err);
       }
@@ -417,6 +631,26 @@ export function FireAlertProvider({ children }) {
       }
     })();
   }, [closeFireAlertModal, fetchAndSyncCounts, muteSiren, router, runPostAckListSync, toast]);
+
+  /**
+   * AutoPilot fire acknowledge — same UI steps as the modal's Acknowledge
+   * (mute siren, close modal, open Live Fire), but awaitable and toast-free.
+   * Resolves true once the priority `ack` returns OK.
+   */
+  const autoAcknowledgeFire = useCallback(async () => {
+    muteSiren();
+    closeFireAlertModal();
+    setIsFireAckPending(false);
+    router.push(LIVE_FIRE_ROUTE);
+
+    // Confirmed ack: re-sent while the fire is still unacknowledged (≤ ~6s).
+    // Resolves true only once the panel has accepted it.
+    const result = await acknowledgeFireConfirmed();
+    console.log("[FireModalContext] AutoPilot fire ack:", result);
+    void fetchAndSyncCounts().catch(() => {});
+    if (result.attempts > 0) void runPostAckListSync("Fire");
+    return result.acknowledged;
+  }, [closeFireAlertModal, fetchAndSyncCounts, muteSiren, router, runPostAckListSync]);
 
   // Siren runs while alarm is active or modal is open (and not muted)
   useEffect(() => {
@@ -441,70 +675,24 @@ export function FireAlertProvider({ children }) {
     let active = true;
     let eventSource = null;
     let reconnectTimer = null;
+    // Arrival time per live entry (kept off the entry so it is never saved).
+    const receivedAtByEntry = new WeakMap();
 
-    const processEntry = (entry) => {
-      if (!entry) return;
+    // AutoPilot hook: the row for this message is now on its live list page.
+    const announceLiveAlarmListed = (label, entry) => {
+      if (typeof window === "undefined") return;
+      window.dispatchEvent(
+        new CustomEvent("vision365:liveAlarmListed", {
+          detail: { label, receivedAt: receivedAtByEntry.get(entry) },
+        }),
+      );
+    };
 
-      const rawText = String(entry.raw || "");
-      const locText = String(entry.location || "");
-      const descText = String(entry.description || "");
-      const devText = String(entry.device || "");
-
-      // Ignore show counts, show <address>, PRIMARY STATUS, and device property queries
-      const allText = `${rawText} ${locText} ${descText} ${devText} ${String(entry.status || "")} ${String(entry.category || "")}`;
-      if (
-        /show\s+counts|FIRE\s*=\s*\d+|TROUBLE\s*=\s*\d+|SUPERVISORY\s*=\s*\d+/i.test(allText) ||
-        /\bshow\b|PRIMARY\s+STATUS|ENABLED\s+STATE|CUSTOM\s+LABEL|DEVICE\s+TYPE|POINT\s+TYPE|RAW\s+ANALOG|ALARM\s+THRESHOLD|CARD\s+TYPE/i.test(allText)
-      ) {
-        return;
-      }
-
-      if (entry.kind === "cval" || entry.kind === "noise" || entry.kind === "system") {
-        return;
-      }
-
-      const statusText = String(entry.status || "");
-      const catText = String(entry.category || "");
-
-      // Check if this is an explicit fire alarm event (highest priority — live event, not passive list dump)
-      const isFire =
-        (entry.kind === "fire" ||
-          catText === "fire" ||
-          /^FIRE\s+ALARM$|^FIRE$/i.test(statusText) ||
-          /FIRE\s+ALARM/i.test(rawText)) &&
-        !entry.isListEntry;
-
-      // Check if this is an ACK event
-      const isAck =
-        entry.kind === "fire-acknowledged" ||
-        entry.kind === "acknowledged" ||
-        entry.acknowledged === true ||
-        /ACKED/i.test(statusText) ||
-        statusText === "NORMAL ACKED" ||
-        /NORMAL\s+ACKED|FIRE\s+ALARM\s+ACKED/i.test(rawText);
-
-      // Check if event is trouble (live event, not passive list dump)
-      const isTrouble =
-        (entry.kind === "trouble" ||
-          catText === "trouble" ||
-          /TROUBLE|TRBL|DIRTY/i.test(statusText)) &&
-        !entry.isListEntry;
-
-      // Check if event is supervisory (live event, not passive list dump)
-      const isSupervisory =
-        (entry.kind === "supervisory" ||
-          catText === "supervisory" ||
-          /SUPERVISORY|SUPV|SUPR/i.test(statusText) ||
-          /SUPERVISORY/i.test(String(entry.device || ""))) &&
-        !entry.isListEntry;
-
-      // Check if event is system reset
-      const isReset =
-        entry.kind === "reset-complete" ||
-        entry.kind === "reset-normal" ||
-        entry.kind === "reset-in-progress" ||
-        entry.kind === "reset-aborted" ||
-        entry.kind === "reset";
+    const processEntry = async (entry) => {
+      const classified = classifyLiveEntry(entry);
+      if (!classified) return;
+      const { rawText, statusText, isRestore, isFire, isAck, isTrouble, isSupervisory, isReset } =
+        classified;
 
       // If new unacknowledged fire alarm detected -> popup fire modal & update device F value to 1!
       if (isFire && !isAck) {
@@ -517,6 +705,7 @@ export function FireAlertProvider({ children }) {
         const { timeMs: fireTimeMs, timestampIso: fireTimestampIso, panelTimeText: firePanelTimeText } =
           extractPanelEventTime(entry);
 
+        setIsFireAckPending(true);
         showFireAlert({
           location: entry.location || "Fire Alarm Detected",
           deviceType: entry.device || entry.deviceType || entry.description || "Fire Device",
@@ -538,7 +727,7 @@ export function FireAlertProvider({ children }) {
         const fireDeviceType =
           entry.device || entry.deviceType || entry.description || "FIRE DEVICE";
 
-        void (async () => {
+        await (async () => {
           try {
             const resolvedAddresses = await findAllDeviceAddressesByLocationText(fireLocation);
             let fireAddrToUse = "NA";
@@ -567,25 +756,23 @@ export function FireAlertProvider({ children }) {
               } catch (err) {
                 console.error("[FireModalContext] list f failed:", err);
               }
-            } else if (resolvedAddresses.length === 1) {
-              fireAddrToUse = resolvedAddresses[0];
-              const listFItem = [fireAddrToUse, fireLocation, fireDeviceType, "FIRE*"]
-                .filter(Boolean)
-                .join("   ");
-              console.log("[FireModalContext] new fire as list f item:", listFItem);
-              const parsedRows = parsePanelListResponse(listFItem);
-              await saveListToCategoryDb("Fire", parsedRows);
-              useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([fireAddrToUse], "F", 1);
             } else {
-              fireAddrToUse = fireAddr || "NA";
-              if (fireAddr) {
-                const listFItem = [fireAddr, fireLocation, fireDeviceType, "FIRE*"]
-                  .filter(Boolean)
-                  .join("   ");
-                console.log("[FireModalContext] new fire as list f item:", listFItem);
-                const parsedRows = parsePanelListResponse(listFItem);
-                await saveListToCategoryDb("Fire", parsedRows);
-                useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([fireAddr], "F", 1);
+              fireAddrToUse = resolvedAddresses.length === 1 ? resolvedAddresses[0] : fireAddr || "NA";
+              // Add this fire to fire-list (keeping every other active fire) —
+              // replacing the list with this one row hid earlier fires.
+              await appendLiveLogToCategoryList("Fire", {
+                ...entry,
+                deviceAddress: fireAddrToUse,
+                fullAddress: fireAddrToUse,
+                location: fireLocation || "—",
+                deviceType: fireDeviceType,
+                time: fireTimeMs,
+                timestamp: fireTimestampIso,
+                panelTimeText: firePanelTimeText,
+              });
+              console.log("[FireModalContext] new fire added to fire-list:", fireAddrToUse, fireLocation);
+              if (fireAddrToUse !== "NA") {
+                useAssetFireStatusStore.getState().optimisticallySetFlagForAddresses([fireAddrToUse], "F", 1);
               }
             }
 
@@ -609,6 +796,7 @@ export function FireAlertProvider({ children }) {
             console.error("[FireModalContext] findAllDeviceAddressesByLocationText failed:", error);
           }
         })();
+        announceLiveAlarmListed("Fire", entry);
       }
 
       // If new unacknowledged trouble log arrives -> append to trouble-list DB & update T value to 1
@@ -626,14 +814,18 @@ export function FireAlertProvider({ children }) {
         // provider in the tree, so signal it via a window event (same pattern as
         // vision365:firePanelStateUpdated) instead of calling its hook directly.
         if (typeof window !== "undefined") {
-          window.dispatchEvent(new CustomEvent("vision365:newTroubleEvent"));
+          window.dispatchEvent(
+            new CustomEvent("vision365:newTroubleEvent", {
+              detail: { receivedAt: receivedAtByEntry.get(entry) },
+            }),
+          );
         }
 
         const troubleLocation = entry.location || "";
         const troubleDeviceType =
           entry.device || entry.deviceType || entry.description || "TROUBLE POINT";
 
-        void (async () => {
+        await (async () => {
           try {
             let trblAddrToUse = trblAddr || "NA";
             if (!trblAddr && troubleLocation) {
@@ -689,6 +881,7 @@ export function FireAlertProvider({ children }) {
             console.error("[FireModalContext] trouble event processing failed:", error);
           }
         })();
+        announceLiveAlarmListed("Trouble", entry);
       }
 
       // If new unacknowledged supervisory log arrives -> append to supervisory-list DB & update S value to 1
@@ -703,16 +896,22 @@ export function FireAlertProvider({ children }) {
           extractPanelEventTime(entry);
 
         if (typeof window !== "undefined") {
-          window.dispatchEvent(new CustomEvent("vision365:newSupervisoryEvent"));
+          window.dispatchEvent(
+            new CustomEvent("vision365:newSupervisoryEvent", {
+              detail: { receivedAt: receivedAtByEntry.get(entry) },
+            }),
+          );
         }
 
         const supervisoryLocation = entry.location || "";
         const supervisoryDeviceType =
           entry.device || entry.deviceType || entry.description || "SUPERVISORY";
 
-        void (async () => {
+        await (async () => {
           try {
             let supAddrToUse = supAddr || "NA";
+            // Set when `list s` already replaced supervisory-list below.
+            let supListSaved = false;
             if (!supAddr && supervisoryLocation) {
               const resolvedAddresses = await findAllDeviceAddressesByLocationText(supervisoryLocation);
               if (resolvedAddresses.length === 1) {
@@ -721,24 +920,61 @@ export function FireAlertProvider({ children }) {
                 ambiguousLocationRef.current.Supervisory = true;
                 supAddrToUse = "NA";
                 console.log(
-                  "[FireModalContext] supervisory location matches multiple devices — will re-list after ack:",
+                  "[FireModalContext] supervisory location matches multiple devices — fetching list s now:",
                   supervisoryLocation,
                   resolvedAddresses,
                 );
+                // Same as fire's `list f`: the panel list names the real address,
+                // so the row does not sit at "NA" until an ack.
+                try {
+                  const result = await withMonitorPaused(() =>
+                    sendPriorityPanelCommand("list s", LIST_COMMAND_TIMEOUT_MS),
+                  );
+                  const rawListText = result?.response ?? "";
+                  const parsedRows = parsePanelListResponse(rawListText);
+                  await saveListToCategoryDb("Supervisory", parsedRows);
+                  const deviceAddresses = extractPanelDeviceAddresses(rawListText);
+                  await syncAssetsListWithPanelList("Supervisory", deviceAddresses);
+                  useAssetFireStatusStore.getState().scheduleSyncFromAssetsList();
+                  supListSaved = true;
+
+                  // Compare address variants so "2:M1-32" and "2:M1-32-0" match.
+                  const candidateKeys = new Set(
+                    resolvedAddresses.flatMap((a) => [...collectDeviceAddressKeys(a)]),
+                  );
+                  const listed = [
+                    ...new Set(
+                      parsedRows
+                        .map((row) => String(row.fullAddress || row.deviceAddress || "").toUpperCase())
+                        .filter((addr) =>
+                          [...collectDeviceAddressKeys(addr)].some((key) => candidateKeys.has(key)),
+                        ),
+                    ),
+                  ];
+                  if (listed.length === 1) supAddrToUse = listed[0];
+                  console.log(
+                    `[FireModalContext] supervisory-list saved from list s: ${parsedRows.length} row(s), resolved address: ${supAddrToUse}`,
+                  );
+                } catch (err) {
+                  console.error("[FireModalContext] list s failed:", err);
+                }
               }
             }
 
-            // Always append live supervisory log to supervisory-list
-            await appendLiveLogToCategoryList("Supervisory", {
-              ...entry,
-              deviceAddress: supAddrToUse,
-              fullAddress: supAddrToUse,
-              location: supervisoryLocation || entry.location || "—",
-              deviceType: supervisoryDeviceType,
-              time: supTimeMs,
-              timestamp: supTimestampIso,
-              panelTimeText: supPanelTimeText,
-            });
+            // Append the live supervisory log to supervisory-list, unless
+            // `list s` above already replaced the list with the panel's rows.
+            if (!supListSaved) {
+              await appendLiveLogToCategoryList("Supervisory", {
+                ...entry,
+                deviceAddress: supAddrToUse,
+                fullAddress: supAddrToUse,
+                location: supervisoryLocation || entry.location || "—",
+                deviceType: supervisoryDeviceType,
+                time: supTimeMs,
+                timestamp: supTimestampIso,
+                panelTimeText: supPanelTimeText,
+              });
+            }
             console.log("[Supervisory]: New Supervisory added to categoryList:", entry, supAddrToUse);
 
             if (supAddrToUse && supAddrToUse !== "NA") {
@@ -766,6 +1002,7 @@ export function FireAlertProvider({ children }) {
             console.error("[FireModalContext] supervisory event processing failed:", error);
           }
         })();
+        announceLiveAlarmListed("Supervisory", entry);
       }
 
       // If system reset completed, dismiss active fire alert and run full post-reset reconciliation workflow
@@ -784,8 +1021,16 @@ export function FireAlertProvider({ children }) {
         /FIRE\s+ALARM\s+ACKED/i.test(rawText);
 
       if (isFireAck) {
-        void fetchAndSyncCounts();
+        setIsFireAckPending(false);
+        requestCountsCheck();
         return;
+      }
+
+      // Any other acknowledgement stops the matching navbar Ack button blink:
+      // a SUPERVISORY device/status → Sup Ack, everything else → Trouble Ack.
+      if (isAck) {
+        if (isSupervisory) setIsSupervisoryAckPending(false);
+        else setIsTroubleAckPending(false);
       }
 
       // If the panel reports "NORMAL ACKED": something was acknowledged/cleared
@@ -795,14 +1040,115 @@ export function FireAlertProvider({ children }) {
         statusText === "NORMAL ACKED" || /NORMAL\s+ACKED/i.test(rawText);
 
       if (isNormalAcked) {
-        void fetchAndSyncCounts({ checkDecrease: true });
+        requestCountsCheck(true);
+        return;
+      }
+
+      // Trouble / supervisory cleared on the panel. The restore line does not say
+      // which category cleared, so clear T and S on that device at once (marker
+      // recolors immediately); `show counts` then re-lists whichever category's
+      // count changed — the authoritative update. Unrecognised live lines ("other",
+      // e.g. a status lost to a glued command echo) get the same counts check so
+      // a clear is never missed.
+      if (isRestore || (entry.kind === "other" && !isAck && !entry.isListEntry)) {
+        if (isRestore) void clearRestoredDeviceFlags(entry, rawText);
+        requestCountsCheck(true);
         return;
       }
 
       // Whenever new fire/trouble/supervisory, acknowledged, or other reset log arrives:
       // Run `show counts` command once and update totalFire/Trouble/Supervisory in UI & DB realtime
       if (isFire || isTrouble || isSupervisory || isAck || isReset) {
-        void fetchAndSyncCounts();
+        requestCountsCheck();
+      }
+    };
+
+    // ── Live message batching ────────────────────────────────────────────────
+    // New panel messages are looked at together — up to LIVE_BATCH_MAX (10) of
+    // them, for at most LIVE_BATCH_WINDOW_MS (2 s) — then handled one at a time
+    // (each finishes before the next starts, so list writes never overwrite each
+    // other) in priority order: fire → supervisory → trouble → everything else
+    // (acks, restores, resets) in arrival order. The batch is handled early when
+    // it is full, when 5+ are waiting and the stream pauses, or LIVE_FIRE_GRACE_MS
+    // after a fire (so the fire alert is never held back by the window).
+    // `show counts` runs once per batch.
+    let pendingEntries = [];
+    let batchTimer = null;
+    let quietTimer = null;
+    let fireTimer = null;
+    let batchSeq = 0;
+    let processingChain = Promise.resolve();
+    let countsCheck = null;
+
+    const requestCountsCheck = (checkDecrease = false) => {
+      countsCheck = { checkDecrease: Boolean(countsCheck?.checkDecrease || checkDecrease) };
+    };
+
+    const clearBatchTimers = () => {
+      for (const timer of [batchTimer, quietTimer, fireTimer]) {
+        if (timer) clearTimeout(timer);
+      }
+      batchTimer = null;
+      quietTimer = null;
+      fireTimer = null;
+    };
+
+    const flushBatch = () => {
+      clearBatchTimers();
+      if (pendingEntries.length === 0) return;
+      const batch = pendingEntries.sort((a, b) => a.priority - b.priority || a.seq - b.seq);
+      pendingEntries = [];
+
+      processingChain = processingChain.then(async () => {
+        for (const { entry } of batch) {
+          if (!active) return;
+          try {
+            await processEntry(entry);
+          } catch (error) {
+            console.error("[FireModalContext] live message failed:", error);
+          }
+        }
+        if (countsCheck && active) {
+          const options = countsCheck;
+          countsCheck = null;
+          // Not awaited: a full list t can take tens of seconds and must not
+          // hold back the next batch (e.g. a new fire).
+          void fetchAndSyncCounts(options);
+        }
+      });
+    };
+
+    const enqueueEntry = (entry) => {
+      // AutoPilot hook: "ACCESS GRANTED" (login reply) seen in the panel logs.
+      if (entry?.kind === "system" && entry.systemType === "login-success") {
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("vision365:panelLoginGranted", { detail: { receivedAt: Date.now() } }),
+          );
+        }
+        return;
+      }
+      const classified = classifyLiveEntry(entry);
+      if (!classified) return;
+      const receivedAt = Date.now();
+      receivedAtByEntry.set(entry, receivedAt);
+      announceLivePanelEntry(entry, classified, receivedAt);
+      const priority = liveEntryPriority(classified);
+      pendingEntries.push({ entry, priority, seq: batchSeq++ });
+
+      if (pendingEntries.length >= LIVE_BATCH_MAX) {
+        flushBatch();
+        return;
+      }
+      if (!batchTimer) {
+        batchTimer = setTimeout(flushBatch, LIVE_BATCH_WINDOW_MS);
+      }
+      if (priority === LIVE_PRIORITY.fire && !fireTimer) {
+        fireTimer = setTimeout(flushBatch, LIVE_FIRE_GRACE_MS);
+      }
+      if (pendingEntries.length >= LIVE_BATCH_MIN_LOOKAHEAD) {
+        if (quietTimer) clearTimeout(quietTimer);
+        quietTimer = setTimeout(flushBatch, LIVE_BATCH_QUIET_MS);
       }
     };
 
@@ -821,10 +1167,10 @@ export function FireAlertProvider({ children }) {
             if (data.backlog) return;
             // New format: entry is the root object with a `kind` field
             if (data.kind) {
-              processEntry(data);
+              enqueueEntry(data);
             } else if (data.type === "log" && data.entry) {
               // Legacy format fallback
-              processEntry(data.entry);
+              enqueueEntry(data.entry);
             }
           } catch {
             // ignore malformed frame
@@ -848,7 +1194,7 @@ export function FireAlertProvider({ children }) {
 
     const handleFireEvent = (e) => {
       if (e?.detail) {
-        processEntry(e.detail);
+        enqueueEntry(e.detail);
       }
     };
     if (typeof window !== "undefined") {
@@ -858,6 +1204,7 @@ export function FireAlertProvider({ children }) {
     return () => {
       active = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      clearBatchTimers();
       if (eventSource) eventSource.close();
       if (typeof window !== "undefined") {
         window.removeEventListener("vision365:newFireEvent", handleFireEvent);
@@ -878,6 +1225,13 @@ export function FireAlertProvider({ children }) {
       unmuteSiren,
       activeAlarmInfo,
       runPostAckListSync,
+      autoAcknowledgeFire,
+      isFireAckPending,
+      clearFireAckPending,
+      isTroubleAckPending,
+      clearTroubleAckPending,
+      isSupervisoryAckPending,
+      clearSupervisoryAckPending,
     }),
     [
       isFireAlertOpen,
@@ -891,6 +1245,13 @@ export function FireAlertProvider({ children }) {
       unmuteSiren,
       activeAlarmInfo,
       runPostAckListSync,
+      autoAcknowledgeFire,
+      isFireAckPending,
+      clearFireAckPending,
+      isTroubleAckPending,
+      clearTroubleAckPending,
+      isSupervisoryAckPending,
+      clearSupervisoryAckPending,
     ],
   );
 

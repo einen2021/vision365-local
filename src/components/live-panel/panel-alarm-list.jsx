@@ -58,7 +58,7 @@ const PanelAlarmRow = memo(function PanelAlarmRow({
     : undefined;
 
   const tooltipTitle = onRowAck
-    ? tone === "fire" || tone === "trouble"
+    ? tone === "fire" || tone === "trouble" || tone === "supervisory"
       ? "Click to acknowledge and open floor plan"
       : "Click to acknowledge"
     : undefined;

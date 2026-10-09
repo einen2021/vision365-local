@@ -13,7 +13,7 @@ import { FireAlertModal } from "@/components/fire-alert-modal";
 import { usePathname } from "next/navigation";
 import secureLocalStorage from "react-secure-storage";
 import { collection as mockCollection, getDocs as mockGetDocs } from "@/lib/mockFirestore";
-import { collection, doc, getDoc, getDocs, updateDoc } from "firebase/firestore";
+import { doc, writeBatch } from "firebase/firestore";
 import { getUserCommunities } from "@/utils/communityService";
 import { loadBrandRegistry } from "@/utils/brandRegistryService";
 import { getStoredSessionUser } from "@/lib/sessionUser";
@@ -45,12 +45,22 @@ import { streamFirePanelListCommand } from "@/lib/firePanelListStream";
 import { pickNewestAppearedAddresses } from "@/lib/livePanelListHighlight";
 import {
   withMonitorPaused,
-  withMonitorPausedForPriority,
 } from "@/lib/firePanelMonitorSession";
-import { sendPriorityPanelCommand } from "@/lib/acknowledgePanelDevice";
+import { sendPriorityPanelCommand, sendPriorityPanelCommands } from "@/lib/acknowledgePanelDevice";
+import { loginToPanel } from "@/lib/panelLogin";
+
+/** Log in (with retry) before a command that needs it; throws when access is never granted. */
+async function requirePanelLogin() {
+  const login = await loginToPanel();
+  if (!login.granted) {
+    throw new Error(`Could not log in to the panel (${login.reason || "no answer"})`);
+  }
+}
+import { getAssetsListSnapshot, invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets";
 import { useFireAlert } from "./FireModalContext";
 import { useDeviceEnabledStore } from "@/stores/deviceEnabledStore";
 import { LivePanelAlertWatcher } from "@/components/live-panel-alert-watcher";
+import { AutoPilotController } from "@/components/autopilot-controller";
 import {
   LIVE_SUPERVISORY_ROUTE,
   LIVE_TROUBLE_ROUTE,
@@ -450,67 +460,54 @@ export const AppProvider = ({ children }) => {
     return { ...data, ...nextState };
   }, []);
 
-  const silenceAlarm = useCallback(async () => {
+  // `login: false` skips the login when the caller already logged in
+  // (AutoPilot). Otherwise the login is retried until ACCESS GRANTED and the
+  // set commands are only sent after it (the panel ignores them otherwise).
+  const silenceAlarm = useCallback(async ({ login = true } = {}) => {
     muteSiren()
-    // Priority queue jumps ahead of any in-flight list/CVAL dump so silence
-    // does not sit queued behind a 200-row list command for tens of seconds.
-    return withMonitorPausedForPriority(async () => {
-      const loginResult = await sendPriorityPanelCommand("login 333", 2000);
-      const loginResponse = loginResult?.response || "";
-      // if (!loginResponse.includes("ACCESS GRANTED")) {
-      //   throw new Error("Panel login failed");
-      // }
-      await sendPriorityPanelCommand("set 2:p217 on", 1000)
-      await sendPriorityPanelCommand("set 3:p217 on", 1000)
-      await sendPriorityPanelCommand("set 4:p217 on", 1000)
-    }, "silenceAlarm");
+    if (login) await requirePanelLogin();
+    // One priority batch: the sets queue back-to-back ahead of any list dump;
+    // each set waits for the panel's echo.
+    return sendPriorityPanelCommands(["set 2:p217 on", "set 3:p217 on", "set 4:p217 on"], 2000);
   }, [muteSiren]);
 
-  const systemReset = useCallback(async () => {
-    // Priority queue jumps ahead of any in-flight list/CVAL dump so reset
-    // does not sit queued behind a 200-row list command for tens of seconds.
-    await withMonitorPausedForPriority(async () => {
-      const loginResult = await sendPriorityPanelCommand("login 333", 2000);
-      const loginResponse = loginResult?.response || "";
-      // if (!loginResponse.includes("ACCESS GRANTED")) {
-      //   throw new Error("Panel login failed");
-      // }
-
-      await sendPriorityPanelCommand("set 2:p212 on", 1000);
-      await sendPriorityPanelCommand("set 3:p212 on", 1000);
-      await sendPriorityPanelCommand("set 4:p212 on", 1000);
-    }, "systemReset")
+  const systemReset = useCallback(async ({ login = true } = {}) => {
+    if (login) await requirePanelLogin();
+    const result = await sendPriorityPanelCommands(
+      ["set 2:p212 on", "set 3:p212 on", "set 4:p212 on"],
+      2000,
+    );
 
     // Turn floor markers green immediately while Firestore catches up.
     // useAssetFireStatusStore.getState().clearAllSimplexStatusInStore();
 
     const runBackgroundReset = async () => {
       try {
-        const snapshot = await getDocs(collection(db, "AssetsList"));
+        invalidateAssetsListSnapshotCache();
+        const snapshot = await getAssetsListSnapshot(db);
         const now = new Date().toISOString();
         const cleared = { F: 0, T: 0, S: 0 };
 
-        const updates = snapshot.docs.map(async (docSnap) => {
+        // One batched write (single DB revision) instead of one write per device.
+        const batch = writeBatch(db);
+        let batchSize = 0;
+        for (const docSnap of snapshot.docs) {
           const data = docSnap.data();
           const current = readSimplexStatus(data);
+          if (current.F === 0 && current.T === 0 && current.S === 0) continue;
 
-          if (current.F === 0 && current.T === 0 && current.S === 0) {
-            return;
-          }
-
-          await updateDoc(doc(db, "AssetsList", docSnap.id), {
+          batch.update(doc(db, "AssetsList", docSnap.id), {
             simplexStatus: cleared,
             updatedAt: now,
           });
-
+          batchSize += 1;
           useAssetFireStatusStore.getState().patchSimplexStatusFromEntry(
             docSnap.id,
             data,
             cleared,
           );
-        });
-
-        await Promise.all(updates);
+        }
+        if (batchSize > 0) await batch.commit();
 
         appendFirePanelMonitorLog("System reset → cleared F/T/S on AssetsList");
       } catch (error) {
@@ -522,13 +519,16 @@ export const AppProvider = ({ children }) => {
     };
 
     void runBackgroundReset();
+    return result;
   }, [appendFirePanelMonitorLog]);
 
 
+  // The login is retried until ACCESS GRANTED (instant while the panel
+  // worker's 3-minute login session is active).
   const disableDevice = useCallback(async (deviceAddress) => {
     return withMonitorPaused(async () => {
-      const loginResponse = await sendPriorityPanelCommand("login 333");
-      const disableResponse = await sendPriorityPanelCommand(`disable ${deviceAddress} on`);
+      await requirePanelLogin();
+      const disableResponse = await sendPriorityPanelCommand(`disable ${deviceAddress} on`, 3000);
       useDeviceEnabledStore.getState().setEnabled(deviceAddress, false);
       return disableResponse;
     });
@@ -536,8 +536,8 @@ export const AppProvider = ({ children }) => {
 
   const enableDevice = useCallback(async (deviceAddress) => {
     return withMonitorPaused(async () => {
-      const loginResponse = await sendPriorityPanelCommand("login 333");
-      const enableResponse = await sendPriorityPanelCommand(`disable ${deviceAddress} off`);
+      await requirePanelLogin();
+      const enableResponse = await sendPriorityPanelCommand(`disable ${deviceAddress} off`, 3000);
       useDeviceEnabledStore.getState().setEnabled(deviceAddress, true);
       return enableResponse;
     });
@@ -866,6 +866,7 @@ export const AppProvider = ({ children }) => {
   return (
     <AppContext.Provider value={value}>
       <LivePanelAlertWatcher />
+      <AutoPilotController />
       {children}
       <FireAlertModal open={isFireAlertOpen} onClose={closeFireAlertModal} />
     </AppContext.Provider>

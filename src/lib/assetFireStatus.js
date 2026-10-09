@@ -270,15 +270,16 @@ export function resolveMarkerStatus(assetId, deviceAddress, fallbackActive, cach
   if (cached) return cached;
 
   const fallback = Number(fallbackActive ?? FIRE_ACTIVE_NORMAL);
-  if (fallback >= FIRE_ACTIVE_ALARM) return { F: 1, T: 0 };
-  if (fallback >= FIRE_ACTIVE_TROUBLE) return { F: 0, T: 1 };
-  return { F: 0, T: 0 };
+  if (fallback >= FIRE_ACTIVE_ALARM) return { F: 1, T: 0, S: 0 };
+  if (fallback >= FIRE_ACTIVE_TROUBLE) return { F: 0, T: 1, S: 0 };
+  if (fallback >= FIRE_ACTIVE_SUPERVISORY) return { F: 0, T: 0, S: 1 };
+  return { F: 0, T: 0, S: 0 };
 }
 
-/** Prefer cached panel F/T status (by deviceAddress / id), else fall back to building active */
+/** Prefer cached panel F/T/S status (by deviceAddress / id), else fall back to building active */
 export function resolveMarkerActive(assetId, deviceAddress, fallbackActive, cache) {
-  const { F, T } = resolveMarkerStatus(assetId, deviceAddress, fallbackActive, cache);
-  return simplexStatusToActive(F, T);
+  const { F, T, S } = resolveMarkerStatus(assetId, deviceAddress, fallbackActive, cache);
+  return simplexStatusToActive(F, T, S);
 }
 
 /** Prefer full mapping identity (ids + address) when resolving live status. */
@@ -288,13 +289,13 @@ export function resolveMarkerActiveFromMapping(
   fallbackActive,
   cache,
 ) {
-  const { F, T } = resolveMarkerStatusFromMapping(
+  const { F, T, S } = resolveMarkerStatusFromMapping(
     mapping,
     deviceAddress,
     fallbackActive,
     cache,
   );
-  return simplexStatusToActive(F, T);
+  return simplexStatusToActive(F, T, S);
 }
 
 /** Resolve raw F/T for a floor-map mapping (with AssetsList meta fallback). */
@@ -340,6 +341,7 @@ export function resolveMarkerStatusFromMapping(
   const fallback = Number(fallbackActive ?? FIRE_ACTIVE_NORMAL);
   if (fallback >= FIRE_ACTIVE_ALARM) return { F: 1, T: 0, S: 0 };
   if (fallback >= FIRE_ACTIVE_TROUBLE) return { F: 0, T: 1, S: 0 };
+  if (fallback >= FIRE_ACTIVE_SUPERVISORY) return { F: 0, T: 0, S: 1 };
   return { F: 0, T: 0, S: 0 };
 }
 
@@ -484,7 +486,7 @@ export function mergeFireIntoActiveStatuses(activeStatuses, assets, cache) {
     const resolvedAddress = resolveAssetDeviceAddress(asset);
     const fallback = merged[id]?.active ?? asset.active ?? FIRE_ACTIVE_NORMAL;
     const status = resolveMarkerStatus(id, resolvedAddress, fallback, cache);
-    const active = simplexStatusToActive(status.F, status.T);
+    const active = simplexStatusToActive(status.F, status.T, status.S);
 
     merged[id] = {
       ...(merged[id] || {}),

@@ -23,7 +23,7 @@ function CommunityOverviewFloorMarkerInner({
 }) {
   const deviceAddr = resolveAssetDeviceAddress(mapping) || mapping.deviceAddress || "";
   const assetId = mapping.assetsListId || mapping.id || mapping.buildingAssetId;
-  // Marker colors from monitoring F/T only — not from `show` ENABLED / PRIMARY STATUS.
+  // Marker colors from monitoring F/T/S only — not from `show` ENABLED / PRIMARY STATUS.
   const active = useAssetFireActive(assetId, deviceAddr, fallbackActive, live);
   const markerTooltip = getAssetMarkerTooltip(mapping, {});
   const dimColor = getFireDimColor(active);

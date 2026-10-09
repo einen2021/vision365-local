@@ -54,10 +54,14 @@ export function parseShowCountsResponse(text = "") {
   const clean = String(text || "");
   const fireMatch = /FIRE\s*=\s*(\d+)/i.exec(clean);
   const supervisoryMatch = /SUPERVISORY\s*=\s*(\d+)/i.exec(clean);
-  const troubleMatch = /TROUBLE\s*=\s*(\d+)/i.exec(clean);
+  // TROUBLE ends the line — require the line end so a reply cut mid-number
+  // ("TROUBLE = 2" of 217) is rejected instead of read as 2.
+  const troubleMatch = /TROUBLE\s*=\s*(\d+)[ \t]*[\r\n]/i.exec(clean);
   const priority2Match = /PRIORITY2\s*=\s*(\d+)/i.exec(clean);
 
-  if (!fireMatch && !supervisoryMatch && !troubleMatch) {
+  // All three totals must be present. A cut-off reply ("FIRE = 0  PRIORITY2 =")
+  // must not be read as TROUBLE = 0 — that wipes the whole trouble list.
+  if (!fireMatch || !supervisoryMatch || !troubleMatch) {
     return null;
   }
 

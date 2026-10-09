@@ -3,6 +3,7 @@
 import { useMemo } from "react";
 import {
   Bell,
+  Bot,
   Building,
   Building2,
   MapPlus,
@@ -89,6 +90,12 @@ const navMain = [
       { title: "Live Trouble", url: "/dashboard/live-trouble" },
       { title: "Live Supervisory", url: "/dashboard/live-supervisory" },
     ],
+  },
+  {
+    title: "AutoPilot",
+    url: "/dashboard/autopilot",
+    icon: Bot,
+    items: [{ title: "Set Up", url: "/dashboard/autopilot" }],
   },
 ];
 

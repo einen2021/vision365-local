@@ -50,7 +50,7 @@ function FloorMapAssetMarkerInner({
     String(deviceAddr || "").trim() ||
     resolveMappingDeviceFields(mapping).deviceAddress ||
     "";
-  // F/T rules: F=1 → red+ripple; F=0 T=1 → yellow; F=0 T=0 → green.
+  // F/T/S rules: F=1 → red+ripple; F=0 T=1 → yellow; F=0 T=0 S=1 → purple; else green.
   const visual = useAssetMarkerVisualFromMapping(
     mapping,
     resolvedAddress,
@@ -272,6 +272,8 @@ function FloorMapAssetMarkerInner({
                 <span className="text-red-500">Fire Alarm</span>
               ) : visual.T === 1 ? (
                 <span className="text-yellow-500">Trouble</span>
+              ) : visual.S === 1 ? (
+                <span className="text-purple-500">Supervisory</span>
               ) : (
                 <span className="text-green-500">Normal</span>
               )}

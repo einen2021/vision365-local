@@ -1,20 +1,21 @@
-/** Coordinates pausing background panel command work around priority commands. */
+/**
+ * Pause bookkeeping around foreground panel commands.
+ *
+ * Command ordering is owned by the desktop-server panel worker (ranked queue:
+ * ack/login/set → list f → list t/s → show → console → cshow *, with list dumps
+ * preempted and restarted for more urgent commands). The browser no longer
+ * serializes commands itself — doing so made an ack wait behind any list dump
+ * already awaiting on the client before it even reached the server.
+ */
 
 /**
  * Keep session flags on globalThis so webpack/Tauri chunk splits cannot
- * duplicate this module and break pause coordination.
+ * duplicate this module.
  */
 function getSessionState() {
   const g = globalThis;
   if (!g.__vision365FirePanelMonitor) {
-    g.__vision365FirePanelMonitor = {
-      pauseDepth: 0,
-      exclusiveCommandChain: Promise.resolve(),
-      // Set while a foreground list dump (e.g. resolving an ambiguous fire
-      // message location) must not be interleaved with anything else on the
-      // telnet connection. See openPriorityGate/closePriorityGate below.
-      priorityGate: null,
-    };
+    g.__vision365FirePanelMonitor = { pauseDepth: 0 };
   }
   return g.__vision365FirePanelMonitor;
 }
@@ -28,77 +29,16 @@ export function resumeMonitorLoop() {
   state.pauseDepth = Math.max(0, state.pauseDepth - 1);
 }
 
-/**
- * Pause background work, run a panel command, then resume this pause layer only.
- * Commands are serialized so two shows cannot interleave.
- */
+/** Run a panel command with the pause layer held; the worker handles ordering. */
 export async function withMonitorPaused(fn) {
-  const state = getSessionState();
-
-  const run = state.exclusiveCommandChain.then(async () => {
-    pauseMonitorLoop();
-    try {
-      return await fn();
-    } finally {
-      resumeMonitorLoop();
-    }
-  });
-
-  // Keep the chain alive even when a command fails.
-  state.exclusiveCommandChain = run.then(
-    () => undefined,
-    () => undefined,
-  );
-
-  return run;
+  pauseMonitorLoop();
+  try {
+    return await fn();
+  } finally {
+    resumeMonitorLoop();
+  }
 }
 
-/**
- * Run with monitor paused in standard serialized order.
- */
 export async function withMonitorPausedForPriority(fn) {
   return withMonitorPaused(fn);
-}
-
-/**
- * Open a gate that defers ack/silence/reset/etc. priority commands (anything
- * going through withMonitorPausedForPriority) until closePriorityGate() runs
- * them, instead of letting them jump ahead as usual. Use around a foreground
- * list dump that must not be interleaved with other panel commands.
- */
-export function openPriorityGate() {
-  const state = getSessionState();
-  const gate = { queue: new Map() };
-  state.priorityGate = gate;
-  return gate;
-}
-
-/**
- * Close a gate opened with openPriorityGate() and run everything that queued
- * up while it was open — once per distinct commandKey (same-key retries were
- * coalesced) — in the order first requested, serialized on the exclusive
- * command chain so they run one at a time, immediately after the gated work.
- */
-export function closePriorityGate(gate) {
-  const state = getSessionState();
-  if (state.priorityGate !== gate) return;
-  state.priorityGate = null;
-
-  for (const entry of gate.queue.values()) {
-    state.exclusiveCommandChain = state.exclusiveCommandChain
-      .then(async () => {
-        pauseMonitorLoop();
-        try {
-          entry.resolve(await entry.fn());
-        } catch (err) {
-          entry.reject(err);
-        } finally {
-          resumeMonitorLoop();
-        }
-      })
-      .then(
-        () => undefined,
-        () => undefined,
-      );
-  }
 }

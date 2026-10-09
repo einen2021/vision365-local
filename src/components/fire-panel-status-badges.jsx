@@ -1,11 +1,11 @@
 "use client";
 
-import { useState } from "react";
 import { Loader2, RefreshCcw, Unplug, VolumeX, Wifi } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
+import { useHeaderActionProgressStore } from "@/stores/headerActionProgressStore";
 import { useToast } from "@/hooks/use-toast";
 import { FirePanelAckButtons } from "@/components/fire-panel-ack-buttons";
 import { GraphicsViewNavButton } from "@/components/graphics-view-nav-button";
@@ -15,6 +15,19 @@ const HEADER_ACTION_BUTTON_CLASS = "h-10 px-4 text-sm";
 const STATUS_BADGE_CLASS =
   "h-4 gap-0.5 px-1.5 py-0 text-[9px] leading-none [&>svg]:size-2.5";
 
+/** Full-width bar that fills the button background for 2s after a click. */
+function ButtonClickProgress({ runId, onDone }) {
+  if (!runId) return null;
+  return (
+    <span
+      key={runId}
+      aria-hidden
+      className="header-button-click-progress"
+      onAnimationEnd={onDone}
+    />
+  );
+}
+
 /** Fire panel header actions shown on every dashboard page. */
 export function FirePanelStatusBadges() {
   const { silenceAlarm, systemReset } = useFirePanelMonitor();
@@ -23,7 +36,12 @@ export function FirePanelStatusBadges() {
   const connectedHost = useFirePanelStore((s) => s.connectedHost);
   const connectedPort = useFirePanelStore((s) => s.connectedPort);
   const { toast } = useToast();
-  const [silencing, setSilencing] = useState(false);
+  // Non-zero while the click progress bar runs; a new value restarts it.
+  // Shared store so AutoPilot plays the same animation.
+  const silenceProgressId = useHeaderActionProgressStore((s) => s.silence);
+  const resetProgressId = useHeaderActionProgressStore((s) => s.reset);
+  const startProgress = useHeaderActionProgressStore((s) => s.start);
+  const clearProgress = useHeaderActionProgressStore((s) => s.clear);
 
   const handleSilenceAlarm = async () => {
     if (!connected) {
@@ -35,7 +53,6 @@ export function FirePanelStatusBadges() {
       return;
     }
 
-    setSilencing(true);
     try {
       await silenceAlarm();
       toast({
@@ -47,8 +64,6 @@ export function FirePanelStatusBadges() {
         description: error?.message || "Could not silence panel alarms.",
         variant: "destructive",
       });
-    } finally {
-      setSilencing(false);
     }
   };
 
@@ -121,24 +136,37 @@ export function FirePanelStatusBadges() {
             type="button"
             variant="outline"
             size="sm"
-            className={HEADER_ACTION_BUTTON_CLASS}
-            disabled={!connected || silencing}
-            onClick={() => void handleSilenceAlarm()}
+            className={`${HEADER_ACTION_BUTTON_CLASS} relative overflow-hidden`}
+            disabled={!connected}
+            onClick={() => {
+              startProgress("silence");
+              void handleSilenceAlarm();
+            }}
           >
-
-            <VolumeX className="mr-2 h-4 w-4" />
-            Silence Alarm
+            <ButtonClickProgress
+              runId={silenceProgressId}
+              onDone={() => clearProgress("silence")}
+            />
+            <VolumeX className="relative mr-2 h-4 w-4" />
+            <span className="relative">Silence Alarm</span>
           </Button>
           <Button
             type="button"
             variant="outline"
             size="sm"
-            className={HEADER_ACTION_BUTTON_CLASS}
-            onClick={() => void handleSystemReset()}
-            disabled={!connected || silencing}
+            className={`${HEADER_ACTION_BUTTON_CLASS} relative overflow-hidden`}
+            onClick={() => {
+              startProgress("reset");
+              void handleSystemReset();
+            }}
+            disabled={!connected}
           >
-            <RefreshCcw className="mr-2 h-4 w-4" />
-            System Reset
+            <ButtonClickProgress
+              runId={resetProgressId}
+              onDone={() => clearProgress("reset")}
+            />
+            <RefreshCcw className="relative mr-2 h-4 w-4" />
+            <span className="relative">System Reset</span>
           </Button>
         </div>
         <GraphicsViewNavButton />

@@ -1,7 +1,7 @@
-import { collection, doc, getDoc, getDocs, setDoc } from "firebase/firestore";
+import { appendRowsToDocs, collection, doc, getDoc, getDocs, writeBatch } from "firebase/firestore";
 import { db } from "@/config/firebase";
 import { normalizeBuildingName } from "./buildingNames";
-import { syncPanelListWithTempArray, getTempPanelList } from "./firePanelListHistory";
+import { syncPanelListWithTempArray, getTempPanelList, sortRowsByLatestEvent } from "./firePanelListHistory";
 
 /**
  * Normalizes building name into {BuildingName}BuildingDB collection name.
@@ -35,47 +35,6 @@ async function getAllBuildingNames(matchedBuildings = []) {
   }
 
   return [...names];
-}
-
-/**
- * Appends rows to a document's array field in Firestore without duplicating entries.
- */
-async function appendRowsToDoc(dbCol, docId, fieldKey, newRows) {
-  if (!dbCol || !docId || !newRows?.length) return;
-  const ref = doc(db, dbCol, docId);
-  const snap = await getDoc(ref);
-
-  let existing = [];
-  if (snap.exists()) {
-    const data = snap.data() || {};
-    existing = Array.isArray(data[fieldKey]) ? data[fieldKey] : [];
-  }
-
-  const rowsToAppend = [];
-  for (const row of newRows) {
-    const rowMsg = String(row?.message || row?.rawMessage || "").trim();
-    const rowTime = Number(row?.time) || 0;
-
-    const isDuplicate = existing.some((ex) => {
-      const exMsg = String(ex?.message || ex?.rawMessage || "").trim();
-      const exTime = Number(ex?.time) || 0;
-      if (exMsg === rowMsg) {
-        if (Math.abs(rowTime - exTime) < 30000 || exTime === rowTime) {
-          return true;
-        }
-      }
-      return false;
-    });
-
-    if (!isDuplicate) {
-      rowsToAppend.push(row);
-      existing.push(row);
-    }
-  }
-
-  if (rowsToAppend.length === 0) return;
-
-  await setDoc(ref, { [fieldKey]: existing }, { merge: true });
 }
 
 /**
@@ -125,24 +84,24 @@ export async function recordLiveAlarmToHistory(label, item = {}) {
   const targetBuildings = await getAllBuildingNames();
   if (targetBuildings.length === 0) return;
 
-  const writePromises = [];
+  // One request for every building: the server appends (and de-duplicates
+  // against recent rows) in place, so history arrays are never downloaded.
+  const targets = [];
   for (const buildingName of targetBuildings) {
     const dbCol = buildingDbCollection(buildingName);
     if (!dbCol) continue;
 
     if (normLabel === "Fire") {
-      writePromises.push(appendRowsToDoc(dbCol, "liveFire", "liveFire", [historyRow]));
-      writePromises.push(appendRowsToDoc(dbCol, "alarmMessages", "alarmMessages", [historyRow]));
+      targets.push({ ref: doc(db, dbCol, "liveFire"), field: "liveFire" });
+      targets.push({ ref: doc(db, dbCol, "alarmMessages"), field: "alarmMessages" });
     } else if (normLabel === "Trouble") {
-      writePromises.push(appendRowsToDoc(dbCol, "liveTrouble", "liveTrouble", [historyRow]));
+      targets.push({ ref: doc(db, dbCol, "liveTrouble"), field: "liveTrouble" });
     } else if (normLabel === "Supervisory") {
-      writePromises.push(appendRowsToDoc(dbCol, "liveSupervisory", "liveSupervisory", [historyRow]));
+      targets.push({ ref: doc(db, dbCol, "liveSupervisory"), field: "liveSupervisory" });
     }
   }
 
-  if (writePromises.length > 0) {
-    await Promise.all(writePromises);
-  }
+  await appendRowsToDocs(targets, [historyRow]);
 }
 
 /**
@@ -166,16 +125,18 @@ export async function saveListToCategoryDb(label, parsedRows = []) {
   const payload = {
     label: normLabel,
     count: parsedRows.length,
-    rows: parsedRows,
+    // Newest live event first; rows from the panel list keep panel order.
+    rows: sortRowsByLatestEvent(parsedRows),
     updatedAt: now,
   };
 
   try {
-    // 1. Root collection document (e.g. fire-list/current)
-    await setDoc(doc(db, docName, "current"), payload, { merge: true });
-
-    // 2. Also save to panel-lists collection for unified query
-    await setDoc(doc(db, "panel-lists", docName), payload, { merge: true });
+    // Root collection document (e.g. fire-list/current) + panel-lists copy for
+    // unified query — one batched write.
+    const batch = writeBatch(db);
+    batch.set(doc(db, docName, "current"), payload, { merge: true });
+    batch.set(doc(db, "panel-lists", docName), payload, { merge: true });
+    await batch.commit();
   } catch (error) {
     console.error(`[recordAlarmHistory] Failed saving ${docName} to DB:`, error);
   }
@@ -231,6 +192,9 @@ export async function appendLiveLogToCategoryList(label, entry) {
     timestamp: timestampIso,
     raw: rawText,
     rawMessage: rawText,
+    // When the app received this event (orders the list newest-first; the panel
+    // clock can be wrong, so its time is not used for ordering).
+    lastEventAt: Date.now(),
   };
 
   // 1. Merge into in-memory temporary cache — add this row without dropping

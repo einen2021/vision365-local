@@ -1,10 +1,11 @@
-import { doc, updateDoc } from "firebase/firestore";
+import { doc, writeBatch } from "firebase/firestore";
 import { db } from "@/config/firebase";
 import {
+  collectAssetAddressMatchKeys,
   expandPanelAddressMatchKeys,
-  findAssetsListEntryByPanelAddress,
+  findAssetsListEntriesByPanelAddresses,
 } from "@/lib/assetsListSimplexStatus";
-import { invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets";
+import { getAssetsListSnapshot, invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets";
 import { readSimplexStatus, simplexKeyForCategoryLabel } from "@/lib/firePanelMonitor";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
 
@@ -81,12 +82,33 @@ export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
     );
   }
   // else: first run this session for this category — treat every address as
-  // newly added, nothing to remove (a full reset already zeroed everything).
+  // newly added. There is no previous list to diff, so clear any flag still set
+  // in AssetsList for a device the panel no longer reports (cached snapshot —
+  // the same one the address index below is built from).
+  const staleEntries = [];
+  if (previousAddresses === null) {
+    const currentKeys = buildAddressKeySet(deviceAddresses);
+    const snapshot = await getAssetsListSnapshot(db);
+    for (const docSnap of snapshot.docs) {
+      const data = docSnap.data();
+      if (Number(readSimplexStatus(data)[statusKey]) !== 1) continue;
+      const keys = collectAssetAddressMatchKeys(data, docSnap.id);
+      if ([...keys].some((key) => currentKeys.has(key))) continue;
+      staleEntries.push({ id: docSnap.id, data });
+    }
+  }
 
-  const updatePromises = [];
+  // 3. Resolve every changed address in one index pass, then write all flag
+  //    changes as a single batch (one DB write + one revision bump).
+  const entries = await findAssetsListEntriesByPanelAddresses([
+    ...addedAddresses,
+    ...removedAddresses,
+  ]);
+  const batch = writeBatch(db);
+  let batchSize = 0;
 
   for (const deviceAddress of addedAddresses) {
-    const entry = await findAssetsListEntryByPanelAddress(deviceAddress);
+    const entry = entries.get(String(deviceAddress).trim());
     if (!entry) continue;
 
     const data = { ...entry.data, id: entry.id };
@@ -98,17 +120,13 @@ export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
 
     const next = { ...current, [statusKey]: 1 };
     patchStoreFromEntry(entry.id, data, next, deviceAddress);
-    updatePromises.push(
-      updateDoc(doc(db, "AssetsList", entry.id), {
-        simplexStatus: next,
-        updatedAt: now,
-      }),
-    );
+    batch.update(doc(db, "AssetsList", entry.id), { simplexStatus: next, updatedAt: now });
+    batchSize += 1;
     updatedCount += 1;
   }
 
   for (const deviceAddress of removedAddresses) {
-    const entry = await findAssetsListEntryByPanelAddress(deviceAddress);
+    const entry = entries.get(String(deviceAddress).trim());
     if (!entry) continue;
 
     const data = { ...entry.data, id: entry.id };
@@ -117,18 +135,22 @@ export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
 
     const next = { ...current, [statusKey]: 0 };
     patchStoreFromEntry(entry.id, data, next, deviceAddress);
-    updatePromises.push(
-      updateDoc(doc(db, "AssetsList", entry.id), {
-        simplexStatus: next,
-        updatedAt: now,
-      }),
-    );
+    batch.update(doc(db, "AssetsList", entry.id), { simplexStatus: next, updatedAt: now });
+    batchSize += 1;
     clearedCount += 1;
   }
 
-  // 3. Concurrently execute all writes
-  if (updatePromises.length > 0) {
-    await Promise.all(updatePromises);
+  for (const entry of staleEntries) {
+    const data = { ...entry.data, id: entry.id };
+    const next = { ...readSimplexStatus(data), [statusKey]: 0 };
+    patchStoreFromEntry(entry.id, data, next);
+    batch.update(doc(db, "AssetsList", entry.id), { simplexStatus: next, updatedAt: now });
+    batchSize += 1;
+    clearedCount += 1;
+  }
+
+  if (batchSize > 0) {
+    await batch.commit();
   }
 
   // 4. Save this run's addresses as the temp array for next comparison

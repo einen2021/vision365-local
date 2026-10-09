@@ -1,50 +1,31 @@
-import { collection, getDocs } from "firebase/firestore"
+import { collection, getDocsMirrored } from "firebase/firestore"
 import { collectDeviceAddressKeys } from "./assetFireStatus"
 import { resolveAssetDeviceAddress } from "./simplexDeviceAddress"
 
-const ASSETS_LIST_CACHE_MS = 60_000
+// Re-sync at most this often; each sync only pulls AssetsList docs changed since
+// the last one (see getDocsMirrored), and returns the same snapshot object when
+// nothing changed so the address / floor indexes built from it are reused.
+const ASSETS_LIST_FRESH_MS = 1000
 let assetsListSnapshotCache = null
 let assetsListSnapshotFetchedAt = 0
-let assetsListSnapshotPromise = null
 
-/** Shared AssetsList snapshot cache (used by placement + fire-alert lookups). */
+/** Shared AssetsList snapshot (read-only — data is shared with the live mirror). */
 export async function getAssetsListSnapshot(db) {
-  const now = Date.now()
   if (
     assetsListSnapshotCache &&
-    now - assetsListSnapshotFetchedAt < ASSETS_LIST_CACHE_MS
+    Date.now() - assetsListSnapshotFetchedAt < ASSETS_LIST_FRESH_MS
   ) {
     return assetsListSnapshotCache
   }
-
-  if (!assetsListSnapshotPromise) {
-    assetsListSnapshotPromise = getDocs(collection(db, "AssetsList"))
-      .then((snapshot) => {
-        assetsListSnapshotCache = snapshot
-        assetsListSnapshotFetchedAt = Date.now()
-        assetsListSnapshotPromise = null
-        return snapshot
-      })
-      .catch((error) => {
-        assetsListSnapshotPromise = null
-        throw error
-      })
-  }
-
-  return assetsListSnapshotPromise
+  const snapshot = await getDocsMirrored(collection(db, "AssetsList"))
+  assetsListSnapshotCache = snapshot
+  assetsListSnapshotFetchedAt = Date.now()
+  return snapshot
 }
 
+/** Make the next getAssetsListSnapshot() pull the latest changes (cheap — changed docs only). */
 export function invalidateAssetsListSnapshotCache() {
-  assetsListSnapshotCache = null
   assetsListSnapshotFetchedAt = 0
-  assetsListSnapshotPromise = null
-  // Lazy import avoids circular deps with address indexes.
-  void import("@/lib/assetsListSimplexStatus")
-    .then((mod) => mod.clearAssetsListAddressIndex?.())
-    .catch(() => {})
-  void import("@/lib/assetAddressFloorIndex")
-    .then((mod) => mod.clearAddressFloorDetailsIndex?.())
-    .catch(() => {})
 }
 
 /** Case-insensitive building name comparison for AssetsList `building` field. */

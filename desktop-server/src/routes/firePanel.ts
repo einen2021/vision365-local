@@ -6,6 +6,7 @@ import {
   getFirePanelStatusLive,
   sendFirePanelCommand,
   sendFirePanelCommandPriority,
+  sendFirePanelCommandsPriority,
   sendFirePanelCommandStreaming,
 } from "../services/firePanelService";
 import { createPanelLogRoutes } from "./panelLogs";
@@ -114,11 +115,15 @@ export function createFirePanelRoutes() {
 
   // Priority command — jumps ahead of any queued list/CVAL work in the panel worker.
   // Use for ack/silence only so normal monitoring is not disrupted.
+  // Pass `commands: string[]` to queue several commands back-to-back (login + set …).
   app.post("/command/priority", async (c) => {
     const body = await c.req.json();
     const command = String(body.command || "");
+    const commands = Array.isArray(body.commands)
+      ? body.commands.map((cmd: unknown) => String(cmd || "")).filter((cmd: string) => cmd.trim())
+      : [];
 
-    if (!command.trim()) {
+    if (!command.trim() && commands.length === 0) {
       return c.json({ error: "Command is required" }, 400);
     }
 
@@ -126,7 +131,9 @@ export function createFirePanelRoutes() {
     const timeoutMs = Number(body.timeoutMs) > 0 ? Number(body.timeoutMs) : 5000;
 
     try {
-      const result = await sendFirePanelCommandPriority(command, timeoutMs);
+      const result = commands.length
+        ? await sendFirePanelCommandsPriority(commands, timeoutMs)
+        : await sendFirePanelCommandPriority(command, timeoutMs);
       return c.json(result);
     } catch (error) {
       return c.json({ error: (error as Error).message }, 500);

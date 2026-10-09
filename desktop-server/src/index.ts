@@ -29,6 +29,7 @@ import { createSettingsRoutes } from "./routes/settings";
 import { createFirePanelRoutes } from "./routes/firePanel";
 import { shutdownFirePanelWorkers } from "./services/firePanelService";
 import { flushPendingDbSnapshotBackup } from "./services/dbSnapshotBackup";
+import { runStartupStorageCleanup } from "./services/storageCleanup";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.VISION365_PORT || 47821);
@@ -104,6 +105,9 @@ async function main() {
   }
 
   loadSettings(paths);
+
+  // Single compressed backup, compact DB, remove uploads nothing refers to.
+  runStartupStorageCleanup(paths);
 
   const app = new Hono();
 

@@ -22,6 +22,8 @@ import { cn } from "@/lib/utils";
 import { LIVE_PANEL_ROUTE_BY_LABEL } from "@/config/live-panel-routes";
 import { apiFetch, parseApiJsonResponse } from "@/lib/apiClient";
 import { buildPanelAckCommand } from "@/lib/firePanelMonitor";
+import { sendPriorityPanelCommand } from "@/lib/acknowledgePanelDevice";
+import { useAutoPilotStore } from "@/stores/autoPilotStore";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
 import {
@@ -142,6 +144,8 @@ function LivePanelAlertModalView({
                 label === "Trouble"
                   ? "bg-yellow-600 text-yellow-950 hover:bg-yellow-500"
                   : "bg-violet-600 text-white hover:bg-violet-500",
+                !ackLoading &&
+                  (label === "Trouble" ? "trouble-ack-blink" : "supervisory-ack-blink"),
               )}
               onClick={onAcknowledge}
               disabled={ackLoading}
@@ -265,8 +269,15 @@ export function LivePanelAlertProvider({ children }) {
   // events instead of calling these hooks directly.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const handleNewTrouble = () => showTroubleAlert();
-    const handleNewSupervisory = () => showSupervisoryAlert();
+    // Skip alarms AutoPilot already acknowledged before this event arrived.
+    const handleNewTrouble = (e) => {
+      if (useAutoPilotStore.getState().wasAcknowledgedSince("Trouble", e?.detail?.receivedAt)) return;
+      showTroubleAlert();
+    };
+    const handleNewSupervisory = (e) => {
+      if (useAutoPilotStore.getState().wasAcknowledgedSince("Supervisory", e?.detail?.receivedAt)) return;
+      showSupervisoryAlert();
+    };
     window.addEventListener("vision365:newTroubleEvent", handleNewTrouble);
     window.addEventListener("vision365:newSupervisoryEvent", handleNewSupervisory);
     return () => {
@@ -359,6 +370,33 @@ export function LivePanelAlertProvider({ children }) {
     }
   }, [closeAlert, openLabel, runPostAckListSync, toast]);
 
+  /**
+   * AutoPilot acknowledge for Trouble / Supervisory: silence the beep, close
+   * that category's popup, then send `ack` through the priority queue (so it is
+   * not stuck behind a list dump). Resolves true / false once the ack finishes.
+   */
+  const autoAcknowledgeAlert = useCallback(
+    async (label, { timeoutMs = 2000 } = {}) => {
+      if (label === "Trouble") silenceTroubleAlertBeep();
+      else if (label === "Supervisory") silenceSupervisoryAlertBeep();
+      else return false;
+
+      setOpenLabel((current) => (current === label ? null : current));
+      setIsMuted(false);
+      setAckLoading(false);
+
+      try {
+        await sendPriorityPanelCommand(buildPanelAckCommand(label), timeoutMs);
+      } catch (error) {
+        console.error(`[LivePanelAlertContext] AutoPilot ${label} ack failed:`, error);
+        return false;
+      }
+      void runPostAckListSync?.(label);
+      return true;
+    },
+    [runPostAckListSync],
+  );
+
   useEffect(() => {
     if (!openLabel) return;
 
@@ -375,6 +413,7 @@ export function LivePanelAlertProvider({ children }) {
       closeAlert,
       handleTroubleCountChange,
       handleSupervisoryCountChange,
+      autoAcknowledgeAlert,
       silenceTroubleAlertBeep,
       silenceSupervisoryAlertBeep,
       troubleModalEnabled,
@@ -388,6 +427,7 @@ export function LivePanelAlertProvider({ children }) {
       closeAlert,
       handleTroubleCountChange,
       handleSupervisoryCountChange,
+      autoAcknowledgeAlert,
       troubleModalEnabled,
       supervisoryModalEnabled,
       setTroubleModalEnabled,

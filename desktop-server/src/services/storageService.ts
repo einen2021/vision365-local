@@ -94,8 +94,9 @@ function sqliteLooksPresent(root: string): boolean {
 }
 
 function snapshotBackupLooksPresent(root: string): boolean {
-  const latest = path.join(root, "backups", "db-snapshots", "db_snapshot_latest.json");
-  if (fs.existsSync(latest)) return true;
+  const dir = path.join(root, "backups", "db-snapshots");
+  if (fs.existsSync(path.join(dir, "db_snapshot_latest.json.gz"))) return true;
+  if (fs.existsSync(path.join(dir, "db_snapshot_latest.json"))) return true;
   return directoryLooksPopulated(path.join(root, "backups", "db-snapshots"));
 }
 
@@ -171,15 +172,48 @@ export function initAppDirectories(appDataPath: string): AppPaths {
   return paths;
 }
 
+/** Files the storage cleanup removed (paths relative to the AppData root). */
+const REMOVED_FILES_NAME = "storage-cleanup-removed.json";
+
+export function readRemovedFiles(appDataPath: string): Set<string> {
+  try {
+    const list = JSON.parse(
+      fs.readFileSync(path.join(appDataPath, REMOVED_FILES_NAME), "utf-8"),
+    );
+    return new Set(Array.isArray(list) ? list.map(String) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** Remember removed files so the legacy-folder import never copies them back. */
+export function recordRemovedFiles(appDataPath: string, absolutePaths: string[]): void {
+  if (absolutePaths.length === 0) return;
+  const removed = readRemovedFiles(appDataPath);
+  for (const abs of absolutePaths) {
+    removed.add(path.relative(appDataPath, abs).replace(/\\/g, "/"));
+  }
+  try {
+    fs.writeFileSync(
+      path.join(appDataPath, REMOVED_FILES_NAME),
+      JSON.stringify([...removed]),
+      "utf-8",
+    );
+  } catch {
+    // ignore
+  }
+}
+
 /**
  * Copy files from src → dest. Missing files are always added.
  * Existing files are left alone (no overwrite) unless overwrite=true.
+ * `skip(destPath)` leaves out files that must not come back.
  * Returns how many files were newly copied.
  */
 export function copyDirMerge(
   src: string,
   dest: string,
-  options: { overwrite?: boolean } = {},
+  options: { overwrite?: boolean; skip?: (destPath: string) => boolean } = {},
 ): number {
   if (!fs.existsSync(src)) return 0;
   fs.mkdirSync(dest, { recursive: true });
@@ -191,6 +225,7 @@ export function copyDirMerge(
     if (entry.isDirectory()) {
       copied += copyDirMerge(from, to, options);
     } else if (entry.isFile()) {
+      if (options.skip?.(to)) continue;
       if (!fs.existsSync(to) || options.overwrite) {
         fs.copyFileSync(from, to);
         copied += 1;
@@ -220,6 +255,17 @@ export function importLegacyAppDataAssets(appDataPath: string): {
   let settings = false;
   let snapshots = 0;
 
+  // Files the storage cleanup deleted must not be copied back in.
+  const removed = readRemovedFiles(appDataPath);
+  const skip = (destPath: string) =>
+    removed.has(path.relative(appDataPath, destPath).replace(/\\/g, "/"));
+  // Restore-when-empty already reads backups from every root in place, so
+  // only copy snapshots when this install has none of its own.
+  const snapDestDir = path.join(dest.backups, "db-snapshots");
+  const hasOwnSnapshot =
+    fs.existsSync(snapDestDir) &&
+    fs.readdirSync(snapDestDir).some((name) => /\.json(\.gz)?$/i.test(name));
+
   for (const root of listVision365AppDataRoots()) {
     if (!fs.existsSync(root)) continue;
     if (path.resolve(root) === path.resolve(appDataPath)) continue;
@@ -228,7 +274,7 @@ export function importLegacyAppDataAssets(appDataPath: string): {
     // Floor plan images / DXF / nested floor folders
     const floorSrc = path.join(root, "floor-plans");
     if (directoryLooksPopulated(floorSrc)) {
-      const n = copyDirMerge(floorSrc, dest.floorPlans);
+      const n = copyDirMerge(floorSrc, dest.floorPlans, { skip });
       if (n > 0) {
         console.log(`[storage] Copied ${n} floor-plan file(s) from ${floorSrc}`);
         floorPlans += n;
@@ -238,7 +284,7 @@ export function importLegacyAppDataAssets(appDataPath: string): {
     // Uploaded images / videos / documents
     const uploadsSrc = path.join(root, "uploads");
     if (directoryLooksPopulated(uploadsSrc)) {
-      const n = copyDirMerge(uploadsSrc, dest.uploads);
+      const n = copyDirMerge(uploadsSrc, dest.uploads, { skip });
       if (n > 0) {
         console.log(`[storage] Copied ${n} upload file(s) from ${uploadsSrc}`);
         uploads += n;
@@ -257,7 +303,7 @@ export function importLegacyAppDataAssets(appDataPath: string): {
     // JSON DB snapshots → active backups/db-snapshots (for SQLite import)
     const snapSrc = path.join(root, "backups", "db-snapshots");
     const snapDest = path.join(dest.backups, "db-snapshots");
-    if (directoryLooksPopulated(snapSrc)) {
+    if (!hasOwnSnapshot && directoryLooksPopulated(snapSrc)) {
       fs.mkdirSync(snapDest, { recursive: true });
       const n = copyDirMerge(snapSrc, snapDest);
       if (n > 0) {

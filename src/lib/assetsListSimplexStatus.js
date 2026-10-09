@@ -188,6 +188,35 @@ export async function findAssetsListEntryByPanelAddress(panelAddress) {
 }
 
 /**
+ * Resolve many panel addresses at once: one AssetsList index build, then the
+ * per-address lookup (in parallel) only for addresses the index misses.
+ * Returns a Map of address → entry (misses omitted).
+ */
+export async function findAssetsListEntriesByPanelAddresses(panelAddresses = []) {
+  const result = new Map()
+  const addresses = (panelAddresses || []).map((a) => String(a || "").trim()).filter(Boolean)
+  if (addresses.length === 0) return result
+
+  const index = await getAssetsListAddressIndex()
+  const misses = []
+  for (const address of addresses) {
+    let hit = null
+    for (const key of expandPanelAddressMatchKeys(address)) {
+      hit = index.get(key)
+      if (hit) break
+    }
+    if (hit) result.set(address, hit)
+    else misses.push(address)
+  }
+
+  const resolved = await Promise.all(misses.map((a) => findAssetsListEntryByPanelAddress(a)))
+  misses.forEach((address, i) => {
+    if (resolved[i]) result.set(address, resolved[i])
+  })
+  return result
+}
+
+/**
  * Resolve AssetsList entries for every address in a panel list response.
  * Newest / last address is preferred first (fire alert uses the latest device).
  */
