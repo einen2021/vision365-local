@@ -53,8 +53,21 @@ import {
 } from "@/lib/firePanelMonitor";
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
 import {
+  clearEnabledDeviceTrouble,
+  consumeEnabledTroubleDrop,
+  expectEnabledTroubleDrop,
+} from "@/lib/deviceEnabledSync";
+import {
   withMonitorPaused,
 } from "@/lib/firePanelMonitorSession";
+import {
+  deferForFirePriority,
+  isFirePriorityActive,
+  isHeldByFirePriority,
+  noteLiveFireAlarm,
+  noteShowCounts,
+  setFireClearedHandler,
+} from "@/lib/firePriority";
 
 const FireAlertContext = createContext();
 
@@ -344,6 +357,11 @@ function classifyLiveEntry(entry) {
   return { rawText, statusText, isRestore, isFire, isAck, isTrouble, isSupervisory, isReset };
 }
 
+/** "2:M1-2-0" / "M1-2-0" → "M1-2-0" so the same device always matches. */
+function fireAddressKey(address) {
+  return String(address || "").trim().toUpperCase().replace(/^\d+:/, "");
+}
+
 /**
  * AutoPilot hook: announce every live panel line the moment it arrives (before
  * batching) as an alarm or an acknowledgement for one category. Fire > Trouble
@@ -384,6 +402,12 @@ export function FireAlertProvider({ children }) {
   // Navbar "Fire Ack" button blinks from a new live fire until it is clicked
   // or a fire acknowledgement (FIRE ALARM ACKED) arrives in the panel logs.
   const [isFireAckPending, setIsFireAckPending] = useState(false);
+  // Fire addresses behind the current blink, and those already acknowledged
+  // (Ack clicked): the panel often repeats a fire line after the ack (glued
+  // into a later reply) — that repeat must not restart the blink. Cleared on
+  // SYSTEM RESET COMPLETE.
+  const fireBlinkAddressesRef = useRef(new Set());
+  const ackedFireAddressesRef = useRef(new Set());
   // Navbar "Trouble Ack" / "Sup Ack" buttons blink from a new live trouble /
   // supervisory event until they are clicked or a matching ack is logged.
   const [isTroubleAckPending, setIsTroubleAckPending] = useState(false);
@@ -423,7 +447,10 @@ export function FireAlertProvider({ children }) {
     setIsFireAlertOpen(false);
   }, []);
 
+  /** Stop the navbar Fire Ack blink (Ack clicked / fire acknowledged). */
   const clearFireAckPending = useCallback(() => {
+    for (const key of fireBlinkAddressesRef.current) ackedFireAddressesRef.current.add(key);
+    fireBlinkAddressesRef.current.clear();
     setIsFireAckPending(false);
   }, []);
 
@@ -474,6 +501,7 @@ export function FireAlertProvider({ children }) {
       const rawText = typeof data === "string" ? data : (data?.response || data?.raw || "");
       const counts = parseShowCountsResponse(rawText);
       if (!counts) return;
+      noteShowCounts(counts);
 
       // Baseline for the change check below (read before this call saves new counts).
       let previous = previousCountsRef.current;
@@ -522,11 +550,22 @@ export function FireAlertProvider({ children }) {
         totalSupervisory: counts.totalSupervisory,
       };
       const syncs = [];
-      if (counts.totalTrouble !== previous.totalTrouble) {
-        syncs.push(syncTroubleListAssets({ expectedCount: counts.totalTrouble }));
-      }
-      if (counts.totalSupervisory !== previous.totalSupervisory) {
-        syncs.push(syncSupervisoryListAssets({ expectedCount: counts.totalSupervisory }));
+      if (isFirePriorityActive()) {
+        // Fire first: no `list t` / `list s` while FIRE > 0 — re-listed once it is 0.
+        if (counts.totalTrouble !== previous.totalTrouble) deferForFirePriority("Trouble");
+        if (counts.totalSupervisory !== previous.totalSupervisory) deferForFirePriority("Supervisory");
+      } else {
+        // A drop caused only by re-enabled devices was already applied locally
+        // (T=0 + trouble-list row removed) — no `list t` for it.
+        const troubleDrop = previous.totalTrouble - counts.totalTrouble;
+        if (troubleDrop > 0 && consumeEnabledTroubleDrop(troubleDrop)) {
+          // handled by the device-enabled path
+        } else if (counts.totalTrouble !== previous.totalTrouble) {
+          syncs.push(syncTroubleListAssets({ expectedCount: counts.totalTrouble }));
+        }
+        if (counts.totalSupervisory !== previous.totalSupervisory) {
+          syncs.push(syncSupervisoryListAssets({ expectedCount: counts.totalSupervisory }));
+        }
       }
       // Any drop in the fire count re-syncs the fire list. A fire at a single
       // device only set a live F flag (no DB write), so without this its
@@ -542,6 +581,87 @@ export function FireAlertProvider({ children }) {
   }, []);
 
   /**
+   * Lower the trouble count by one without asking the panel (`show counts`).
+   * The desktop server treats this drop as expected after `disable <addr> off`,
+   * so saving it does not run `list t` there either.
+   */
+  const applyEnabledTroubleDrop = useCallback(async () => {
+    try {
+      let current = previousCountsRef.current;
+      if (!current) {
+        const res = await fetch(apiUrl("/api/telnet/fire-panel/panel-state"));
+        if (!res.ok) return;
+        const stored = await res.json();
+        current = {
+          totalFire: Number(stored?.totalFire) || 0,
+          totalTrouble: Number(stored?.totalTrouble) || 0,
+          totalSupervisory: Number(stored?.totalSupervisory) || 0,
+        };
+      }
+      const counts = { ...current, totalTrouble: Math.max(0, current.totalTrouble - 1) };
+      previousCountsRef.current = counts;
+
+      await fetch(apiUrl("/api/telnet/fire-panel/panel-state"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(counts),
+      });
+      window.dispatchEvent(new CustomEvent("vision365:firePanelStateUpdated", { detail: counts }));
+    } catch (err) {
+      console.error("[FireModalContext] applyEnabledTroubleDrop failed:", err);
+    }
+  }, []);
+
+  // A device was re-enabled: set its T to 0, drop its trouble-list row and
+  // lower the trouble count by one locally — no `show counts`, no `list t`.
+  // The expected trouble-count drop is registered first so a restore line's
+  // counts check (which may run meanwhile) cannot re-list either; when that
+  // check already applied the drop, the count is not lowered a second time.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleDeviceEnabled = async (e) => {
+      const deviceAddress = e?.detail?.deviceAddress;
+      if (!deviceAddress) return;
+      // During a fire the device's T flag / trouble row stay as they are; the
+      // trouble list is re-read once the fire count is 0.
+      if (isFirePriorityActive()) {
+        deferForFirePriority("Trouble");
+        return;
+      }
+      const withdrawExpectedDrop = expectEnabledTroubleDrop();
+      await clearEnabledDeviceTrouble(deviceAddress);
+      if (!withdrawExpectedDrop()) return;
+      await applyEnabledTroubleDrop();
+    };
+    window.addEventListener("vision365:deviceEnabled", handleDeviceEnabled);
+    return () => window.removeEventListener("vision365:deviceEnabled", handleDeviceEnabled);
+  }, [applyEnabledTroubleDrop]);
+
+  // Fire count back to 0: catch up the trouble / supervisory work held during
+  // the fire — re-list each skipped category (`list t` / `list s`, T / S flags,
+  // lists) and raise the alerts of alarms that arrived meanwhile.
+  useEffect(
+    () =>
+      setFireClearedHandler(async ({ counts, sync, alert }) => {
+        console.log("[FireModalContext] fire count is 0 — resuming trouble / supervisory:", { sync, alert });
+        const syncs = [];
+        if (sync.Trouble) {
+          syncs.push(syncTroubleListAssets({ expectedCount: counts?.totalTrouble }));
+        }
+        if (sync.Supervisory) {
+          syncs.push(syncSupervisoryListAssets({ expectedCount: counts?.totalSupervisory }));
+        }
+        if (typeof window !== "undefined") {
+          const detail = { receivedAt: Date.now() };
+          if (alert.Trouble) window.dispatchEvent(new CustomEvent("vision365:newTroubleEvent", { detail }));
+          if (alert.Supervisory) window.dispatchEvent(new CustomEvent("vision365:newSupervisoryEvent", { detail }));
+        }
+        await Promise.allSettled(syncs);
+      }),
+    [],
+  );
+
+  /**
    * Runs only when a message in this category had an ambiguous (multi-device)
    * location AND that category's acknowledge just succeeded. Sends `list f/t/s`,
    * waits for the full response, saves it to {label}-list so the live page
@@ -553,6 +673,11 @@ export function FireAlertProvider({ children }) {
   const runPostAckListSync = useCallback(async (label) => {
     if (!ambiguousLocationRef.current[label]) return;
     ambiguousLocationRef.current[label] = false;
+    // No `list t` / `list s` during a fire — the deferred re-list covers it.
+    if (isHeldByFirePriority(label)) {
+      deferForFirePriority(label);
+      return;
+    }
 
     const listCmd = getListCmdForLabel(label);
     if (!listCmd) return;
@@ -592,6 +717,8 @@ export function FireAlertProvider({ children }) {
   }, []);
 
   const handleAcknowledge = useCallback(() => {
+    // Stop the navbar Fire Ack blink on click — no wait for FIRE ALARM ACKED.
+    clearFireAckPending();
     const connected = useFirePanelStore.getState().connected;
     if (!connected) {
       toast({
@@ -605,17 +732,15 @@ export function FireAlertProvider({ children }) {
     // Instantly mute siren, close modal, and route for immediate responsiveness
     muteSiren();
     closeFireAlertModal();
-    router.push(LIVE_FIRE_ROUTE);
-
-    // Run `ack f` and count sync non-blockingly in background. No unconditional
-    // `list f` here — only run one afterward if a fire message this alarm had
-    // an ambiguous (multi-device) location, and only once ack has succeeded.
+    // Run the ack and count sync in the background. No unconditional `list f`
+    // here — only one afterward if a fire message this alarm had an ambiguous
+    // (multi-device) location, and only once the ack has succeeded.
     void (async () => {
       let ackSucceeded = false;
       try {
-        // Re-sends `ack` while `list f` still shows the fire unacknowledged (≤ ~6s).
+        // One ack, confirmed by the panel worker ("- ack" executed).
         const result = await acknowledgeFireConfirmed();
-        ackSucceeded = true;
+        ackSucceeded = result.acknowledged;
         console.log("[FireModalContext] fire ack:", result);
       } catch (err) {
         console.error("[FireModalContext] ack f failed:", err);
@@ -630,7 +755,8 @@ export function FireAlertProvider({ children }) {
         void runPostAckListSync("Fire");
       }
     })();
-  }, [closeFireAlertModal, fetchAndSyncCounts, muteSiren, router, runPostAckListSync, toast]);
+    router.push(LIVE_FIRE_ROUTE);
+  }, [clearFireAckPending, closeFireAlertModal, fetchAndSyncCounts, muteSiren, router, runPostAckListSync, toast]);
 
   /**
    * AutoPilot fire acknowledge — same UI steps as the modal's Acknowledge
@@ -640,17 +766,16 @@ export function FireAlertProvider({ children }) {
   const autoAcknowledgeFire = useCallback(async () => {
     muteSiren();
     closeFireAlertModal();
-    setIsFireAckPending(false);
+    clearFireAckPending();
     router.push(LIVE_FIRE_ROUTE);
 
-    // Confirmed ack: re-sent while the fire is still unacknowledged (≤ ~6s).
-    // Resolves true only once the panel has accepted it.
+    // One ack; resolves true once the panel worker saw it executed ("- ack").
     const result = await acknowledgeFireConfirmed();
     console.log("[FireModalContext] AutoPilot fire ack:", result);
     void fetchAndSyncCounts().catch(() => {});
-    if (result.attempts > 0) void runPostAckListSync("Fire");
+    if (result.acknowledged) void runPostAckListSync("Fire");
     return result.acknowledged;
-  }, [closeFireAlertModal, fetchAndSyncCounts, muteSiren, router, runPostAckListSync]);
+  }, [clearFireAckPending, closeFireAlertModal, fetchAndSyncCounts, muteSiren, router, runPostAckListSync]);
 
   // Siren runs while alarm is active or modal is open (and not muted)
   useEffect(() => {
@@ -705,7 +830,12 @@ export function FireAlertProvider({ children }) {
         const { timeMs: fireTimeMs, timestampIso: fireTimestampIso, panelTimeText: firePanelTimeText } =
           extractPanelEventTime(entry);
 
-        setIsFireAckPending(true);
+        // A repeat of an already-acknowledged fire does not restart the blink.
+        const fireKey = fireAddressKey(fireAddr);
+        if (!fireKey || !ackedFireAddressesRef.current.has(fireKey)) {
+          if (fireKey) fireBlinkAddressesRef.current.add(fireKey);
+          setIsFireAckPending(true);
+        }
         showFireAlert({
           location: entry.location || "Fire Alarm Detected",
           deviceType: entry.device || entry.deviceType || entry.description || "Fire Device",
@@ -799,8 +929,43 @@ export function FireAlertProvider({ children }) {
         announceLiveAlarmListed("Fire", entry);
       }
 
+      // Fire first: while FIRE > 0 a new trouble / supervisory message only adds
+      // its row to the Live Trouble / Live Supervisory page — no T / S colour,
+      // no `list t` / `list s`, no history, no alert. The category is re-listed
+      // (and alerted) once the fire count is 0. Only `show counts` still runs.
+      const holdTrouble = isTrouble && !isAck && isFirePriorityActive();
+      const holdSupervisory = isSupervisory && !isAck && isFirePriorityActive();
+      for (const [held, label, fallbackType] of [
+        [holdTrouble, "Trouble", "TROUBLE POINT"],
+        [holdSupervisory, "Supervisory", "SUPERVISORY"],
+      ]) {
+        if (!held) continue;
+        deferForFirePriority(label, { alert: true });
+        const { timeMs, timestampIso, panelTimeText } = extractPanelEventTime(entry);
+        const address =
+          entry.pointId || entry.deviceAddress || rawText.match(ADDRESS_IN_TEXT_RE)?.[0] || "NA";
+        try {
+          await appendLiveLogToCategoryList(
+            label,
+            {
+              ...entry,
+              deviceAddress: address,
+              fullAddress: address,
+              location: entry.location || "—",
+              deviceType: entry.device || entry.deviceType || entry.description || fallbackType,
+              time: timeMs,
+              timestamp: timestampIso,
+              panelTimeText,
+            },
+            { duringFire: true },
+          );
+        } catch (error) {
+          console.error(`[FireModalContext] ${label} row during fire failed:`, error);
+        }
+      }
+
       // If new unacknowledged trouble log arrives -> append to trouble-list DB & update T value to 1
-      if (isTrouble && !isAck) {
+      if (isTrouble && !isAck && !holdTrouble) {
         const trblAddr =
           entry.pointId ||
           entry.deviceAddress ||
@@ -885,7 +1050,7 @@ export function FireAlertProvider({ children }) {
       }
 
       // If new unacknowledged supervisory log arrives -> append to supervisory-list DB & update S value to 1
-      if (isSupervisory && !isAck) {
+      if (isSupervisory && !isAck && !holdSupervisory) {
         const supAddr =
           entry.pointId ||
           entry.deviceAddress ||
@@ -1008,6 +1173,7 @@ export function FireAlertProvider({ children }) {
       // If system reset completed, dismiss active fire alert and run full post-reset reconciliation workflow
       if (entry.kind === "reset-complete" || /SYSTEM\s+RESET\s+COMPLETE/i.test(statusText)) {
         hideFireAlert();
+        ackedFireAddressesRef.current.clear();
         void handleSystemResetCompleteWorkflow();
         return;
       }
@@ -1021,7 +1187,7 @@ export function FireAlertProvider({ children }) {
         /FIRE\s+ALARM\s+ACKED/i.test(rawText);
 
       if (isFireAck) {
-        setIsFireAckPending(false);
+        clearFireAckPending();
         requestCountsCheck();
         return;
       }
@@ -1051,7 +1217,11 @@ export function FireAlertProvider({ children }) {
       // e.g. a status lost to a glued command echo) get the same counts check so
       // a clear is never missed.
       if (isRestore || (entry.kind === "other" && !isAck && !entry.isListEntry)) {
-        if (isRestore) void clearRestoredDeviceFlags(entry, rawText);
+        if (isRestore) {
+          // During a fire the T / S colours stay; both lists are re-read after it.
+          if (isFirePriorityActive()) deferForFirePriority("both");
+          else void clearRestoredDeviceFlags(entry, rawText);
+        }
         requestCountsCheck(true);
         return;
       }
@@ -1130,6 +1300,9 @@ export function FireAlertProvider({ children }) {
       }
       const classified = classifyLiveEntry(entry);
       if (!classified) return;
+      // Hold trouble / supervisory work from the moment a fire line arrives —
+      // before this batch runs and before `show counts` confirms the fire.
+      if (classified.isFire && !classified.isAck) noteLiveFireAlarm();
       const receivedAt = Date.now();
       receivedAtByEntry.set(entry, receivedAt);
       announceLivePanelEntry(entry, classified, receivedAt);
@@ -1210,7 +1383,7 @@ export function FireAlertProvider({ children }) {
         window.removeEventListener("vision365:newFireEvent", handleFireEvent);
       }
     };
-  }, [fetchAndSyncCounts, hideFireAlert, showFireAlert]);
+  }, [clearFireAckPending, fetchAndSyncCounts, hideFireAlert, showFireAlert]);
 
   const value = useMemo(
     () => ({

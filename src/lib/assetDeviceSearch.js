@@ -9,10 +9,7 @@ import {
 } from "@/lib/fireAlertFloorNavigation";
 import { buildGraphicsViewUrl } from "@/lib/graphicsViewSelection";
 import { normalizeBuildingName } from "@/lib/buildingNames";
-import {
-  resolveAssetDeviceAddress,
-  stripPanelAddressPrefix,
-} from "@/lib/simplexDeviceAddress";
+import { resolveAssetDeviceAddress } from "@/lib/simplexDeviceAddress";
 import { resolveFloorDetailsFromCache } from "@/lib/assetAddressFloorIndex";
 
 /** Normalize a device-address search query for matching. */
@@ -43,30 +40,58 @@ function collectSearchableAddressKeys(asset = {}) {
   return keys;
 }
 
-/** True when an AssetsList row matches a partial device-address query. */
+/** Split "2:M1-2-1" into { panel: "2", rest: "M1-2-1" } (panel null when absent). */
+function splitPanelPrefix(value = "") {
+  const match = String(value || "").match(/^(\d+):(.*)$/);
+  return match ? { panel: match[1], rest: match[2] } : { panel: null, rest: value };
+}
+
+/**
+ * True when an AssetsList row matches a partial device-address query.
+ * A panel prefix in the query ("2:") is binding — "2:M2-4-0" never matches
+ * "3:M2-4-0", since the same M-address on another panel is a different device.
+ */
 export function assetMatchesDeviceQuery(asset = {}, query = "") {
   const normalizedQuery = normalizeDeviceSearchQuery(query);
   if (normalizedQuery.length < 2) return false;
 
-  const strippedQuery = stripPanelAddressPrefix(normalizedQuery).toUpperCase();
+  const { panel: queryPanel, rest: queryRest } = splitPanelPrefix(normalizedQuery);
   const keys = collectSearchableAddressKeys(asset);
 
   for (const key of keys) {
-    if (key.includes(normalizedQuery) || normalizedQuery.includes(key)) {
-      return true;
+    if (key === normalizedQuery) return true;
+
+    const { panel: keyPanel, rest: keyRest } = splitPanelPrefix(key);
+
+    if (queryPanel) {
+      // Different panel → different physical device.
+      if (keyPanel && keyPanel !== queryPanel) continue;
+      // Same panel: user may still be typing the rest of the address.
+      if (keyPanel && key.startsWith(normalizedQuery)) return true;
+      // Asset stored without a panel prefix: compare the M-address part.
+      if (!keyPanel && queryRest && keyRest.startsWith(queryRest)) return true;
+      continue;
     }
 
-    const strippedKey = stripPanelAddressPrefix(key).toUpperCase();
-    if (!strippedKey || !strippedQuery) continue;
-    if (
-      strippedKey.includes(strippedQuery) ||
-      strippedQuery.includes(strippedKey)
-    ) {
+    // No panel typed: match the address part on any panel (or raw ids).
+    if (keyRest.includes(normalizedQuery) || key.includes(normalizedQuery)) {
       return true;
     }
   }
 
   return false;
+}
+
+/** Lower is better: exact address, then same-panel, then everything else. */
+function rankSearchResult(result, normalizedQuery) {
+  const address = String(result.deviceAddress || "").toUpperCase();
+  if (!address) return 3;
+  if (address === normalizedQuery) return 0;
+  if (collectDeviceAddressKeys(address).has(normalizedQuery)) return 0;
+  const { panel: queryPanel } = splitPanelPrefix(normalizedQuery);
+  const { panel: addressPanel } = splitPanelPrefix(address);
+  if (queryPanel && addressPanel === queryPanel) return 1;
+  return 2;
 }
 
 /** Merge cached floor details onto an AssetsList row for labels + navigation. */
@@ -224,9 +249,9 @@ export function searchAssetsByDeviceAddress(
   }
 
   matches.sort((a, b) => {
-    const aExact = String(a.deviceAddress || "").toUpperCase() === normalizedQuery;
-    const bExact = String(b.deviceAddress || "").toUpperCase() === normalizedQuery;
-    if (aExact !== bExact) return aExact ? -1 : 1;
+    const aRank = rankSearchResult(a, normalizedQuery);
+    const bRank = rankSearchResult(b, normalizedQuery);
+    if (aRank !== bRank) return aRank - bRank;
     if (a.placed !== b.placed) return a.placed ? -1 : 1;
     return String(a.deviceAddress || "").localeCompare(String(b.deviceAddress || ""));
   });

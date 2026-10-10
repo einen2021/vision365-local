@@ -7,6 +7,7 @@ import { useFirePanelMonitor } from "@/contexts/AppContext";
 import { useFireAlert } from "@/contexts/FireModalContext";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { acknowledgeFireConfirmed } from "@/lib/confirmedFireAck";
+import { acknowledgeAlertConfirmed } from "@/lib/confirmedAlertAck";
 import { useToast } from "@/hooks/use-toast";
 import { LIVE_PANEL_ROUTE_BY_LABEL } from "@/config/live-panel-routes";
 import { normalizePathname } from "@/lib/roleAccess";
@@ -49,7 +50,7 @@ const ACK_BUTTONS = [
 export function FirePanelAckButtons() {
   const router = useRouter();
   const pathname = normalizePathname(usePathname());
-  const { acknowledge, firePanelState } = useFirePanelMonitor();
+  const { firePanelState } = useFirePanelMonitor();
   const {
     muteSiren,
     isFireAckPending,
@@ -80,21 +81,17 @@ export function FirePanelAckButtons() {
 
     try {
       if (label === "Fire") {
-        // One confirmed ack instead of two blind ones: a second bare `ack` can
-        // acknowledge a trouble once the fire is already acknowledged.
+        // One ack, confirmed by the panel worker ("- ack" executed). A second
+        // bare `ack` would acknowledge another event (e.g. a trouble).
         const result = await acknowledgeFireConfirmed();
-        toast({
-          title: result.acknowledged ? "Fire acknowledged" : `${title} sent`,
-          description: result.acknowledged
-            ? undefined
-            : "The panel has not confirmed it yet.",
-        });
+        if (!result.acknowledged) throw new Error(result.error || "The panel did not run the ack.");
+        toast({ title: "Fire acknowledged" });
         return true;
       }
-      await acknowledge(label);
-      await acknowledge(label);
+      // Sent once; the panel worker confirms it executed (echo "- ack").
+      const result = await acknowledgeAlertConfirmed(label);
       toast({
-        title: `${title} sent`,
+        title: result.acknowledged ? `${label} acknowledged` : `${title} executed`,
       });
       return true;
     } catch (error) {

@@ -19,6 +19,13 @@ import {
 } from "@/lib/panelListAssetSync";
 import { saveListToCategoryDb } from "@/lib/recordAlarmHistory";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
+import {
+  clearFirePriorityDeferrals,
+  deferForFirePriority,
+  isFirePriorityActive,
+  isHeldByFirePriority,
+  noteShowCounts,
+} from "@/lib/firePriority";
 
 const CATEGORY_LABELS = ["Fire", "Trouble", "Supervisory"];
 
@@ -42,25 +49,39 @@ async function sendPanelCommand(command, { timeoutMs, expectedCount } = {}) {
 
 /**
  * Reset all assets where simplexStatus F, T, or S > 0 back to 0 (one batched write).
+ * Skipped entirely while a fire is active (see firePriority): the fire markers
+ * stay red, and T / S are held. The `list f` that follows reconciles F (devices
+ * no longer listed are cleared); FIRE = 0 later runs the full reset path.
+ * `fireOnly`: reset F only, T / S flags and their lists stay untouched.
  */
-export async function resetAllAssetsSimplexStatus() {
+export async function resetAllAssetsSimplexStatus({ fireOnly = false, force = false } = {}) {
+  if (!force && isFirePriorityActive()) {
+    console.log("[systemResetWorkflow] fire active — F/T/S not cleared, list f reconciles fire markers");
+    return;
+  }
   invalidateAssetsListSnapshotCache();
   clearAssetsListAddressIndex();
-  clearTempPanelList();
-  clearPanelListAssetSyncTempArray();
-  useAssetFireStatusStore.getState().clearAllSimplexStatusInStore();
+  if (fireOnly) {
+    clearTempPanelList("Fire");
+    clearPanelListAssetSyncTempArray("Fire");
+    useAssetFireStatusStore.getState().syncPanelLiveFlagsForCategory("F", []);
+  } else {
+    clearTempPanelList();
+    clearPanelListAssetSyncTempArray();
+    useAssetFireStatusStore.getState().clearAllSimplexStatusInStore();
+  }
 
   const snapshot = await getAssetsListSnapshot(db);
   const now = new Date().toISOString();
-  const cleared = { F: 0, T: 0, S: 0 };
   const batch = writeBatch(db);
   let batchSize = 0;
 
   for (const docSnap of snapshot.docs) {
     const data = docSnap.data();
     const current = readSimplexStatus(data);
-    if (current.F === 0 && current.T === 0 && current.S === 0) continue;
+    if (fireOnly ? current.F === 0 : current.F === 0 && current.T === 0 && current.S === 0) continue;
 
+    const cleared = fireOnly ? { ...current, F: 0 } : { F: 0, T: 0, S: 0 };
     batch.update(doc(db, "AssetsList", docSnap.id), {
       simplexStatus: cleared,
       updatedAt: now,
@@ -82,7 +103,9 @@ export async function resetAllAssetsSimplexStatus() {
 async function fetchFreshCategoryCounts() {
   try {
     const rawText = await sendPanelCommand("show counts", { timeoutMs: 6000 });
-    return rawText == null ? null : parseShowCountsResponse(rawText);
+    const counts = rawText == null ? null : parseShowCountsResponse(rawText);
+    noteShowCounts(counts);
+    return counts;
   } catch {
     return null;
   }
@@ -109,11 +132,20 @@ async function runCategoryListSync(label, { expectedCount, skipIfCount } = {}) {
   // An AutoPilot ack → login → silence → reset sequence must not have a list
   // dump typed into it (no-op when AutoPilot is not running).
   await waitForAutoPilotListHold();
+  // Fire first: no `list t` / `list s` while FIRE > 0 (re-run once it is 0).
+  if (isHeldByFirePriority(label)) {
+    deferForFirePriority(label);
+    return null;
+  }
   const listCmd = getListCmdForLabel(label);
   let expected = expectedCount;
   if (expected == null) {
     const counts = await fetchFreshCategoryCounts();
     expected = counts ? counts[COUNT_FIELD_BY_LABEL[label]] : null;
+    if (isHeldByFirePriority(label)) {
+      deferForFirePriority(label);
+      return null;
+    }
   }
 
   if (skipIfCount != null && expected != null && expected === skipIfCount) {
@@ -146,6 +178,11 @@ async function runCategoryListSync(label, { expectedCount, skipIfCount } = {}) {
     );
   }
 
+  // A fire that started during the dump: drop the result, re-list after the fire.
+  if (isHeldByFirePriority(label)) {
+    deferForFirePriority(label);
+    return null;
+  }
   await applyCategoryList(label, parsedRows, extractPanelDeviceAddresses(rawText));
   return expected;
 }
@@ -199,22 +236,33 @@ export const syncSupervisoryListAssets = (options) =>
   syncCategoryListAssets("Supervisory", options);
 
 let workflowInProgress = false;
+let lastWorkflowStartedAt = 0;
+
+/** When the post-reset workflow last started (0 = never this session). */
+export function getLastResetWorkflowStartedAt() {
+  return lastWorkflowStartedAt;
+}
 
 /**
  * Post-system-reset sequence:
- * 1. Reset all devices with F/T/S > 0 to 0
- * 2. `show counts` → save totals to DB & UI
+ * 1. `show counts` → save totals to DB & UI
+ * 2. Reset all devices with F/T/S > 0 to 0 (F only while FIRE > 0)
  * 3. `list f` / `list t` / `list s` only for categories with a non-zero count,
- *    each completing as soon as its expected row count arrives
+ *    each completing as soon as its expected row count arrives. While FIRE > 0
+ *    trouble / supervisory are held and re-listed once the fire count is 0.
  */
 export async function handleSystemResetCompleteWorkflow() {
   if (workflowInProgress) return;
   workflowInProgress = true;
+  lastWorkflowStartedAt = Date.now();
 
   try {
+    // This run re-lists every category itself; a held one defers itself again.
+    clearFirePriorityDeferrals();
+    // Counts first, so the reset below knows whether a fire is still active.
+    const counts = await fetchFreshCategoryCounts();
     await resetAllAssetsSimplexStatus();
 
-    const counts = await fetchFreshCategoryCounts();
     if (counts) {
       await fetch(apiUrl("/api/telnet/fire-panel/panel-state"), {
         method: "POST",

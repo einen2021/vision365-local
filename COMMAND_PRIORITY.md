@@ -1,5 +1,9 @@
 # Vision365 Fire Panel Command Priority Architecture
 
+> **Superseded.** The panel worker no longer ranks or preempts commands. Every
+> command now runs one at a time in arrival order, waits for the panel's `-`
+> prompt and is confirmed by its echo — see [docs/PANEL_COMMANDS.md](docs/PANEL_COMMANDS.md).
+
 This document defines the **domain-driven operational priority hierarchy and real-time preemption engine** for all commands communicated to the Simplex Fire Alarm Panel over the Telnet interface (`desktop-server/src/workers/firePanelWorker.ts`).
 
 ---

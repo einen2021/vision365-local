@@ -40,7 +40,7 @@ interface PanelLogEntry {
   // CVAL
   register?: "a0" | "a1" | "a2";
   cval?: number;
-  systemType?: "error" | "login-success" | "banner";
+  systemType?: "error" | "login-success" | "banner" | "command";
 }
 
 type IncomingMessage =
@@ -60,6 +60,7 @@ type OutgoingMessage =
   | { type: "connected"; connected: boolean; host: string; port: number }
   | { type: "status"; id: string; connected: boolean; host: string; port: number }
   | { type: "panel-log"; entry: PanelLogEntry }
+  | { type: "raw"; dir: "TX" | "RX"; text: string }
   | { type: "chunk"; id: string; response: string; done: boolean }
   | { type: "result"; id: string; ok: true; response: string }
   | { type: "result"; id: string; ok: false; error: string };
@@ -578,11 +579,11 @@ function createParser(): PanelDataParser {
   return new PanelDataParser((entry) => {
     // Drop pure noise from the SSE/DB stream — too high volume
     if (entry.kind === "noise") return;
-    // ACCESS GRANTED starts the login session even when it arrives late,
-    // after the login command already returned with other output.
-    if (entry.kind === "system" && entry.systemType === "login-success" && socket) {
-      loginSession = { socket, at: Date.now() };
-    }
+    // Any ACCESS GRANTED starts the login session — also one arriving late or
+    // from a login typed by hand; ACCESS DENIED ends it.
+    noteLoginLine(String(entry.raw || "").trim());
+    // A live FIRE ALARM holds trouble / supervisory lists at once (fire priority).
+    if (entry.kind === "fire" && !entry.isListEntry) setFireActive(true, "live FIRE ALARM");
     post({ type: "panel-log", entry });
   });
 }
@@ -638,7 +639,8 @@ async function connect(host: string, port: number) {
         currentHost = host;
         currentPort = port;
         parser = createParser();
-        staleOutputPending = false;
+        loginSession = null;
+        resetOutputTracking();
 
         attachSocketHandlers(sock);
         resolve();
@@ -662,72 +664,331 @@ async function connect(host: string, port: number) {
 }
 
 // ---------------------------------------------------------------------------
-// Active Command Response Collection
+// Sending commands
 // ---------------------------------------------------------------------------
+//
+// The panel only runs a command typed at its "-" prompt. A command that arrives
+// while it is busy (printing a response or an event) is echoed WITHOUT the
+// leading "-" and ignored. So every command, one at a time in arrival order:
+//   1. waits until the panel sits at its prompt (Enter recovers a hidden one),
+//   2. is sent,
+//   3. is confirmed by its echo: "- cmd" = executed, "cmd" = ignored → resend
+//      (3 attempts), no echo = unknown → fail without resending (except login).
+// See docs/PANEL_COMMANDS.md.
 
 type CommandMessage = Extract<IncomingMessage, { type: "command" }>;
 
-/**
- * Operational rank (lower = more urgent) — see COMMAND_PRIORITY.md.
- *   2  ack / silence / login / set / disable / enable (life-safety controls)
- *   3  list f
- *   4  list t / list s / show counts
- *   5  show <addr>
- *   6  anything else (terminal console, cshow cval)
- *   7  cshow * (bulk export)
- */
-function rankFor(command: string): number {
-  const c = command.trim().toLowerCase();
-  if (/^(ack|silence|login|set|disable|enable)\b/.test(c)) return 2;
-  if (/^list\s+f\b/.test(c)) return 3;
-  if (/^list\s+[ts]\b/.test(c) || /^show\s+counts\b/.test(c)) return 4;
-  if (/^show\b/.test(c)) return 5;
-  if (/^cshow\s+\*/.test(c)) return 7;
-  return 6;
-}
-
-/** Long multi-row dumps that can be cancelled and restarted for a more urgent command. */
-function isPreemptibleDump(command: string): boolean {
-  return /^(list|cshow)\b/i.test(command.trim());
-}
-
-/**
- * Commands with no reply of their own (ack / set). They complete as soon as the
- * panel echoes the line (or after ECHO_ONLY_MAX_MS), so the next command is
- * never typed into the middle of one the panel is still reading — typing them
- * back-to-back garbled lines on the panel ("sset 2:p212 on" → %ERROR).
- */
-function isEchoOnly(command: string): boolean {
-  return /^(ack|set)\b/i.test(command);
-}
-
-/** Longest wait for an ack / set echo before moving on regardless. */
-const ECHO_ONLY_MAX_MS = 600;
-
-/**
- * After a control command (ack / login / set) list dumps are held back this
- * long, so a dump cannot restart in the short gap between e.g. ack → silence →
- * reset and have the next control command typed into its output.
- */
-const CONTROL_QUIET_MS = 3000;
-/**
- * `list t` / `list s` wait longer after a control command: the panel ignores
- * typed commands until a dump ends, so a 200-row trouble list started between
- * a disable and the following enable held the enable back ~40s.
- */
-const LIST_TS_CONTROL_QUIET_MS = 15000;
-let lastControlAt = 0;
-
-function controlQuietMsFor(command: string): number {
-  return /^list\s+[ts]\b/i.test(command.trim()) ? LIST_TS_CONTROL_QUIET_MS : CONTROL_QUIET_MS;
-}
-
-// ---------------------------------------------------------------------------
-// Login session
-// ---------------------------------------------------------------------------
-
-/** One panel login is reused this long for every command that needs it. */
+/** Wait after the prompt appears before sending, to be sure nothing follows it. */
+const SETTLE_MS = 50;
+/** Longest wait for the prompt before a command fails as "panel not ready". */
+const PROMPT_WAIT_MS = 10_000;
+/** No prompt for this long: press Enter to get a fresh one (repeats). */
+const PROMPT_RECOVERY_MS = 2_000;
+/** Longest wait for a command's echo. */
+const ECHO_WAIT_MS = 5_000;
+/** Tries for a command the panel explicitly ignored. */
+const MAX_ATTEMPTS = 3;
+/** Longest wait for the answer to `login 333`. */
+const LOGIN_ANSWER_MS = 3_000;
+/** Login tries before giving up. */
+const LOGIN_ATTEMPTS = 5;
+/** How long an ACCESS GRANTED is reused. */
 const LOGIN_SESSION_MS = 3 * 60 * 1000;
+/** Longest wait for a list (list f/t/s, cshow) to finish. */
+const LIST_WAIT_MS = 60_000;
+/** Longest wait for the rest of any other response (up to the next prompt). */
+const RESPONSE_WAIT_MS = 5_000;
+const CHUNK_POST_INTERVAL_MS = 100;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function cmdLog(message: string) {
+  post({
+    type: "panel-log",
+    entry: { kind: "system", systemType: "command", raw: `CMD    ${message}`, at: new Date().toISOString() },
+  });
+}
+
+// --- Panel output tracking --------------------------------------------------
+
+/** Last part of the panel output (\r removed) — enough to see the last line. */
+let outputTail = "";
+/** Bumped on every chunk from the panel. */
+let outputSeq = 0;
+/** Something was written; the panel counts as busy until it prints a new prompt. */
+let busyAfterWrite = false;
+/** Output since the current command was written (null when nothing is waiting on it). */
+let capture: { text: string } | null = null;
+const outputWaiters = new Set<() => void>();
+
+function wakeOutputWaiters() {
+  for (const wake of [...outputWaiters]) wake();
+}
+
+/** Resolves on the next panel output, a disconnect, or after `ms`. */
+function waitForOutput(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      outputWaiters.delete(done);
+      resolve();
+    };
+    const timer = setTimeout(done, Math.max(0, ms));
+    outputWaiters.add(done);
+  });
+}
+
+/** True when the last line printed is exactly "-". */
+function endsAtPrompt(text: string): boolean {
+  const trimmed = text.replace(/\s+$/, "");
+  const lastLine = trimmed.slice(trimmed.lastIndexOf("\n") + 1);
+  return lastLine.trim() === "-";
+}
+
+function onPanelOutput(text: string) {
+  const clean = text.replace(/\r/g, "");
+  outputSeq += 1;
+  outputTail = (outputTail + clean).slice(-512);
+  if (busyAfterWrite && endsAtPrompt(outputTail)) busyAfterWrite = false;
+  if (capture) capture.text += clean;
+  wakeOutputWaiters();
+}
+
+function resetOutputTracking() {
+  outputTail = "";
+  busyAfterWrite = false;
+  capture = null;
+  wakeOutputWaiters();
+}
+
+function promptReady(): boolean {
+  return isSocketLive(socket) && !busyAfterWrite && endsAtPrompt(outputTail);
+}
+
+/**
+ * Start capturing output for a command about to be written. The capture begins
+ * with the line already on screen — the "- " prompt — because the echo of a
+ * command typed at the prompt completes that line ("- ack").
+ */
+function startCapture() {
+  capture = { text: outputTail.slice(outputTail.lastIndexOf("\n") + 1) };
+}
+
+function requireSocket(): net.Socket {
+  if (!isSocketLive(socket)) throw new Error("Fire panel not connected");
+  return socket;
+}
+
+/** Write a line to the panel; from now on it is busy until it prints a prompt. */
+function writeLine(line: string) {
+  const sock = requireSocket();
+  busyAfterWrite = true;
+  flushRawRx();
+  post({ type: "raw", dir: "TX", text: line });
+  sock.write(`${line}\r\n`);
+}
+
+// --- Raw telnet trace (exactly what crossed the socket, line by line) -------
+
+const RAW_RX_FLUSH_MS = 150;
+let rawRxBuffer = "";
+let rawRxTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Show control bytes (other than tab) as <XX> so nothing is hidden. */
+function visibleRaw(text: string): string {
+  return text.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, (c) =>
+    `<${c.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase()}>`,
+  );
+}
+
+function flushRawRx() {
+  if (rawRxTimer) {
+    clearTimeout(rawRxTimer);
+    rawRxTimer = null;
+  }
+  if (!rawRxBuffer) return;
+  post({ type: "raw", dir: "RX", text: visibleRaw(rawRxBuffer) });
+  rawRxBuffer = "";
+}
+
+/** Emit complete lines as they arrive; a trailing partial line (e.g. the "-" prompt) after a short idle. */
+function traceRawRx(chunk: string) {
+  rawRxBuffer += chunk;
+  let idx: number;
+  while ((idx = rawRxBuffer.indexOf("\n")) >= 0) {
+    const line = rawRxBuffer.slice(0, idx).replace(/\r$/, "");
+    rawRxBuffer = rawRxBuffer.slice(idx + 1);
+    post({ type: "raw", dir: "RX", text: visibleRaw(line) });
+  }
+  if (rawRxTimer) clearTimeout(rawRxTimer);
+  rawRxTimer = rawRxBuffer ? setTimeout(flushRawRx, RAW_RX_FLUSH_MS) : null;
+}
+
+/**
+ * Wait until the panel sits at its "-" prompt, then 50 ms more with nothing new
+ * printed. No prompt for 2 s → press Enter (repeats every 2 s); none in 10 s →
+ * "panel not ready" (nothing is sent).
+ */
+async function waitForPrompt(): Promise<void> {
+  const start = Date.now();
+  let lastEnterAt = start;
+  for (;;) {
+    requireSocket();
+    if (promptReady()) {
+      const seq = outputSeq;
+      await sleep(SETTLE_MS);
+      if (promptReady() && outputSeq === seq) return;
+      continue;
+    }
+    const now = Date.now();
+    if (now - start >= PROMPT_WAIT_MS) {
+      throw new Error(`Panel not ready: no "-" prompt within ${PROMPT_WAIT_MS / 1000}s`);
+    }
+    if (now - lastEnterAt >= PROMPT_RECOVERY_MS) {
+      writeLine("");
+      lastEnterAt = now;
+    }
+    await waitForOutput(Math.min(100, start + PROMPT_WAIT_MS - now));
+  }
+}
+
+// --- Echo ------------------------------------------------------------------
+
+function normalizeCommand(text: string): string {
+  return text.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * executed:    "- ack"  — typed at the prompt
+ * ignored:     "ack"    — on its own line without the dash
+ * interrupted: echoed inside other output ("… COS 21list f"): typed while the
+ *              panel was printing an event, and it may still run it afterwards
+ *              (seen with `list f`) — so its outcome is unknown.
+ */
+type EchoKind = "executed" | "ignored" | "interrupted";
+
+/**
+ * Look for the command's echo among the complete lines of `text`. Returns
+ * where the echo line starts and where the output after it begins.
+ */
+function findEcho(
+  text: string,
+  command: string,
+): { kind: EchoKind; start: number; end: number } | null {
+  const want = normalizeCommand(command);
+  let start = 0;
+  for (;;) {
+    const nl = text.indexOf("\n", start);
+    if (nl === -1) return null; // only complete lines count
+    const line = text.slice(start, nl).replace(/\x00/g, "");
+    const match = /^\s*(-?)\s*(.*)$/.exec(line);
+    const dash = match?.[1] === "-";
+    const rest = normalizeCommand(match?.[2] ?? "");
+    if (rest === want) return { kind: dash ? "executed" : "ignored", start, end: nl + 1 };
+    if (rest.endsWith(want)) return { kind: "interrupted", start, end: nl + 1 };
+    start = nl + 1;
+  }
+}
+
+/** Wait up to ECHO_WAIT_MS for the echo of `command` in the current capture. */
+async function waitForEcho(command: string, ms = ECHO_WAIT_MS) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    requireSocket();
+    const echo = capture ? findEcho(capture.text, command) : null;
+    if (echo) return echo;
+    const left = deadline - Date.now();
+    if (left <= 0) return null;
+    await waitForOutput(left);
+  }
+}
+
+// --- Responses -------------------------------------------------------------
+
+/** ack / set / silence print nothing of their own — done once executed. */
+function isEchoOnly(command: string): boolean {
+  return /^(ack|set|silence)\b/i.test(command);
+}
+
+/** Commands that only read from the panel — safe to send again. */
+function isReadOnly(command: string): boolean {
+  return /^(list|show|cshow)\b/i.test(command);
+}
+
+function isListCommand(command: string): boolean {
+  return /^(list|cshow)\b/i.test(command);
+}
+
+/**
+ * Collect the response after the echo up to the next "-" prompt (lists: up to
+ * LIST_WAIT_MS, streamed to the caller as it grows; others: RESPONSE_WAIT_MS).
+ * On timeout what arrived so far is returned.
+ */
+async function collectResponse(msg: CommandMessage, command: string, echoStart: number, echoEnd: number) {
+  const isList = isListCommand(command);
+  const deadline = Date.now() + (isList ? LIST_WAIT_MS : RESPONSE_WAIT_MS);
+  let lastChunkAt = 0;
+  let lastChunkLength = -1;
+  for (;;) {
+    const text = capture?.text ?? "";
+    const response = text.slice(echoStart);
+    const afterEcho = text.slice(echoEnd);
+    if (endsAtPrompt(afterEcho)) {
+      if (isList) post({ type: "chunk", id: msg.id, response, done: true });
+      return response;
+    }
+    if (isList && response.length !== lastChunkLength && Date.now() - lastChunkAt >= CHUNK_POST_INTERVAL_MS) {
+      post({ type: "chunk", id: msg.id, response, done: false });
+      lastChunkAt = Date.now();
+      lastChunkLength = response.length;
+    }
+    requireSocket();
+    const left = deadline - Date.now();
+    if (left <= 0) {
+      cmdLog(`${command}   response did not end with a "-" prompt within ${Math.round((isList ? LIST_WAIT_MS : RESPONSE_WAIT_MS) / 1000)}s — returning what arrived`);
+      if (isList) post({ type: "chunk", id: msg.id, response, done: true });
+      return response;
+    }
+    await waitForOutput(Math.min(left, CHUNK_POST_INTERVAL_MS));
+  }
+}
+
+/** Send one command: wait for the prompt, send, confirm by echo, collect its response. */
+async function runCommand(msg: CommandMessage, command: string): Promise<string> {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    await waitForPrompt();
+    startCapture();
+    writeLine(command);
+    cmdLog(`${command}   sent (attempt ${attempt})`);
+
+    const echo = await waitForEcho(command);
+    if (!echo || echo.kind === "interrupted") {
+      const what = echo
+        ? `echoed inside other panel output (panel was busy, it may still run it)`
+        : `no echo received`;
+      // Reading (list / show) twice is harmless; anything that changes the
+      // panel is never resent when it may already have run.
+      if (isReadOnly(command) && attempt < MAX_ATTEMPTS) {
+        cmdLog(`${command}   ${what}, retrying`);
+        continue;
+      }
+      throw new Error(
+        `${echo ? "Echo interrupted" : "No echo received"} for '${command}'; execution status is unknown, not resent`,
+      );
+    }
+    if (echo.kind === "ignored") {
+      cmdLog(`${command}   IGNORED by panel (no "-" prompt)${attempt < MAX_ATTEMPTS ? ", retrying" : ""}`);
+      continue;
+    }
+    cmdLog(`- ${command}   EXECUTED`);
+    if (isEchoOnly(command)) return (capture?.text ?? "").slice(echo.start, echo.end);
+    return collectResponse(msg, command, echo.start, echo.end);
+  }
+  throw new Error(`'${command}' was ignored by the panel ${MAX_ATTEMPTS} times`);
+}
+
+// --- Login -----------------------------------------------------------------
+
 let loginSession: { socket: net.Socket; at: number } | null = null;
 
 function isLoginCommand(command: string): boolean {
@@ -744,373 +1005,193 @@ function loginSessionActive(): boolean {
   );
 }
 
-/**
- * Remember a login the panel accepted. Only ACCESS GRANTED / ALREADY count —
- * after a freeze the reply can be another command's late output.
- */
-function recordLoginResult(response: string) {
-  const text = String(response || "").replace(/\r/g, "");
-  if (/ACCESS\s+GRANTED|ALREADY/i.test(text) && socket) {
+/** Any ACCESS GRANTED starts the 3-minute session; ACCESS DENIED ends it. */
+function noteLoginLine(systemLine: string) {
+  if (/^ACCESS\s+GRANTED\s*$/i.test(systemLine) && socket) {
     loginSession = { socket, at: Date.now() };
-  } else if (/ACCESS\s+DENIED/i.test(text)) {
+  } else if (/^ACCESS\s+DENIED\b/i.test(systemLine)) {
     loginSession = null;
   }
 }
-let deferredProcessTimer: NodeJS.Timeout | null = null;
 
-function isControlCommand(command: string): boolean {
-  return rankFor(command) <= 2;
-}
+type LoginAnswer = "granted" | "denied" | "error" | "ignored" | "no answer";
 
-interface PendingCommand {
-  id: string;
-  command: string;
-  msg: CommandMessage;
-  rank: number;
-  buffer: string;
-  /**
-   * Set when a dump was just cancelled: the panel may still be sending its tail.
-   * Incoming text is held in `preBuffer` until this command's echo shows up (or
-   * the line goes quiet) so stale rows do not leak into this response.
-   */
-  awaitingEcho: boolean;
-  preBuffer: string;
-  quietTimer: NodeJS.Timeout | null;
-  /** Trailing timer for throttled partial `chunk` posts (list dumps). */
-  chunkTimer: NodeJS.Timeout | null;
-  lastChunkAt: number;
-  expectedCount?: number;
-  /** Original per-gap budget — reused to extend timeoutTimer while a list dump is still progressing. */
-  timeoutMs: number;
-  timeoutTimer: NodeJS.Timeout;
-  silenceTimer: NodeJS.Timeout | null;
-  priority?: boolean;
-  /** Highest list-row address count seen so far, for progress-based deadline extension. */
-  lastProgressCount?: number;
-  /** ack / set — done once the panel echoes the line. */
-  echoOnly?: boolean;
-}
-
-let activeCommand: PendingCommand | null = null;
-const commandQueue: Array<{ msg: CommandMessage; rank: number }> = [];
-/** True after a dump was cancelled mid-stream until the next collecting command syncs on its echo. */
-let staleOutputPending = false;
-
-function clearCommandTimers(cmd: PendingCommand) {
-  if (cmd.timeoutTimer) clearTimeout(cmd.timeoutTimer);
-  if (cmd.silenceTimer) clearTimeout(cmd.silenceTimer);
-  if (cmd.quietTimer) clearTimeout(cmd.quietTimer);
-  if (cmd.chunkTimer) clearTimeout(cmd.chunkTimer);
-}
-
-const CHUNK_POST_INTERVAL_MS = 100;
-
-/**
- * Stream the growing dump to callers at most every CHUNK_POST_INTERVAL_MS — each
- * post carries the whole cumulative buffer, so one per telnet packet is wasted
- * work all the way to the browser. The final `done` chunk is always sent.
- */
-function postPartialChunk(cmd: PendingCommand) {
-  const wait = cmd.lastChunkAt + CHUNK_POST_INTERVAL_MS - Date.now();
-  if (wait <= 0) {
-    if (cmd.chunkTimer) clearTimeout(cmd.chunkTimer);
-    cmd.chunkTimer = null;
-    cmd.lastChunkAt = Date.now();
-    post({ type: "chunk", id: cmd.id, response: cmd.buffer, done: false });
-    return;
-  }
-  if (!cmd.chunkTimer) {
-    cmd.chunkTimer = setTimeout(() => {
-      cmd.chunkTimer = null;
-      if (activeCommand === cmd) postPartialChunk(cmd);
-    }, wait);
-  }
-}
-
-/** Queue by rank; FIFO within a rank. `front` puts it ahead of its own rank (restarted dumps). */
-function enqueueCommand(msg: CommandMessage, front = false) {
-  const rank = rankFor(msg.command);
-  if (front) {
-    commandQueue.unshift({ msg, rank });
-  } else {
-    commandQueue.push({ msg, rank });
-  }
-}
-
-function completeActiveCommand() {
-  if (!activeCommand) return;
-  const cmd = activeCommand;
-  activeCommand = null;
-  if (isControlCommand(cmd.command)) lastControlAt = Date.now();
-
-  clearCommandTimers(cmd);
-  if (isLoginCommand(cmd.command)) recordLoginResult(cmd.buffer);
-
-  // Final partial chunk so streaming callers see the completed dump (list commands only).
-  if (cmd.command.toLowerCase().startsWith("list")) {
-    post({ type: "chunk", id: cmd.id, response: cmd.buffer, done: true });
-  }
-
-  post({
-    type: "result",
-    id: cmd.id,
-    ok: true,
-    response: cmd.buffer,
-  });
-
-  // A dump completed by row count can finish before the panel prints its last
-  // characters and "-" prompt. That tail would land in the next command's
-  // response, so make the next collecting command wait for its own echo.
-  if (isPreemptibleDump(cmd.command) && !dumpEndedWithPrompt(cmd.buffer)) {
-    staleOutputPending = true;
-  }
-
-  processNextCommand();
-}
-
-function dumpEndedWithPrompt(buffer: string): boolean {
-  const text = buffer.replace(/\r/g, "").replace(/\s+$/, "");
-  return /_DNE|_END/i.test(text) || /(?:^|\n)\s*-$/.test(text);
-}
-
-function processNextCommand() {
-  if (activeCommand) return;
-  if (commandQueue.length === 0) return;
-
-  // Hold list dumps for a while after a control command (CONTROL_QUIET_MS,
-  // LIST_TS_CONTROL_QUIET_MS); other queued commands still run meanwhile.
-  const now = Date.now();
-  let best = -1;
-  let soonestWait = Infinity;
-  for (let i = 0; i < commandQueue.length; i++) {
-    const { msg, rank } = commandQueue[i];
-    if (isPreemptibleDump(msg.command)) {
-      const wait = lastControlAt + controlQuietMsFor(msg.command) - now;
-      if (wait > 0) {
-        soonestWait = Math.min(soonestWait, wait);
-        continue;
-      }
-    }
-    if (best === -1 || rank < commandQueue[best].rank) best = i;
-  }
-
-  if (best === -1) {
-    if (deferredProcessTimer) clearTimeout(deferredProcessTimer);
-    deferredProcessTimer = setTimeout(() => {
-      deferredProcessTimer = null;
-      processNextCommand();
-    }, soonestWait);
-    return;
-  }
-
-  executeCommand(commandQueue.splice(best, 1)[0].msg);
-}
-
-/**
- * A dump stopped for a more urgent command. Panels differ in what happens next:
- *   - the dump aborts and the urgent command is echoed right away → restart the
- *     dump once the urgent commands are done;
- *   - the panel finishes the dump first and only then runs the urgent command →
- *     the rows are still arriving, so complete the original dump from them
- *     (restarting would make the panel dump twice and delay later commands).
- * Whichever shows up first in the stream — the urgent command's echo, or the
- * end of the dump — decides.
- */
-interface SuspendedDump {
-  cmd: PendingCommand;
-  /** Command whose echo means "the panel aborted the dump". */
-  echoOf: string;
-  /** Panel text received since the dump was suspended. */
-  tail: string;
-  timer: NodeJS.Timeout | null;
-}
-
-let suspendedDump: SuspendedDump | null = null;
-
-/** Restart a suspended dump when the line goes this quiet without either signal. */
-const SUSPENDED_DUMP_IDLE_MS = 2000;
-
-const RE_LIST_ROW = /(?:^|\n)\s*(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+(?:-\d+)?)\b/g;
-const RE_PROMPT_LINE = /(?:^|\n)\s*-\s*(?:\n|$)/;
-
-function countListRows(text: string): number {
-  return (text.match(RE_LIST_ROW) || []).length;
-}
-
-/** Start offset of the panel's echo line for `command` in `text`, or -1. */
-function findEchoLine(text: string, command: string): number {
-  const want = command.trim().toLowerCase().replace(/\s+/g, " ");
-  let start = 0;
+async function waitForLoginAnswer(command: string, sentAt: number): Promise<LoginAnswer> {
+  const deadline = sentAt + LOGIN_ANSWER_MS;
   for (;;) {
-    const nl = text.indexOf("\n", start);
-    const end = nl === -1 ? text.length : nl;
-    const line = text
-      .slice(start, end)
-      .replace(/[\r\x00]/g, "")
-      .replace(/^[\s-]+/, "")
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, " ");
-    // The echo may be glued to a previous dump's tail ("TRBL show counts").
-    if (line === want || line.endsWith(" " + want)) return start;
-    if (nl === -1) return -1;
-    start = nl + 1;
+    requireSocket();
+    const text = capture?.text ?? "";
+    if (/ACCESS\s+GRANTED/i.test(text) || (loginSession && loginSession.at >= sentAt)) return "granted";
+    if (/ACCESS\s+DENIED/i.test(text)) return "denied";
+    if (/%ERROR/i.test(text)) return "error";
+    if (findEcho(text, command)?.kind === "ignored") return "ignored";
+    const left = deadline - Date.now();
+    if (left <= 0) return "no answer";
+    await waitForOutput(left);
   }
-}
-
-/** True when `tail` finishes the suspended dump (prompt / _DNE with the expected row count). */
-function isSuspendedDumpComplete(cmd: PendingCommand, tail: string): boolean {
-  const cleanTail = tail.replace(/\r/g, "");
-  const ended = /_DNE|_END/i.test(cleanTail) || RE_PROMPT_LINE.test(cleanTail);
-  const count = countListRows((cmd.buffer + tail).replace(/\r/g, ""));
-  const exp = cmd.msg.expectedCount || 0;
-  if (exp > 0) return count >= exp || (ended && count >= Math.floor(exp * 0.95));
-  return ended && count > 0;
-}
-
-function armSuspendedDumpTimer(s: SuspendedDump) {
-  if (s.timer) clearTimeout(s.timer);
-  s.timer = setTimeout(restartSuspendedDump, SUSPENDED_DUMP_IDLE_MS);
-}
-
-function takeSuspendedDump(): SuspendedDump | null {
-  const s = suspendedDump;
-  if (!s) return null;
-  if (s.timer) clearTimeout(s.timer);
-  suspendedDump = null;
-  return s;
-}
-
-function restartSuspendedDump() {
-  const s = takeSuspendedDump();
-  if (!s) return;
-  enqueueCommand(s.cmd.msg, true);
-  processNextCommand();
-}
-
-function failSuspendedDump(error: string) {
-  const s = takeSuspendedDump();
-  if (!s) return;
-  post({ type: "result", id: s.cmd.id, ok: false, error });
-}
-
-/** Route panel text to the suspended dump and settle it once the stream shows which way the panel went. */
-function feedSuspendedDump(text: string) {
-  const s = suspendedDump;
-  if (!s) return;
-  s.tail += text;
-
-  const echoAt = findEchoLine(s.tail, s.echoOf);
-  const beforeEcho = echoAt === -1 ? s.tail : s.tail.slice(0, echoAt);
-  if (isSuspendedDumpComplete(s.cmd, beforeEcho)) {
-    takeSuspendedDump();
-    const response = s.cmd.buffer + beforeEcho;
-    post({ type: "chunk", id: s.cmd.id, response, done: true });
-    post({ type: "result", id: s.cmd.id, ok: true, response });
-    return;
-  }
-  if (echoAt !== -1) {
-    restartSuspendedDump();
-    return;
-  }
-  // Rows still streaming — the panel queued the urgent command behind the dump.
-  armSuspendedDumpTimer(s);
 }
 
 /**
- * Ack/silence/reset must reach the panel immediately — waiting behind a slow
- * in-flight dump (hundreds of "list" rows) would delay a life-safety action by
- * many seconds. Stop collecting the active dump so the urgent command is written
- * now; the dump is then either completed from the rows still arriving or
- * restarted (see SuspendedDump). Its caller still receives one complete response.
+ * Skipped while a login is active (3 min after ACCESS GRANTED). Otherwise sent
+ * and answered within 3 s; anything but ACCESS GRANTED is retried, up to 5
+ * attempts — logging in twice is harmless, so a missing echo is retried too.
  */
-function preemptActiveDump(incomingCommand: string) {
-  if (!activeCommand) return;
-  const cmd = activeCommand;
-  activeCommand = null;
-  clearCommandTimers(cmd);
-  staleOutputPending = true;
-
-  if (suspendedDump) {
-    // Already watching an earlier dump — just restart this one later.
-    enqueueCommand(cmd.msg, true);
-    return;
+async function runLogin(command: string): Promise<string> {
+  if (loginSessionActive()) {
+    const left = Math.round((LOGIN_SESSION_MS - (Date.now() - loginSession!.at)) / 1000);
+    const note = `already logged in (${left}s left), login skipped`;
+    cmdLog(note);
+    return note;
   }
-  suspendedDump = { cmd, echoOf: incomingCommand, tail: "", timer: null };
-  armSuspendedDumpTimer(suspendedDump);
+  for (let attempt = 1; attempt <= LOGIN_ATTEMPTS; attempt++) {
+    await waitForPrompt();
+    startCapture();
+    const sentAt = Date.now();
+    writeLine(command);
+    cmdLog(`${command}   sent (attempt ${attempt})`);
+
+    const answer = await waitForLoginAnswer(command, sentAt);
+    if (answer === "granted") {
+      if (socket) loginSession = { socket, at: Date.now() };
+      cmdLog(`${command} -> ACCESS GRANTED (attempt ${attempt})`);
+      return capture?.text || "ACCESS GRANTED";
+    }
+    if (answer === "denied") loginSession = null;
+    cmdLog(`${command} -> ${answer.toUpperCase()} (attempt ${attempt})${attempt < LOGIN_ATTEMPTS ? ", retrying" : ""}`);
+  }
+  throw new Error(`Login failed after ${LOGIN_ATTEMPTS} attempts`);
 }
 
-function executeCommand(msg: CommandMessage) {
-  if (!isSocketLive(socket)) {
-    post({
-      type: "result",
-      id: msg.id,
-      ok: false,
-      error: "Fire panel not connected",
-    });
-    processNextCommand();
+// --- Fire priority -----------------------------------------------------------
+
+/**
+ * While the panel reports FIRE > 0, `list t` / `list s` are never sent: queued
+ * ones are refused and new ones are refused when their turn comes. Set by a
+ * live FIRE ALARM line or a `show counts` reply with FIRE > 0; cleared only by
+ * a `show counts` reply with FIRE = 0. The app re-lists trouble / supervisory
+ * itself once the fire count is 0.
+ */
+let fireActive = false;
+
+function isTroubleSupervisoryList(command: string): boolean {
+  return /^list\s+[ts]\b/i.test(command.trim());
+}
+
+function fireHoldError(command: string): string {
+  return `Fire alarm active (FIRE > 0): '${command}' not sent — trouble / supervisory lists wait until the fire count is 0`;
+}
+
+function setFireActive(active: boolean, reason: string) {
+  if (fireActive === active) return;
+  fireActive = active;
+  cmdLog(`FIRE PRIORITY ${active ? "ON" : "OFF"} (${reason}) — list t / list s ${active ? "held" : "allowed"}`);
+  if (!active) return;
+  for (let i = commandQueue.length - 1; i >= 0; i--) {
+    const queued = commandQueue[i];
+    if (!isTroubleSupervisoryList(queued.command)) continue;
+    commandQueue.splice(i, 1);
+    const error = fireHoldError(queued.command.trim());
+    cmdLog(`${queued.command.trim()}   NOT SENT: ${error}`);
+    postResult(queued.id, { ok: false, error });
+  }
+}
+
+/** FIRE from a complete `show counts` reply (all three totals present), or null. */
+function fireCountFromShowCounts(response: string): number | null {
+  const fire = /FIRE\s*=\s*(\d+)/i.exec(response);
+  const supervisory = /SUPERVISORY\s*=\s*(\d+)/i.exec(response);
+  const trouble = /TROUBLE\s*=\s*(\d+)[ \t]*[\r\n]/i.exec(response);
+  if (!fire || !supervisory || !trouble) return null;
+  return Number(fire[1]);
+}
+
+// --- Queue -----------------------------------------------------------------
+
+/** Commands run one at a time, in the order they arrived. */
+const commandQueue: CommandMessage[] = [];
+/**
+ * Only one `show counts` waits in the queue at a time: later requests share the
+ * answer of the one already waiting (queued msg id -> extra request ids).
+ */
+const sharedResultIds = new Map<string, string[]>();
+
+/** Post a command's result to its caller and to every request sharing it. */
+function postResult(
+  id: string,
+  result: { ok: true; response: string } | { ok: false; error: string },
+) {
+  const ids = [id, ...(sharedResultIds.get(id) ?? [])];
+  sharedResultIds.delete(id);
+  for (const each of ids) post({ type: "result", id: each, ...result });
+}
+let activeCommandText: string | null = null;
+let pumping = false;
+
+async function executeCommand(msg: CommandMessage) {
+  const command = msg.command.replace(/[\r\n]+/g, " ").trim();
+  if (fireActive && isTroubleSupervisoryList(command)) {
+    const error = fireHoldError(command);
+    cmdLog(`${command}   NOT SENT: ${error}`);
+    postResult(msg.id, { ok: false, error });
     return;
   }
-
-  const clean = msg.command.replace(/[\r\n]+/g, " ").trim();
-  if (!clean) {
-    post({ type: "result", id: msg.id, ok: true, response: "OK" });
-    processNextCommand();
-    return;
-  }
-
-  if (isControlCommand(clean)) lastControlAt = Date.now();
-
-  // ack / set have no reply — wait only for the panel's echo (ECHO_ONLY_MAX_MS
-  // at most). Other commands (login, show, disable, enable, list) collect output.
-  const echoOnly = isEchoOnly(clean);
-  const timeoutMs = echoOnly
-    ? ECHO_ONLY_MAX_MS
-    : msg.timeoutMs && msg.timeoutMs > 0
-      ? msg.timeoutMs
-      : 5000;
-
-  const awaitingEcho = staleOutputPending;
-  staleOutputPending = false;
-
-  activeCommand = {
-    id: msg.id,
-    command: clean,
-    msg,
-    rank: rankFor(clean),
-    buffer: "",
-    awaitingEcho,
-    preBuffer: "",
-    quietTimer: null,
-    chunkTimer: null,
-    lastChunkAt: 0,
-    expectedCount: msg.expectedCount,
-    timeoutMs,
-    timeoutTimer: setTimeout(() => {
-      if (activeCommand && activeCommand.id === msg.id) {
-        completeActiveCommand();
-      }
-    }, timeoutMs),
-    silenceTimer: null,
-    priority: msg.priority,
-    lastProgressCount: 0,
-    echoOnly,
-  };
-
-  socket.write(`${clean}\r\n`, (err) => {
-    if (err && activeCommand && activeCommand.id === msg.id) {
-      clearCommandTimers(activeCommand);
-      const cmdId = activeCommand.id;
-      activeCommand = null;
-      post({
-        type: "result",
-        id: cmdId,
-        ok: false,
-        error: err.message || "Failed to write command to socket",
-      });
-      processNextCommand();
+  activeCommandText = command;
+  try {
+    let response: string;
+    if (!command) {
+      // A blank line by hand (empty command box): Enter, to get a fresh prompt.
+      writeLine("");
+      response = "OK";
+    } else if (isLoginCommand(command)) {
+      response = await runLogin(command);
+    } else {
+      response = await runCommand(msg, command);
     }
-  });
+    if (normalizeCommand(command) === "show counts") {
+      const fire = fireCountFromShowCounts(response);
+      if (fire !== null) setFireActive(fire > 0, `show counts FIRE = ${fire}`);
+    }
+    postResult(msg.id, { ok: true, response });
+  } catch (error) {
+    const message = (error as Error)?.message || "Command failed";
+    cmdLog(`${command || "(enter)"}   FAILED: ${message}`);
+    postResult(msg.id, { ok: false, error: message });
+  } finally {
+    activeCommandText = null;
+    capture = null;
+  }
+}
+
+async function pumpCommands() {
+  if (pumping) return;
+  pumping = true;
+  try {
+    while (commandQueue.length > 0) {
+      await executeCommand(commandQueue.shift()!);
+    }
+  } finally {
+    pumping = false;
+  }
+}
+
+function enqueueCommand(msg: CommandMessage) {
+  if (normalizeCommand(msg.command) === "show counts") {
+    const waiting = commandQueue.find((queued) => normalizeCommand(queued.command) === "show counts");
+    if (waiting) {
+      sharedResultIds.set(waiting.id, [...(sharedResultIds.get(waiting.id) ?? []), msg.id]);
+      return;
+    }
+  }
+  commandQueue.push(msg);
+  void pumpCommands();
+}
+
+/** Fail everything still queued (the running command fails on its own). */
+function failQueuedCommands(error: string) {
+  while (commandQueue.length > 0) {
+    const msg = commandQueue.shift()!;
+    postResult(msg.id, { ok: false, error });
+  }
 }
 
 function attachSocketHandlers(sock: net.Socket) {
@@ -1119,28 +1200,9 @@ function attachSocketHandlers(sock: net.Socket) {
     parser?.flush();
     parser = null;
     socket = null;
-    if (activeCommand) {
-      clearCommandTimers(activeCommand);
-      post({
-        type: "result",
-        id: activeCommand.id,
-        ok: false,
-        error: "Socket closed while waiting for response",
-      });
-      activeCommand = null;
-    }
-    failSuspendedDump("Socket closed");
-    while (commandQueue.length > 0) {
-      const item = commandQueue.shift();
-      if (item) {
-        post({
-          type: "result",
-          id: item.msg.id,
-          ok: false,
-          error: "Socket closed",
-        });
-      }
-    }
+    loginSession = null;
+    resetOutputTracking();
+    failQueuedCommands("Socket closed");
     post({ type: "connected", connected: false, host: currentHost, port: currentPort });
   });
 
@@ -1151,236 +1213,30 @@ function attachSocketHandlers(sock: net.Socket) {
       parser?.flush();
       parser = null;
       socket = null;
+      loginSession = null;
+      resetOutputTracking();
       post({ type: "connected", connected: false, host: currentHost, port: currentPort });
     }
   });
 
-  // Feed all incoming panel data into the parser & collect command responses
+  // Feed all incoming panel data into the parser & the command being confirmed.
   sock.on("data", (chunk: Buffer) => {
-    // 1. If an interactive query command is active (show <address>, cshow, login, disable, enable),
-    // do not feed its response chunks to the spontaneous alarm parser.
+    traceRawRx(chunk.toString("utf8"));
+    // Replies to device queries (show <address>, cshow, disable, enable) are not
+    // alarm events — keep them away from the spontaneous-event parser.
+    const lowerCmd = activeCommandText?.toLowerCase() ?? "";
     const isInteractiveQuery =
-      activeCommand &&
-      (activeCommand.command.toLowerCase().startsWith("show") ||
-        activeCommand.command.toLowerCase().startsWith("cshow") ||
-        activeCommand.command.toLowerCase().startsWith("login") ||
-        activeCommand.command.toLowerCase().startsWith("disable") ||
-        activeCommand.command.toLowerCase().startsWith("enable"));
+      lowerCmd.startsWith("show") ||
+      lowerCmd.startsWith("cshow") ||
+      lowerCmd.startsWith("disable") ||
+      lowerCmd.startsWith("enable");
+    if (!isInteractiveQuery) parser?.feed(chunk);
 
-    if (!isInteractiveQuery) {
-      parser?.feed(chunk);
-    }
-
-    const text = chunk.toString("utf8");
-    feedSuspendedDump(text);
-
-    // 2. If an active command is waiting for response, collect the chunk
-    if (activeCommand && appendToActiveCommand(activeCommand, text)) {
-      evaluateActiveCommand();
-    }
+    onPanelOutput(chunk.toString("utf8"));
   });
 }
 
-const ECHO_QUIET_MS = 300;
-
-/**
- * Add panel text to the active command's response. While `awaitingEcho` (a dump
- * was just cancelled), text is held back until this command's echo appears, or
- * until the line has been quiet for ECHO_QUIET_MS (then everything held is kept).
- * Returns false while still waiting for the echo.
- */
-function appendToActiveCommand(cmd: PendingCommand, text: string): boolean {
-  if (!cmd.awaitingEcho) {
-    cmd.buffer += text;
-    return true;
-  }
-
-  cmd.preBuffer += text;
-  const echoIdx = findEchoLine(cmd.preBuffer, cmd.command);
-  if (echoIdx !== -1) {
-    releaseEchoGate(cmd, cmd.preBuffer.slice(echoIdx));
-    return true;
-  }
-
-  if (cmd.quietTimer) clearTimeout(cmd.quietTimer);
-  cmd.quietTimer = setTimeout(() => {
-    if (activeCommand !== cmd || !cmd.awaitingEcho) return;
-    releaseEchoGate(cmd, cmd.preBuffer);
-    evaluateActiveCommand();
-  }, ECHO_QUIET_MS);
-  return false;
-}
-
-function releaseEchoGate(cmd: PendingCommand, buffer: string) {
-  if (cmd.quietTimer) clearTimeout(cmd.quietTimer);
-  cmd.quietTimer = null;
-  cmd.awaitingEcho = false;
-  cmd.preBuffer = "";
-  cmd.buffer = buffer;
-}
-
-/** `show counts` reply holds all three totals (FIRE / SUPERVISORY / TROUBLE). */
-function hasAllCounts(text: string): boolean {
-  return (
-    /FIRE\s*=\s*\d+/i.test(text) &&
-    /SUPERVISORY\s*=\s*\d+/i.test(text) &&
-    // TROUBLE is last on the line: only complete once the line ends. Its
-    // digits can arrive in separate chunks ("TROUBLE = 2" then "17") — reading
-    // the first part as 2 started a bogus list t that swallowed the next ack.
-    /TROUBLE\s*=\s*\d+[ \t]*[\r\n]/i.test(text)
-  );
-}
-
-/** Complete the active command when its response is recognisably done; otherwise (re)arm the silence timer. */
-function evaluateActiveCommand() {
-  if (activeCommand) {
-    const trimmed = activeCommand.buffer.trim();
-    const lowerCmd = activeCommand.command.toLowerCase();
-
-    let isComplete = false;
-
-    if (activeCommand.echoOnly) {
-      // Done once the panel echoes the line; otherwise ECHO_ONLY_MAX_MS ends it.
-      if (findEchoLine(activeCommand.buffer, activeCommand.command) !== -1 || /%ERROR/i.test(trimmed)) {
-        completeActiveCommand();
-      }
-      return;
-    } else if (lowerCmd.startsWith("login")) {
-      if (/ACCESS GRANTED|ACCESS DENIED|%ERROR|INVALID|ALREADY|LEVEL/i.test(trimmed) || trimmed.endsWith("-") || /\n-\s*$/.test(trimmed)) {
-        isComplete = true;
-      }
-    } else if (lowerCmd.startsWith("show counts")) {
-      // Wait for the whole counts line. A "-" prompt can be left over from a
-      // previous dump, so a prompt alone must not finish a half-received
-      // "FIRE = 0  PRIORITY2 =" (read downstream as TROUBLE = 0).
-      if (hasAllCounts(trimmed) || /%ERROR|INVALID/i.test(trimmed)) {
-        isComplete = true;
-      }
-    } else if (lowerCmd.startsWith("show")) {
-      const hasError = /%ERROR|INVALID|NOT FOUND|ACCESS DENIED/i.test(trimmed);
-      const hasPrimaryStatus = /PRIMARY STATUS\s*(?::|\s)\s*(NORM|FIRE|DIRT|DISA|DISABLE|ABNOR|NO\s*ANS|SUP|OPEN|SHORT|TEST|OFF|ON|ACTIVE|INACT|UNVER)/i.test(trimmed);
-      const hasPromptAtEnd = trimmed.endsWith("-") || /-\s*$/.test(trimmed) || /_DNE|_END/i.test(trimmed);
-      const hasEnabledState = /ENABLED STATE\s*(?::|\s)\s*(ENABLED|DISABLED)/i.test(trimmed);
-
-      if (hasError || (hasPrimaryStatus && (hasPromptAtEnd || hasEnabledState))) {
-        isComplete = true;
-      }
-    } else if (lowerCmd.startsWith("disable") || lowerCmd.startsWith("enable")) {
-      if (/COMMAND ACCEPTED|%ERROR|INVALID|DISABLED|ENABLED/i.test(trimmed) || trimmed.endsWith("-") || /\n-\s*$/.test(trimmed)) {
-        isComplete = true;
-      }
-    } else if (lowerCmd.startsWith("list")) {
-      const exp = activeCommand.expectedCount || 0;
-      const addressMatches = trimmed.match(/(?:^|\n)\s*(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+(?:-\d+)?)\b/g);
-      const count = addressMatches ? addressMatches.length : 0;
-
-      // Stream the growing dump on every chunk so callers can save rows one by
-      // one as they arrive, instead of waiting for the full expected count.
-      postPartialChunk(activeCommand);
-
-      // Slow panels can take minutes to dump hundreds of rows one at a time. As
-      // long as new rows keep trickling in, push the deadline back instead of
-      // cutting the dump off mid-stream (a retry restarts "list" from row 1, so
-      // a fixed total-time budget would otherwise mean the tail rows are never
-      // reached no matter how many attempts run).
-      if (exp > 0 && count > (activeCommand.lastProgressCount || 0)) {
-        activeCommand.lastProgressCount = count;
-        const cmdId = activeCommand.id;
-        clearTimeout(activeCommand.timeoutTimer);
-        activeCommand.timeoutTimer = setTimeout(() => {
-          if (activeCommand && activeCommand.id === cmdId) {
-            completeActiveCommand();
-          }
-        }, activeCommand.timeoutMs);
-      }
-
-      if (exp > 0) {
-        // If expectedCount is set (e.g. 215), only complete when count >= exp OR _DNE/_END reached with count >= 95%
-        if (count >= exp || (count >= Math.floor(exp * 0.95) && /_DNE|_END/i.test(trimmed))) {
-          isComplete = true;
-        }
-      } else {
-        // No expectedCount specified: complete if ends with prompt "-" after receiving at least 1 line or _DNE/_END
-        if (
-          /_DNE|_END/i.test(trimmed) ||
-          /%ERROR|INVALID/i.test(trimmed) ||
-          (count > 0 && (trimmed.endsWith("-") || /\n-\s*$/.test(trimmed)))
-        ) {
-          isComplete = true;
-        }
-      }
-    }
-
-    if (isComplete) {
-      completeActiveCommand();
-      return;
-    }
-
-    // Reset silence timer: finalize response after data chunk arrives
-    if (activeCommand.silenceTimer) {
-      clearTimeout(activeCommand.silenceTimer);
-    }
-    activeCommand.silenceTimer = setTimeout(() => {
-      if (!activeCommand) return;
-      const bufTrimmed = activeCommand.buffer.trim();
-      const cmdClean = activeCommand.command.trim();
-
-      // If buffer only contains the echoed command (or command prompt with no actual response text yet),
-      // do not complete early on silence — keep waiting for the panel data until timeoutTimer.
-      const stripped = bufTrimmed
-        .replace(/^-+\s*/, "")
-        .replace(/\s*-+$/, "")
-        .replace(/[\r\n\-]+/g, " ")
-        .trim();
-      const isOnlyEcho =
-        stripped === cmdClean ||
-        stripped === "" ||
-        stripped === "-";
-
-      if (isOnlyEcho) {
-        return;
-      }
-
-      // Special check for show counts: do not complete on silence if counts have not arrived yet
-      if (
-        lowerCmd.startsWith("show counts") &&
-        !hasAllCounts(bufTrimmed) &&
-        !/%ERROR|INVALID/i.test(bufTrimmed)
-      ) {
-        return;
-      }
-
-      // Special check for show <device>: do not complete on silence if PRIMARY STATUS has not arrived
-      if (
-        lowerCmd.startsWith("show") &&
-        !lowerCmd.startsWith("show counts")
-      ) {
-        const hasError = /%ERROR|INVALID|NOT FOUND|ACCESS DENIED/i.test(bufTrimmed);
-        const hasPrimaryStatus = /PRIMARY STATUS\s*(?::|\s)\s*(NORM|FIRE|DIRT|DISA|DISABLE|ABNOR|NO\s*ANS|SUP|OPEN|SHORT|TEST|OFF|ON|ACTIVE|INACT|UNVER)/i.test(bufTrimmed);
-
-        if (!hasError && !hasPrimaryStatus) {
-          return;
-        }
-      }
-
-      // Special check for list: if expectedCount is specified, keep collecting unless silence has elapsed with sufficient data
-      if (lowerCmd.startsWith("list")) {
-        const exp = activeCommand.expectedCount || 0;
-        const addressMatches = bufTrimmed.match(/(?:^|\n)\s*(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+(?:-\d+)?)\b/g);
-        const count = addressMatches ? addressMatches.length : 0;
-        if (exp > 0 && count < Math.floor(exp * 0.95)) {
-          // Still waiting for full list data from panel — do not finish early on silence
-          return;
-        }
-      }
-
-      completeActiveCommand();
-    }, 500);
-  }
-}
-
 function disconnect() {
-  failSuspendedDump("Disconnected");
   if (socket) {
     const prev = socket;
     socket = null;
@@ -1389,16 +1245,9 @@ function disconnect() {
     prev.removeAllListeners();
     prev.destroy();
   }
-  if (activeCommand) {
-    clearCommandTimers(activeCommand);
-    post({
-      type: "result",
-      id: activeCommand.id,
-      ok: false,
-      error: "Disconnected",
-    });
-    activeCommand = null;
-  }
+  loginSession = null;
+  resetOutputTracking();
+  failQueuedCommands("Disconnected");
   post({ type: "connected", connected: false, host: currentHost, port: currentPort });
 }
 
@@ -1435,26 +1284,7 @@ parentPort?.on("message", (msg: IncomingMessage) => {
   }
 
   if (msg.type === "command") {
-    // A login already accepted on this connection within the last 3 minutes is
-    // answered here without sending it again.
-    if (isLoginCommand(msg.command) && loginSessionActive()) {
-      post({
-        type: "result",
-        id: msg.id,
-        ok: true,
-        response: "ACCESS GRANTED (login still active)",
-      });
-      return;
-    }
     enqueueCommand(msg);
-    if (
-      activeCommand &&
-      rankFor(msg.command) < activeCommand.rank &&
-      isPreemptibleDump(activeCommand.command)
-    ) {
-      preemptActiveDump(msg.command);
-    }
-    processNextCommand();
     return;
   }
 

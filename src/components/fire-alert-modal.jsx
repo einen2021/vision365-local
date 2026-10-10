@@ -48,12 +48,15 @@ export function FireAlertModal({ open, onClose }) {
   const { acknowledge, silenceAlarm, fetchFirePanelListResponse } = useFirePanelMonitor();
   const fireAlertCtx = useFireAlert();
   const muteSiren = fireAlertCtx?.muteSiren;
+  const clearFireAckPending = fireAlertCtx?.clearFireAckPending;
 
   const [ackLoading, setAckLoading] = useState(false);
 
   const alert = PLACEHOLDER_ALERT;
 
   const handleAcknowledge = () => {
+    // Stop the navbar Fire Ack blink on click — no wait for FIRE ALARM ACKED.
+    clearFireAckPending?.();
     if (!connected) {
       toast({
         title: "Not connected",
@@ -74,7 +77,7 @@ export function FireAlertModal({ open, onClose }) {
     // 2. Priority ACK command (`ack f`) & list sync run in background
     void (async () => {
       try {
-        // Re-sends `ack` while `list f` still shows the fire unacknowledged (≤ ~6s).
+        // One ack, confirmed by the panel worker ("- ack" executed).
         await acknowledgeFireConfirmed();
       } catch (error) {
         console.error("Fire Ack failed:", error);

@@ -8,6 +8,7 @@ import {
 import { getAssetsListSnapshot, invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets";
 import { readSimplexStatus, simplexKeyForCategoryLabel } from "@/lib/firePanelMonitor";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
+import { deferForFirePriority, isHeldByFirePriority } from "@/lib/firePriority";
 
 // Per-category temp array of addresses seen in the last list response — diffed
 // against the next response so only devices that actually changed (added or
@@ -53,9 +54,14 @@ function patchStoreFromEntry(entryId, data, status, extraAddress = "") {
  * addresses that dropped out get the flag reset to 0.
  */
 export async function syncAssetsListWithPanelList(label, deviceAddresses = []) {
-  invalidateAssetsListSnapshotCache();
-
   const statusKey = simplexKeyForCategoryLabel(label);
+  // Fire first: no T / S flag (marker colour) change while FIRE > 0.
+  if (isHeldByFirePriority(label)) {
+    deferForFirePriority(label);
+    return { updatedCount: 0, clearedCount: 0, statusKey, held: true };
+  }
+
+  invalidateAssetsListSnapshotCache();
   const now = new Date().toISOString();
   let updatedCount = 0;
   let clearedCount = 0;

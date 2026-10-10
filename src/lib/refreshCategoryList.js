@@ -8,6 +8,12 @@ import { syncPanelListWithTempArray } from "@/lib/firePanelListHistory";
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
 import { saveListToCategoryDb } from "@/lib/recordAlarmHistory";
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
+import {
+  deferForFirePriority,
+  firePriorityHoldMessage,
+  isHeldByFirePriority,
+  noteShowCounts,
+} from "@/lib/firePriority";
 
 /**
  * Robustly refresh a category list (Fire, Trouble, Supervisory) from the fire panel:
@@ -47,12 +53,19 @@ export async function refreshCategoryPanelList(label) {
     return typeof data === "string" ? data : (data?.response || data?.raw || "");
   };
 
+  // Fire first: no `list t` / `list s` while FIRE > 0.
+  if (isHeldByFirePriority(normLabel)) {
+    deferForFirePriority(normLabel);
+    throw new Error(firePriorityHoldMessage(normLabel));
+  }
+
   // 1. Query show counts to get current accurate expected count
   let expectedCount = 0;
   let counts = null;
   try {
     const countsRaw = await sendCommand("show counts", 6000);
     counts = parseShowCountsResponse(countsRaw);
+    noteShowCounts(counts);
     if (counts) {
       expectedCount = Number(counts[countKey]) || 0;
       // Sync panel-state in DB & UI
@@ -70,6 +83,12 @@ export async function refreshCategoryPanelList(label) {
     }
   } catch (err) {
     console.warn(`[refreshCategoryPanelList] show counts failed, proceeding with best-effort:`, err);
+  }
+
+  // The counts above may show a fire.
+  if (isHeldByFirePriority(normLabel)) {
+    deferForFirePriority(normLabel);
+    throw new Error(firePriorityHoldMessage(normLabel));
   }
 
   // 2. If expected count is 0, clear list immediately
@@ -100,6 +119,12 @@ export async function refreshCategoryPanelList(label) {
       break;
     }
     await new Promise((r) => setTimeout(r, 1200));
+  }
+
+  // A fire that started during the dump: drop the result.
+  if (isHeldByFirePriority(normLabel)) {
+    deferForFirePriority(normLabel);
+    throw new Error(firePriorityHoldMessage(normLabel));
   }
 
   const addresses = extractPanelDeviceAddresses(rawRes);

@@ -14,6 +14,11 @@ import {
 import { useAssetFireStatusStore } from "@/stores/assetFireStatusStore";
 import { useStartupProgressStore } from "@/stores/startupProgressStore";
 import { isDebugMode } from "@/lib/debugMode";
+import {
+  deferForFirePriority,
+  isHeldByFirePriority,
+  noteShowCounts,
+} from "@/lib/firePriority";
 
 let startupSyncCompleted = false;
 let startupSyncInProgress = false;
@@ -115,13 +120,9 @@ export async function runStartupListSync(arg1, arg2) {
       return typeof data === "string" ? data : (data?.response || data?.raw || "");
     };
 
-    // Step 7: Reset all assets F, T, S values to 0
-    reportProgress(7, 12, 60, "Resetting device status (F/T/S to 0)...");
-    await logStartupSync("[startupSync] Resetting all assets F/T/S values to 0 before list commands...");
-    await resetAllAssetsSimplexStatus();
-
-    // Step 8: Run `show counts` (with retry attempts)
-    reportProgress(8, 12, 68, "Checking fire panel counts...");
+    // Step 7: Run `show counts` (with retry attempts) — first, so the reset
+    // below knows whether a fire is active (fire first: T / S are then held).
+    reportProgress(7, 12, 60, "Checking fire panel counts...");
     let counts = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
       await logStartupSync(`[startupSync] Querying show counts on app startup (attempt ${attempt}/2)...`);
@@ -132,6 +133,12 @@ export async function runStartupListSync(arg1, arg2) {
         await new Promise((r) => setTimeout(r, 800));
       }
     }
+    noteShowCounts(counts);
+
+    // Step 8: Reset all assets F, T, S values to 0 (F only while FIRE > 0)
+    reportProgress(8, 12, 68, "Resetting device status (F/T/S to 0)...");
+    await logStartupSync("[startupSync] Resetting all assets F/T/S values to 0 before list commands...");
+    await resetAllAssetsSimplexStatus();
 
     if (!counts && isDebugMode()) {
       await logStartupSync(
@@ -182,6 +189,14 @@ export async function runStartupListSync(arg1, arg2) {
     ) => {
       const docName = `${label.toLowerCase()}-list`;
 
+      // Fire first: no `list t` / `list s` while FIRE > 0 — re-listed once it is 0.
+      if (isHeldByFirePriority(label)) {
+        deferForFirePriority(label);
+        await logStartupSync(`[startupSync] Fire active — ${listCmd} held until the fire count is 0.`);
+        reportProgress(stepNum, 12, basePercent + 8, `${label} list held — fire alarm active.`);
+        return [];
+      }
+
       if (expectedCount === 0) {
         reportProgress(stepNum, 12, basePercent + 5, `Saving ${label} list to database (0 items)...`);
         syncPanelListWithTempArray(label, []);
@@ -213,6 +228,8 @@ export async function runStartupListSync(arg1, arg2) {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const timeoutMs = Math.max(30000, Math.min(120000, expectedCount * 250 + 15000));
         rawRes = await sendCommand(listCmd, timeoutMs, expectedCount);
+        // A fire that started meanwhile (the panel worker then refuses the list).
+        if (isHeldByFirePriority(label)) break;
         parsedRows = parsePanelListResponse(rawRes);
 
         // Fallback for debug mode if connection is absent or returned empty
@@ -276,6 +293,13 @@ export async function runStartupListSync(arg1, arg2) {
           `[startupSync] ${listCmd} attempt ${attempt}/2 received ${parsedRows.length}/${expectedCount} items. Retrying attempt 2/2...`,
         );
         await new Promise((r) => setTimeout(r, 1500));
+      }
+
+      if (isHeldByFirePriority(label)) {
+        deferForFirePriority(label);
+        await logStartupSync(`[startupSync] Fire active — ${listCmd} result dropped, re-listed once the fire count is 0.`);
+        reportProgress(stepNum, 12, basePercent + 8, `${label} list held — fire alarm active.`);
+        return [];
       }
 
       reportProgress(

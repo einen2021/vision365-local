@@ -1,5 +1,10 @@
 import { Hono } from "hono";
-import { getStoredPanelAlarmTotals, getStoredPanelState, savePanelStateCounts } from "../services/firePanelAlarmSync";
+import {
+  expectEnabledTroubleDrop,
+  getStoredPanelAlarmTotals,
+  getStoredPanelState,
+  savePanelStateCounts,
+} from "../services/firePanelAlarmSync";
 import {
   connectFirePanel,
   disconnectFirePanel,
@@ -10,6 +15,15 @@ import {
   sendFirePanelCommandStreaming,
 } from "../services/firePanelService";
 import { createPanelLogRoutes } from "./panelLogs";
+
+/** `disable <addr> off` re-enables a device — its trouble-count drop needs no `list t`. */
+const ENABLE_DEVICE_RE = /^\s*disable\s+\S+\s+off\s*$/i;
+
+function noteEnableCommands(commands: string[]) {
+  for (const cmd of commands) {
+    if (ENABLE_DEVICE_RE.test(cmd)) expectEnabledTroubleDrop();
+  }
+}
 
 export function createFirePanelRoutes() {
   const app = new Hono();
@@ -105,6 +119,7 @@ export function createFirePanelRoutes() {
           ? Number(expectedRaw)
           : undefined;
 
+    noteEnableCommands([command]);
     try {
       const result = await sendFirePanelCommand(command, timeoutMs, expectedCount);
       return c.json(result);
@@ -130,6 +145,8 @@ export function createFirePanelRoutes() {
     // Default 5s — enough for ack/silence; caller can override.
     const timeoutMs = Number(body.timeoutMs) > 0 ? Number(body.timeoutMs) : 5000;
 
+    // Before sending: the count drop can be saved before the command returns.
+    noteEnableCommands(commands.length ? commands : [command]);
     try {
       const result = commands.length
         ? await sendFirePanelCommandsPriority(commands, timeoutMs)

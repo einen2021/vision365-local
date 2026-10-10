@@ -14,6 +14,7 @@ import { findAllDeviceAddressesByLocationText } from "@/lib/assetAddressFloorInd
 import { collectDeviceAddressKeys, normalizeSimplexStatus } from "@/lib/assetFireStatus";
 import { loginToPanel } from "@/lib/panelLogin";
 import { AutoPilotNotices } from "@/components/autopilot-notices";
+import { isHeldByFirePriority, onFirePriorityChange } from "@/lib/firePriority";
 
 // Human-like pacing, all measured from the moment the message arrives (t0):
 //   2s    click Acknowledge, then watch the panel logs up to 2s for the
@@ -277,8 +278,8 @@ export function AutoPilotController() {
       // 2. Watch the panel logs up to 2s for the button-ack line
       //    ("... ACKED AT NODE n"); move on to Silence either way.
       step("confirm", { status: "running", message: "Waiting for the panel" });
-      // A fire ack is already confirmed by acknowledgeFireConfirmed (ACKED line
-      // or `list f` no longer showing FIRE*) — no extra wait.
+      // A fire ack is already confirmed by acknowledgeFireConfirmed (the panel
+      // worker saw "- ack" executed) — no extra wait.
       const ackLogWaitEnd = run.label === "Fire" && ackOk ? Date.now() : Date.now() + ACK_LOG_WAIT_MS;
       let confirmed = run.label === "Fire" && ackOk ? run.incidents.length : countConfirmations(run);
       while (confirmed < run.incidents.length && Date.now() < ackLogWaitEnd) {
@@ -449,7 +450,10 @@ export function AutoPilotController() {
 
     const pump = async () => {
       if (running || disposed) return;
-      const label = Object.keys(PRIORITY).find((key) => pending[key].length > 0);
+      // Fire first: trouble / supervisory runs wait (queued) until the fire count is 0.
+      const label = Object.keys(PRIORITY).find(
+        (key) => pending[key].length > 0 && !isHeldByFirePriority(key),
+      );
       if (!label) return;
 
       const incidents = pending[label];
@@ -543,10 +547,23 @@ export function AutoPilotController() {
       }
     });
 
+    // A fire stops a running trouble / supervisory run (same as a new fire
+    // message does); fire count back to 0 runs the alarms held meanwhile.
+    const unsubscribeFirePriority = onFirePriorityChange((active) => {
+      if (active) {
+        if (running && isHeldByFirePriority(running.label) && !running.stopReason) {
+          running.stopReason = "preempted";
+        }
+        return;
+      }
+      void pump();
+    });
+
     window.addEventListener("vision365:livePanelEntry", handleEntry);
     return () => {
       disposed = true;
       unsubscribe();
+      unsubscribeFirePriority();
       window.removeEventListener("vision365:livePanelEntry", handleEntry);
     };
   }, []);

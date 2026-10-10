@@ -627,11 +627,9 @@ export function collectAssetHighlightKeys(mapping = {}, extraId = "") {
 
   const { deviceAddress } = resolveMappingDeviceFields(mapping)
   const address = deviceAddress || resolveAssetDeviceAddress(mapping)
+  // Keep the panel prefix: "2:M1-2-1" and "3:M1-2-1" are different devices,
+  // so stripping it would highlight every panel's marker with that M-address.
   add(address)
-  if (address) {
-    // Also match without a leading panel prefix like "2:M1-2-1".
-    add(address.replace(/^\d+:/i, ""))
-  }
 
   return [...keys]
 }
@@ -664,16 +662,19 @@ function addressesLikelyMatch(left = "", right = "") {
     if (rightKeys.has(key)) return true
   }
 
-  // Partial match (same idea as the asset search bar).
-  const aUp = a.toUpperCase()
-  const bUp = b.toUpperCase()
-  if (aUp.includes(bUp) || bUp.includes(aUp)) return true
+  // A different panel prefix ("2:" vs "3:") is always a different device.
+  const panelOf = (value) => value.match(/^(\d+):/)?.[1] || null
+  const aPanel = panelOf(a)
+  const bPanel = panelOf(b)
+  if (aPanel && bPanel) return false
 
-  const strip = (value) => value.replace(/^\d+:/i, "").toUpperCase()
-  const aStrip = strip(aUp)
-  const bStrip = strip(bUp)
-  if (!aStrip || !bStrip) return false
-  return aStrip.includes(bStrip) || bStrip.includes(aStrip)
+  // One side has no panel prefix — compare the M-address parts exactly.
+  const strip = (value) => value.replace(/^\d+:/i, "")
+  const strippedRight = collectDeviceAddressKeys(strip(b))
+  for (const key of collectDeviceAddressKeys(strip(a))) {
+    if (strippedRight.has(key)) return true
+  }
+  return false
 }
 
 /**
@@ -693,6 +694,18 @@ export function findHighlightMapping(
 
   // Prefer device address — this is what the user searched for.
   if (targetAddress) {
+    // Exact address (same panel prefix) beats a looser unprefixed match.
+    const targetKeys = collectDeviceAddressKeys(targetAddress)
+    const byExactAddress = list.find((mapping) => {
+      const mappingAddress = resolveMappingAddress(mapping)
+      if (!mappingAddress) return false
+      for (const key of collectDeviceAddressKeys(mappingAddress)) {
+        if (targetKeys.has(key)) return true
+      }
+      return false
+    })
+    if (byExactAddress) return byExactAddress
+
     const byAddress = list.find((mapping) =>
       addressesLikelyMatch(resolveMappingAddress(mapping), targetAddress),
     )

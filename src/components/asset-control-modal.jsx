@@ -35,6 +35,7 @@ import {
 } from "@/lib/parsePanelShowResponse"
 import { withMonitorPausedForPriority, pauseMonitorLoop, resumeMonitorLoop } from "@/lib/firePanelMonitorSession"
 import { cn } from "@/lib/utils"
+import { isFirePriorityActive } from "@/lib/firePriority"
 
 /** Small delay between show retries when the panel returns a partial chunk. */
 const SHOW_RETRY_DELAY_MS = 400
@@ -43,6 +44,8 @@ const SHOW_RETRY_DELAY_MS = 400
 function syncShowStatusToMarkers(address, primaryStatus) {
   const trimmed = String(address || "").trim()
   if (!trimmed) return
+  // Fire first: no T / S marker colour change while FIRE > 0.
+  if (isFirePriorityActive()) return
 
   const status = primaryStatus
     ? primaryStatusToSimplex(primaryStatus)
@@ -94,9 +97,14 @@ export function AssetControlModal({
   const [deviceDescription, setDeviceDescription] = useState("")
   const [primaryStatus, setPrimaryStatus] = useState("")
   const [enabledState, setEnabledState] = useState("")
-  // When "Check status" last read the panel (null = not checked in this session).
+  // When `show <address>` last read the panel (null = not read in this session).
   const [statusCheckedAt, setStatusCheckedAt] = useState(null)
-  const [enabled, setEnabled] = useState(true)
+  // True when the last automatic `show` got no usable answer (offers a retry).
+  const [statusReadFailed, setStatusReadFailed] = useState(false)
+  // ENABLED STATE from the panel — drives Enable / Disable (null = not read yet).
+  const [enabled, setEnabled] = useState(null)
+  // Firestore `enabled` value, so a differing panel state can be written back.
+  const firestoreEnabledRef = useRef(null)
   const [selectedAsset, setSelectedAsset] = useState(null)
   // Live AssetsList simplexStatus (F/T/S) — read directly via onSnapshot, never from the in-memory cache.
   const [liveSimplexStatus, setLiveSimplexStatus] = useState({ F: 0, T: 0, S: 0 })
@@ -117,8 +125,8 @@ export function AssetControlModal({
         throw new Error(useFirePanelStore.getState().lastError || "Panel show command failed")
       }
 
-      // Prefer the command result — shared rawResponse can be overwritten by CVAL polls.
-      const response = result.response || useFirePanelStore.getState().rawResponse || ""
+      // Only this command's own reply — never the store's last response from an earlier command.
+      const response = result.response || ""
       console.log(`[show ${trimmedAddress}] response:\n${response}`)
       return parsePanelShowResponse(response)
     },
@@ -137,6 +145,11 @@ export function AssetControlModal({
 
       const requestId = ++statusRequestIdRef.current
       setIsLoadingPanelStatus(true)
+      setStatusReadFailed(false)
+      // Drop the previous read — only this `show` reply is displayed.
+      setPrimaryStatus("")
+      setEnabledState("")
+      setStatusCheckedAt(null)
 
       const attemptShow = async () => {
         const parsed = await runPanelShow(trimmed)
@@ -176,35 +189,42 @@ export function AssetControlModal({
         // Modal closed or a newer request started — drop this result.
         if (requestId !== statusRequestIdRef.current) return
         if (!parsed) {
-          toast({
-            title: "Could not read device status",
-            description: "The panel did not answer. Try again in a moment.",
-            variant: "destructive",
-          })
+          setStatusReadFailed(true)
           return
         }
         setStatusCheckedAt(new Date())
 
-        if (parsed.primaryStatus) {
-          setPrimaryStatus(parsed.primaryStatus)
-          syncShowStatusToMarkers(trimmed, parsed.primaryStatus)
-        }
-        if (parsed.enabledState) {
-          setEnabledState(parsed.enabledState)
-        }
+        setPrimaryStatus(parsed.primaryStatus || "")
+        if (parsed.primaryStatus) syncShowStatusToMarkers(trimmed, parsed.primaryStatus)
+        setEnabledState(parsed.enabledState || "")
         if (parsed.enabled !== null) {
           setEnabled(parsed.enabled)
+          useDeviceEnabledStore.getState().setEnabled(trimmed, parsed.enabled)
+
+          // The panel is the source of truth — write back when Firestore disagrees.
+          if (
+            assetRef?.assetCategory &&
+            assetRef?.buildingAssetId &&
+            firestoreEnabledRef.current !== parsed.enabled
+          ) {
+            firestoreEnabledRef.current = parsed.enabled
+            updateDoc(
+              doc(db, selectedBuilding + "BuildingDB", "asset", assetRef.assetCategory, assetRef.buildingAssetId),
+              { enabled: parsed.enabled, updatedAt: new Date().toISOString() },
+            ).catch((err) => console.warn("[asset-control-modal] enabled write-back failed:", err))
+          }
         }
       } catch (error) {
         if (requestId !== statusRequestIdRef.current) return
         console.error("Panel show command failed:", error)
+        setStatusReadFailed(true)
       } finally {
         if (requestId === statusRequestIdRef.current) {
           setIsLoadingPanelStatus(false)
         }
       }
     },
-    [runPanelShow, toast],
+    [runPanelShow, selectedBuilding],
   )
 
   // Stable key so parent re-renders with a new asset object do not re-trigger load.
@@ -235,7 +255,7 @@ export function AssetControlModal({
     }
   }, [isOpen])
 
-  // Load Firestore asset fields. Panel status is read only via "Check status".
+  // Load Firestore asset fields. Panel status is read by the auto-show effect below.
   useEffect(() => {
     if (!isOpen || !asset || !selectedBuilding) return
 
@@ -246,6 +266,8 @@ export function AssetControlModal({
     setPrimaryStatus("")
     setEnabledState("")
     setStatusCheckedAt(null)
+    setStatusReadFailed(false)
+    setEnabled(null)
     setIsLoadingPanelStatus(false)
 
     const loadAssetData = async () => {
@@ -335,9 +357,8 @@ export function AssetControlModal({
           location = savedFieldsRef.current.location
         }
 
-        const enabledStatus = assetData.enabled !== undefined ? assetData.enabled : true
-
-        useDeviceEnabledStore.getState().setEnabled(address, enabledStatus)
+        // Enable / Disable follows the panel's ENABLED STATE; keep Firestore's value for write-back.
+        firestoreEnabledRef.current = assetData.enabled !== undefined ? assetData.enabled : true
 
         const descTrimmed = description.trim()
         if (location && descTrimmed && location.toLowerCase() === descTrimmed.toLowerCase()) {
@@ -355,7 +376,6 @@ export function AssetControlModal({
 
         setDeviceAddress(address)
         setDeviceDescription(description)
-        setEnabled(enabledStatus)
         setDeviceLocation(location)
         setSelectedAsset(nextSelectedAsset)
       } catch (error) {
@@ -377,6 +397,17 @@ export function AssetControlModal({
     // assetKey stands in for asset identity; read latest `asset` from this render.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: avoid reload on new object refs
   }, [isOpen, assetKey, selectedBuilding, toast])
+
+  // Run `show <address>` automatically once the asset is loaded, when the panel
+  // (re)connects, and after the saved address changes.
+  const loadedAssetId = selectedAsset?.buildingAssetId || ""
+  const loadedAddress = String(selectedAsset?.deviceAddress || "").trim()
+  useEffect(() => {
+    if (!isOpen || !loadedAssetId || !loadedAddress || !panelConnected) return
+    void fetchPanelShowStatus(loadedAddress, selectedAsset)
+    // selectedAsset is read from this render; identity is covered by the id/address keys.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, loadedAssetId, loadedAddress, panelConnected, fetchPanelShowStatus])
 
   // Live F/T/S badge — subscribe directly to the AssetsList doc so values always
   // reflect the current database state instead of the polled/optimistic store cache.
@@ -410,7 +441,8 @@ export function AssetControlModal({
       setPrimaryStatus("")
       setEnabledState("")
       setStatusCheckedAt(null)
-      setEnabled(true)
+      setStatusReadFailed(false)
+      setEnabled(null)
       setSelectedAsset(null)
       setIsLoadingPanelStatus(false)
     }
@@ -452,7 +484,9 @@ export function AssetControlModal({
       return
     }
 
+    // Supersede any in-flight `show` — Enable / Disable does not wait on it.
     statusRequestIdRef.current += 1
+    setIsLoadingPanelStatus(false)
     setIsUpdatingAsset(true)
     try {
       await enableDevice(address)
@@ -500,7 +534,9 @@ export function AssetControlModal({
       return
     }
 
+    // Supersede any in-flight `show` — Enable / Disable does not wait on it.
     statusRequestIdRef.current += 1
+    setIsLoadingPanelStatus(false)
     setIsUpdatingAsset(true)
     try {
       await disableDevice(address)
@@ -675,7 +711,7 @@ export function AssetControlModal({
         deviceAddress: nextAddress,
         deviceDescription: nextDescription,
         deviceLocation: nextLocation,
-        enabled,
+        enabled: enabled ?? firestoreEnabledRef.current,
       })
 
       toast({
@@ -683,11 +719,12 @@ export function AssetControlModal({
         description: "Device details saved successfully",
       })
 
-      // A new address invalidates the last status read — check it again on demand.
+      // A new address invalidates the last status read — the auto-show effect re-reads it.
       if (nextAddress !== previousAddress) {
         setPrimaryStatus("")
         setEnabledState("")
         setStatusCheckedAt(null)
+        setEnabled(null)
       }
     } catch (error) {
       console.error("Error saving device details:", error)
@@ -775,25 +812,7 @@ export function AssetControlModal({
               </div>
 
               <div className="space-y-1.5">
-                <div className="flex items-center justify-between gap-2">
-                  <Label className="text-sm font-semibold">Current Device Status</Label>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-8 gap-1.5"
-                    disabled={isLoadingPanelStatus || !deviceAddress.trim() || !panelConnected}
-                    title={!panelConnected ? "Connect to the fire panel first" : undefined}
-                    onClick={() => fetchPanelShowStatus(deviceAddress, selectedAsset)}
-                  >
-                    {isLoadingPanelStatus ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <RefreshCcw className="h-4 w-4" />
-                    )}
-                    {displayPrimaryStatus ? "Check again" : "Check status"}
-                  </Button>
-                </div>
+                <Label className="text-sm font-semibold">Current Device Status</Label>
                 <div className={cn("rounded-lg border px-3 py-2.5 text-sm font-medium", statusToneClass)}>
                   {isLoadingPanelStatus ? (
                     <span className="inline-flex items-center gap-2">
@@ -802,11 +821,27 @@ export function AssetControlModal({
                     </span>
                   ) : displayPrimaryStatus ? (
                     displayPrimaryStatus
+                  ) : statusReadFailed ? (
+                    <span className="flex items-center justify-between gap-2 font-normal text-muted-foreground">
+                      The panel did not answer.
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 gap-1.5"
+                        onClick={() => fetchPanelShowStatus(selectedAsset?.deviceAddress, selectedAsset)}
+                      >
+                        <RefreshCcw className="h-3.5 w-3.5" />
+                        Retry
+                      </Button>
+                    </span>
                   ) : (
                     <span className="font-normal text-muted-foreground">
-                      {panelConnected
-                        ? "Not checked — click Check status to read it from the panel"
-                        : "Connect to the fire panel to check the status"}
+                      {statusCheckedAt
+                        ? "The panel reply had no PRIMARY STATUS"
+                        : panelConnected
+                        ? "Waiting for device details..."
+                        : "Connect to the fire panel to read the status"}
                     </span>
                   )}
                 </div>
@@ -874,26 +909,38 @@ export function AssetControlModal({
                 <div
                   className={cn(
                     "flex items-center gap-2 rounded-lg border px-3 py-2.5 text-sm font-medium transition-colors",
-                    enabled
+                    enabled === true
                       ? "border-green-500/40 bg-green-500/10 text-green-700 dark:text-green-300"
-                      : "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300",
+                      : enabled === false
+                        ? "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300"
+                        : "border-muted bg-muted/40 text-muted-foreground",
                   )}
                 >
-                  {enabled ? (
+                  {enabled === null ? (
+                    isLoadingPanelStatus ? (
+                      <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                    ) : null
+                  ) : enabled ? (
                     <CheckCircle className="h-4 w-4 shrink-0" />
                   ) : (
                     <XCircle className="h-4 w-4 shrink-0" />
                   )}
-                  <span>Device is {enabled ? "Enabled" : "Disabled"}</span>
+                  <span>
+                    {enabled === null
+                      ? isLoadingPanelStatus
+                        ? "Reading enabled state from the panel..."
+                        : "Enabled state unknown — read from the panel first"
+                      : `Device is ${enabled ? "Enabled" : "Disabled"}`}
+                  </span>
                 </div>
 
                 <div className="flex gap-2">
                   <Button
                     onClick={handleEnable}
-                    disabled={isUpdatingAsset || enabled || !deviceAddress.trim()}
+                    disabled={isUpdatingAsset}
                     className={cn(
                       "flex-1",
-                      enabled
+                      enabled === true
                         ? "bg-green-600 text-white hover:bg-green-700"
                         : "border-green-600/30 bg-background text-green-700 hover:bg-green-500/10",
                     )}
@@ -903,10 +950,10 @@ export function AssetControlModal({
                   </Button>
                   <Button
                     onClick={handleDisable}
-                    disabled={isUpdatingAsset || !enabled || !deviceAddress.trim()}
+                    disabled={isUpdatingAsset}
                     className={cn(
                       "flex-1",
-                      !enabled
+                      enabled === false
                         ? "bg-red-600 text-white hover:bg-red-700"
                         : "border-red-600/30 bg-background text-red-700 hover:bg-red-500/10",
                     )}

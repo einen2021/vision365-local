@@ -20,9 +20,9 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { LIVE_PANEL_ROUTE_BY_LABEL } from "@/config/live-panel-routes";
-import { apiFetch, parseApiJsonResponse } from "@/lib/apiClient";
 import { buildPanelAckCommand } from "@/lib/firePanelMonitor";
 import { sendPriorityPanelCommand } from "@/lib/acknowledgePanelDevice";
+import { acknowledgeAlertConfirmed } from "@/lib/confirmedAlertAck";
 import { useAutoPilotStore } from "@/stores/autoPilotStore";
 import { useFirePanelStore } from "@/stores/firePanelStore";
 import { useToast } from "@/hooks/use-toast";
@@ -337,16 +337,8 @@ export function LivePanelAlertProvider({ children }) {
 
     setAckLoading(true);
     try {
-      const cmd = buildPanelAckCommand(openLabel);
-      const res = await apiFetch("/api/telnet/fire-panel/command", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command: cmd }),
-      });
-      const data = await parseApiJsonResponse(res);
-      if (!res.ok) {
-        throw new Error(data?.error || "Could not send acknowledge command.");
-      }
+      // Sent once; the panel worker confirms it executed (echo "- ack").
+      await acknowledgeAlertConfirmed(openLabel);
 
       if (openLabel === "Trouble") {
         silenceTroubleAlertBeep();

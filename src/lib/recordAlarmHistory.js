@@ -51,6 +51,7 @@ function formatHistoryMessage(element, label) {
 }
 
 import { extractPanelEventTime } from "./firePanelMonitor";
+import { deferForFirePriority, isHeldByFirePriority } from "./firePriority";
 
 /**
  * Records a single live alarm message (converted to list item format) to the History documents:
@@ -117,7 +118,13 @@ export async function recordNewElementsToHistory(label, newElements) {
  * @param {"Fire"|"Trouble"|"Supervisory"|string} label
  * @param {Array<Object>} parsedRows
  */
-export async function saveListToCategoryDb(label, parsedRows = []) {
+export async function saveListToCategoryDb(label, parsedRows = [], { duringFire = false } = {}) {
+  // Fire first: trouble / supervisory lists are not written while FIRE > 0
+  // (except a live message's own row — see appendLiveLogToCategoryList).
+  if (!duringFire && isHeldByFirePriority(label)) {
+    deferForFirePriority(label);
+    return;
+  }
   const normLabel =
     /^trouble$/i.test(label) ? "Trouble" : /^supervisory$/i.test(label) ? "Supervisory" : "Fire";
   const docName = `${normLabel.toLowerCase()}-list`;
@@ -149,9 +156,15 @@ export async function saveListToCategoryDb(label, parsedRows = []) {
  *
  * @param {"Fire"|"Trouble"|"Supervisory"|string} label
  * @param {Object|string} entry
+ * @param {{ duringFire?: boolean }} [options] duringFire: add the row even while
+ *   FIRE > 0 (a live trouble / supervisory message — its row only, nothing else)
  */
-export async function appendLiveLogToCategoryList(label, entry) {
+export async function appendLiveLogToCategoryList(label, entry, { duringFire = false } = {}) {
   if (!entry || !label) return;
+  if (!duringFire && isHeldByFirePriority(label)) {
+    deferForFirePriority(label);
+    return;
+  }
 
   const normLabel =
     /^trouble$/i.test(label) ? "Trouble" : /^supervisory$/i.test(label) ? "Supervisory" : "Fire";
@@ -226,7 +239,7 @@ export async function appendLiveLogToCategoryList(label, entry) {
 
     filtered.unshift(row);
 
-    await saveListToCategoryDb(normLabel, filtered);
+    await saveListToCategoryDb(normLabel, filtered, { duringFire });
   } catch (err) {
     console.error(`[appendLiveLogToCategoryList] Failed appending to ${docName}:`, err);
   }

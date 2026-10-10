@@ -39,7 +39,8 @@ type OutgoingMessage =
   | { type: "chunk"; id: string; response: string; done: boolean }
   | { type: "result"; id: string; ok: true; response: string }
   | { type: "result"; id: string; ok: false; error: string }
-  | { type: "panel-log"; entry: PanelLogEntry };
+  | { type: "panel-log"; entry: PanelLogEntry }
+  | { type: "raw"; dir: "TX" | "RX"; text: string };
 
 // ---------------------------------------------------------------------------
 // Panel log — persistence + real-time SSE broadcast
@@ -77,7 +78,7 @@ export interface PanelLogEntry {
   isListEntry?: boolean;
   register?: "a0" | "a1" | "a2";
   cval?: number;
-  systemType?: "error" | "login-success" | "banner";
+  systemType?: "error" | "login-success" | "banner" | "command";
 }
 
 export interface StoredPanelLog extends PanelLogEntry {
@@ -254,12 +255,6 @@ function addLog(message: string) {
   serverLog(`[fire-panel] ${message}`);
 }
 
-function cleanCommandText(command: string) {
-  return String(command || "")
-    .replace(/[\x00-\x1f\x7f]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-}
 
 function getWorkerEntryPath(ext: "js" | "cjs") {
   // When bundled as CJS (MSI resources), __dirname points to the server directory.
@@ -404,6 +399,12 @@ function attachWorkerHandlers(worker: Worker) {
       if (!msg.connected) {
         addLog("Telnet socket closed");
       }
+      return;
+    }
+
+    // Raw telnet traffic — the server log shows exactly what crossed the wire.
+    if (msg.type === "raw") {
+      serverLog(`[fire-panel] ${msg.dir} ${msg.text}`);
       return;
     }
 
@@ -664,9 +665,6 @@ async function sendCommandViaWorker(
 ) {
   ensureWorkers();
 
-  const trimmed = cleanCommandText(command);
-  addLog(`Command: ${trimmed}`);
-
   const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const msg: IncomingMessage = {
     type: "command",
@@ -682,13 +680,7 @@ async function sendCommandViaWorker(
   }
 
   try {
-    const response = (await request(panelWorker!, msg)) as string;
-    if (trimmed.toLowerCase().startsWith("show")) {
-      addLog(`show response:\n${response}`);
-    } else if (trimmed.toLowerCase().startsWith("login")) {
-      addLog(`login response: ${JSON.stringify(String(response).slice(0, 200))}`);
-    }
-    return response;
+    return (await request(panelWorker!, msg)) as string;
   } finally {
     chunkHandlers.delete(id);
   }
@@ -726,8 +718,8 @@ export async function sendFirePanelCommand(
 }
 
 /**
- * Priority command — the worker ranks it by command type (ack/login/set first)
- * and cancels + restarts any lower-rank list dump in progress.
+ * Kept for callers of the priority endpoint. The worker runs every command the
+ * same way now: one at a time, in arrival order (see docs/PANEL_COMMANDS.md).
  */
 export async function sendFirePanelCommandPriority(
   command: string,
@@ -738,21 +730,30 @@ export async function sendFirePanelCommandPriority(
   return { response };
 }
 
+/** Only one command sequence (Silence Alarm / Reset System) runs at a time. */
+let commandSequence: Promise<unknown> = Promise.resolve();
+
 /**
- * Several priority commands posted to the worker in one tick (e.g. login + set
- * 2/3/4:p217 on) so they queue back-to-back with nothing interleaved.
+ * A command sequence, e.g. Silence Alarm's set 2/3/4:p217 on. Each command is
+ * sent after the previous one is confirmed; if one fails the rest are not sent.
+ * Other commands may take turns in between — each waits for its own prompt.
  */
 export async function sendFirePanelCommandsPriority(
   commands: string[],
   timeoutMs?: number,
 ) {
   ensureConnected();
-  const responses = await Promise.all(
-    commands.map((command) =>
-      sendCommandViaWorker(command, timeoutMs, undefined, undefined, true),
-    ),
-  );
-  return { responses };
+  const run = commandSequence.then(async () => {
+    const responses: string[] = [];
+    for (const command of commands) {
+      responses.push(
+        (await sendCommandViaWorker(command, timeoutMs, undefined, undefined, true)) as string,
+      );
+    }
+    return { responses };
+  });
+  commandSequence = run.catch(() => {});
+  return run;
 }
 
 export async function shutdownFirePanelWorkers() {

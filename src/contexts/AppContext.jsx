@@ -13,7 +13,6 @@ import { FireAlertModal } from "@/components/fire-alert-modal";
 import { usePathname } from "next/navigation";
 import secureLocalStorage from "react-secure-storage";
 import { collection as mockCollection, getDocs as mockGetDocs } from "@/lib/mockFirestore";
-import { doc, writeBatch } from "firebase/firestore";
 import { getUserCommunities } from "@/utils/communityService";
 import { loadBrandRegistry } from "@/utils/brandRegistryService";
 import { getStoredSessionUser } from "@/lib/sessionUser";
@@ -33,7 +32,6 @@ import {
   isListResponseComplete,
   isListResponseReady,
   parsePanelListResponse,
-  readSimplexStatus,
   simplexKeyForCategoryLabel,
 } from "@/lib/firePanelMonitor";
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
@@ -47,16 +45,39 @@ import {
   withMonitorPaused,
 } from "@/lib/firePanelMonitorSession";
 import { sendPriorityPanelCommand, sendPriorityPanelCommands } from "@/lib/acknowledgePanelDevice";
-import { loginToPanel } from "@/lib/panelLogin";
+import { loginToPanel, PANEL_LOGIN_SESSION_MS } from "@/lib/panelLogin";
+import {
+  deferForFirePriority,
+  firePriorityHoldMessage,
+  isHeldByFirePriority,
+  seedFireCountFromStoredState,
+} from "@/lib/firePriority";
 
-/** Log in (with retry) before a command that needs it; throws when access is never granted. */
+// Right after a fire the panel can stay silent ~20s before ACCESS GRANTED shows
+// up, so manual commands keep retrying longer than AutoPilot's default (12s).
+const MANUAL_LOGIN_MAX_MS = 25000;
+
+/**
+ * Log in (with retry) before a command that needs it; throws when access is
+ * never granted. A login granted within the panel's 3-minute session is reused.
+ */
 async function requirePanelLogin() {
-  const login = await loginToPanel();
+  const login = await loginToPanel({
+    reuseWithinMs: PANEL_LOGIN_SESSION_MS,
+    maxMs: MANUAL_LOGIN_MAX_MS,
+  });
   if (!login.granted) {
     throw new Error(`Could not log in to the panel (${login.reason || "no answer"})`);
   }
 }
-import { getAssetsListSnapshot, invalidateAssetsListSnapshotCache } from "@/lib/floorMapAssets";
+import {
+  getLastResetWorkflowStartedAt,
+  handleSystemResetCompleteWorkflow,
+  resetAllAssetsSimplexStatus,
+} from "@/lib/systemResetWorkflow";
+
+/** Re-list F/T/S this long after Reset System if RESET COMPLETE has not done it. */
+const RESET_RELIST_FALLBACK_MS = 15000;
 import { useFireAlert } from "./FireModalContext";
 import { useDeviceEnabledStore } from "@/stores/deviceEnabledStore";
 import { LivePanelAlertWatcher } from "@/components/live-panel-alert-watcher";
@@ -265,9 +286,14 @@ export const AppProvider = ({ children }) => {
     }
 
     const statusKey = simplexKeyForCategoryLabel(label);
-    useAssetFireStatusStore
-      .getState()
-      .syncPanelLiveFlagsForCategory(statusKey, addresses, previous);
+    // A fire that started during the dump: T / S marker colours stay as they are.
+    if (isHeldByFirePriority(label)) {
+      deferForFirePriority(label);
+    } else {
+      useAssetFireStatusStore
+        .getState()
+        .syncPanelLiveFlagsForCategory(statusKey, addresses, previous);
+    }
 
     previousListAddressesRef.current[label] = addresses;
     lastListNewestRef.current[label] = newestAddress
@@ -381,6 +407,11 @@ export const AppProvider = ({ children }) => {
       if (!listCmd) {
         throw new Error(`Unknown list label: ${label}`);
       }
+      // Fire first: no `list t` / `list s` while FIRE > 0.
+      if (isHeldByFirePriority(label)) {
+        deferForFirePriority(label);
+        throw new Error(firePriorityHoldMessage(label));
+      }
 
       // Mark streaming/loading state immediately so UI turns on spinner instantly
       setFirePanelListResponses((prev) => ({
@@ -481,34 +512,12 @@ export const AppProvider = ({ children }) => {
     // Turn floor markers green immediately while Firestore catches up.
     // useAssetFireStatusStore.getState().clearAllSimplexStatusInStore();
 
+    const resetSentAt = Date.now();
     const runBackgroundReset = async () => {
       try {
-        invalidateAssetsListSnapshotCache();
-        const snapshot = await getAssetsListSnapshot(db);
-        const now = new Date().toISOString();
-        const cleared = { F: 0, T: 0, S: 0 };
-
-        // One batched write (single DB revision) instead of one write per device.
-        const batch = writeBatch(db);
-        let batchSize = 0;
-        for (const docSnap of snapshot.docs) {
-          const data = docSnap.data();
-          const current = readSimplexStatus(data);
-          if (current.F === 0 && current.T === 0 && current.S === 0) continue;
-
-          batch.update(doc(db, "AssetsList", docSnap.id), {
-            simplexStatus: cleared,
-            updatedAt: now,
-          });
-          batchSize += 1;
-          useAssetFireStatusStore.getState().patchSimplexStatusFromEntry(
-            docSnap.id,
-            data,
-            cleared,
-          );
-        }
-        if (batchSize > 0) await batch.commit();
-
+        // Clears F/T/S on AssetsList and the list sync's previous addresses, so
+        // the next list sync writes every flag again instead of only changes.
+        await resetAllAssetsSimplexStatus();
         appendFirePanelMonitorLog("System reset → cleared F/T/S on AssetsList");
       } catch (error) {
         appendFirePanelMonitorLog(`!! system reset background: ${error.message}`);
@@ -518,13 +527,24 @@ export const AppProvider = ({ children }) => {
       }
     };
 
+    // The panel prints SYSTEM RESET COMPLETE only when the reset completes (not
+    // while e.g. a pull station is still active), and troubles survive a reset.
+    // If that line has not started the re-list by now, re-list anyway so the
+    // markers show what the panel still reports.
+    setTimeout(() => {
+      if (getLastResetWorkflowStartedAt() < resetSentAt) {
+        appendFirePanelMonitorLog("System reset → no RESET COMPLETE yet, re-listing F/T/S");
+        void handleSystemResetCompleteWorkflow();
+      }
+    }, RESET_RELIST_FALLBACK_MS);
+
     void runBackgroundReset();
     return result;
   }, [appendFirePanelMonitorLog]);
 
 
-  // The login is retried until ACCESS GRANTED (instant while the panel
-  // worker's 3-minute login session is active).
+  // The login is reused while the panel's 3-minute login session is active;
+  // otherwise it is retried until ACCESS GRANTED.
   const disableDevice = useCallback(async (deviceAddress) => {
     return withMonitorPaused(async () => {
       await requirePanelLogin();
@@ -539,6 +559,13 @@ export const AppProvider = ({ children }) => {
       await requirePanelLogin();
       const enableResponse = await sendPriorityPanelCommand(`disable ${deviceAddress} off`, 3000);
       useDeviceEnabledStore.getState().setEnabled(deviceAddress, true);
+      // FireModalContext clears this device's trouble (T=0, trouble-list row)
+      // and updates counts without re-running `list t`.
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("vision365:deviceEnabled", { detail: { deviceAddress } }),
+        );
+      }
       return enableResponse;
     });
   }, []);
@@ -550,6 +577,8 @@ export const AppProvider = ({ children }) => {
       const data = await parseApiJsonResponse(res);
       setFirePanelState(data);
       firePanelStateRef.current = data;
+      // After a reload mid-fire: hold trouble / supervisory until `show counts` answers.
+      seedFireCountFromStoredState(data?.totalFire);
     } catch {
       // API may be unavailable on first load
     } finally {

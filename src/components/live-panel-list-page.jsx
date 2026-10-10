@@ -31,6 +31,11 @@ import { findAssetsListEntryByPanelAddress } from "@/lib/assetsListSimplexStatus
 import { resolveAssetNavigationUrl } from "@/lib/assetPlacementNavigation";
 import { saveListToCategoryDb } from "@/lib/recordAlarmHistory";
 import { syncAssetsListWithPanelList } from "@/lib/panelListAssetSync";
+import {
+  deferForFirePriority,
+  firePriorityHoldMessage,
+  isHeldByFirePriority,
+} from "@/lib/firePriority";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
@@ -246,10 +251,21 @@ export function LivePanelListPage({ label, title, description, tone }) {
       return;
     }
 
+    // Fire first: no `list t` / `list s` while FIRE > 0.
+    if (isHeldByFirePriority(label)) {
+      deferForFirePriority(label);
+      toast({ title: "Fire alarm active", description: firePriorityHoldMessage(label) });
+      return;
+    }
+
     const cmd = LIST_CMD_BY_LABEL[label] || "list f";
     setIsRefreshing(true);
     try {
       const res = await sendPriorityPanelCommand(cmd, 25000);
+      if (isHeldByFirePriority(label)) {
+        deferForFirePriority(label);
+        throw new Error(firePriorityHoldMessage(label));
+      }
       const rows = parsePanelListResponse(res);
       const addresses = extractPanelDeviceAddresses(res);
 

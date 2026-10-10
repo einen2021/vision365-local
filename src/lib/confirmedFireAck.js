@@ -1,31 +1,19 @@
 /**
- * Fire acknowledge that is confirmed, not just sent.
+ * Fire acknowledge.
  *
- * The panel can take 10–30s to report "FIRE ALARM ACKED" — right after a fire
- * it often goes quiet for ~10s and answers nothing. So: send `ack`, wait up to
- * 2s for that line, otherwise read `list f`:
- *   - fire row(s) with no `*`  → accepted (the line is just late);
- *   - a row still `FIRE*`      → send `ack` again;
- *   - no fire row came back    → the panel is busy; keep waiting, type nothing.
- * Repeats until ~6s.
- *
- * `ack` is only re-sent while a fire is still `FIRE*`, so a repeat can never
- * acknowledge something else (e.g. one of the troubles, all `TRBL*`).
+ * Sends a bare `ack` once. The panel worker confirms it by its echo ("- ack" =
+ * executed) and resends it itself only when the panel ignored it — so it is
+ * never sent again here: a second executed `ack` would acknowledge another
+ * event. Right after a fire the panel can take 10–30s to print "FIRE ALARM
+ * ACKED" (and `list f` still shows FIRE* meanwhile), so neither is used to
+ * decide on a resend; the ACKED line is awaited briefly only for reporting.
  */
 
 import { sendPriorityPanelCommand } from "@/lib/acknowledgePanelDevice";
 
-/** Wait this long for "FIRE ALARM ACKED" before checking `list f`. */
+/** Wait this long for "FIRE ALARM ACKED" after the ack executed. */
 const ACK_LOG_WAIT_MS = 2000;
-/** Give up re-sending after this long. */
-const CONFIRM_BUDGET_MS = 6000;
-const ACK_TIMEOUT_MS = 2000;
-const LIST_F_TIMEOUT_MS = 2500;
 const POLL_MS = 50;
-
-/** A `list f` device row ending in FIRE / ALARM, with or without the `*`. */
-const FIRE_ROW_RE =
-  /(?:^|\n)\s*(?:\d+:)?(?:M\d+-\d+(?:-\d+)?|P\d+|\d+-\d+-\d+)\b[^\n]*\b(?:FIRE|ALARM)(\*?)[ \t]*(?=\n|$)/gi;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -50,62 +38,31 @@ async function waitForAckLine(since, ms) {
 }
 
 /**
- * Read `list f`: "acked" when it lists fire row(s) and none is starred,
- * "unacked" when a row is still `FIRE*`, "unknown" when no fire row came back
- * (an empty or timed-out reply proves nothing).
- */
-async function fireListAckState() {
-  try {
-    const result = await sendPriorityPanelCommand("list f", LIST_F_TIMEOUT_MS);
-    const text = String(result?.response ?? "").replace(/\r/g, "");
-    const rows = [...text.matchAll(FIRE_ROW_RE)];
-    if (rows.length === 0) return "unknown";
-    return rows.some((row) => row[1] === "*") ? "unacked" : "acked";
-  } catch {
-    return "unknown";
-  }
-}
-
-/**
- * Send `ack` and keep it going until the panel has accepted it, within ~6s.
- * Resolves { acknowledged, attempts, ms, via } — via: "log" | "list" | null.
+ * Send `ack` once. Never throws. Resolves { acknowledged, logged, attempts, ms,
+ * via, error } — `acknowledged` once the panel executed it ("- ack"), `logged`
+ * once FIRE ALARM ACKED was seen within 2s.
  */
 export async function acknowledgeFireConfirmed() {
   const start = Date.now();
-  let attempts = 0;
-  let resend = true;
-
-  while (Date.now() - start < CONFIRM_BUDGET_MS) {
-    if (resend) {
-      attempts += 1;
-      try {
-        await sendPriorityPanelCommand("ack", ACK_TIMEOUT_MS);
-      } catch (error) {
-        console.warn(`[confirmedFireAck] ack attempt ${attempts} failed:`, error?.message);
-      }
-    }
-
-    // Any ACKED line since the first ack counts — the panel may report it late.
-    const remaining = CONFIRM_BUDGET_MS - (Date.now() - start);
-    if (await waitForAckLine(start, Math.min(ACK_LOG_WAIT_MS, Math.max(0, remaining)))) {
-      return { acknowledged: true, attempts, ms: Date.now() - start, via: "log" };
-    }
-    if (Date.now() - start >= CONFIRM_BUDGET_MS) break;
-
-    const state = await fireListAckState();
-    if (state === "acked") {
-      return { acknowledged: true, attempts, ms: Date.now() - start, via: "list" };
-    }
-    // Only a row still marked FIRE* justifies another ack; an empty reply
-    // means the panel is busy — keep waiting without typing more into it.
-    resend = state === "unacked";
-    console.log(
-      `[confirmedFireAck] after attempt ${attempts} (${Date.now() - start}ms): list f = ${state}${resend ? " — sending ack again" : " — waiting"}`,
-    );
+  try {
+    await sendPriorityPanelCommand("ack");
+  } catch (error) {
+    console.warn("[confirmedFireAck] ack failed:", error?.message);
+    return {
+      acknowledged: false,
+      logged: false,
+      attempts: 1,
+      ms: Date.now() - start,
+      via: null,
+      error: error?.message || "ack failed",
+    };
   }
-
-  if (lastFireAckLoggedAt >= start) {
-    return { acknowledged: true, attempts, ms: Date.now() - start, via: "log" };
-  }
-  return { acknowledged: false, attempts, ms: Date.now() - start, via: null };
+  const logged = await waitForAckLine(start, ACK_LOG_WAIT_MS);
+  return {
+    acknowledged: true,
+    logged,
+    attempts: 1,
+    ms: Date.now() - start,
+    via: logged ? "log" : "echo",
+  };
 }

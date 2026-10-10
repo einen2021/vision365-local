@@ -119,6 +119,32 @@ export async function savePanelCategoryCount(
   }
 }
 
+/**
+ * Re-enabling a device (`disable <addr> off`) drops the trouble count by one.
+ * The app clears that device's trouble row itself, so the drop is "expected"
+ * for a while and does not re-run `list t` (see savePanelStateCounts).
+ */
+const EXPECTED_TROUBLE_DROP_TTL_MS = 30000;
+let expectedTroubleDrops: number[] = [];
+
+function pruneExpectedTroubleDrops() {
+  const now = Date.now();
+  expectedTroubleDrops = expectedTroubleDrops.filter((at) => now - at < EXPECTED_TROUBLE_DROP_TTL_MS);
+}
+
+export function expectEnabledTroubleDrop() {
+  pruneExpectedTroubleDrops();
+  expectedTroubleDrops.push(Date.now());
+}
+
+/** True when a drop of `drop` is fully explained by re-enabled devices (consumed). */
+function consumeExpectedTroubleDrop(drop: number): boolean {
+  pruneExpectedTroubleDrops();
+  if (drop <= 0 || expectedTroubleDrops.length < drop) return false;
+  expectedTroubleDrops.splice(0, drop);
+  return true;
+}
+
 /** Persist all three CVAL totals to firePanelState (e.g. after monitor cycle). */
 export async function savePanelStateCounts(counts: {
   totalFire: number;
@@ -179,7 +205,12 @@ export async function savePanelStateCounts(counts: {
     }
     if (existing.totalTrouble !== next.totalTrouble) {
       changes.push(`trouble ${existing.totalTrouble}→${next.totalTrouble}`);
-      if (next.totalTrouble < existing.totalTrouble) {
+      if (
+        next.totalTrouble < existing.totalTrouble &&
+        consumeExpectedTroubleDrop(existing.totalTrouble - next.totalTrouble)
+      ) {
+        changes.push("(re-enabled device — no list t)");
+      } else if (next.totalTrouble < existing.totalTrouble) {
         decreasedCategories.push({
           category: "trouble",
           nextCount: next.totalTrouble,
@@ -192,6 +223,17 @@ export async function savePanelStateCounts(counts: {
 
     result = payload;
   });
+
+  // Fire first: while FIRE > 0 no `list t` / `list s` and no T / S flag change —
+  // the app re-lists trouble / supervisory once the fire count is 0.
+  if (Number(counts.totalFire) > 0) {
+    if (decreasedCategories.length > 0) {
+      serverLog(
+        `[fire-panel] Fire active (FIRE=${counts.totalFire}) — ${decreasedCategories.map((d) => d.category).join(" / ")} re-sync held`,
+      );
+    }
+    return result!;
+  }
 
   // If any category count decreased from previous (except fire), do all the steps in startUpListSync for that category
   for (const { category, nextCount } of decreasedCategories) {
@@ -451,9 +493,12 @@ export async function syncCategoryOnCountDecrease(
         const res = await sendFirePanelCommand(listCmd, timeoutMs, expectedCount);
         rawRes = res?.response || "";
       } catch (err) {
+        const message = (err as Error).message || "";
         serverLog(
-          `[fire-panel] [startupSync] Error sending ${listCmd}: ${(err as Error).message}`,
+          `[fire-panel] [startupSync] Error sending ${listCmd}: ${message}`,
         );
+        // Held for a fire: keep the stored list and flags (the app re-lists after it).
+        if (/Fire alarm active/i.test(message)) return;
         break;
       }
 
@@ -476,6 +521,12 @@ export async function syncCategoryOnCountDecrease(
 
       await new Promise((r) => setTimeout(r, 1500));
     }
+  }
+
+  // A fire reported meanwhile: keep the stored list and T / S flags as they are.
+  if ((await getStoredPanelState()).totalFire > 0) {
+    serverLog(`[fire-panel] [startupSync] Fire active — ${listCmd} result not saved`);
+    return;
   }
 
   // Save to DB and sync assets / building totals
